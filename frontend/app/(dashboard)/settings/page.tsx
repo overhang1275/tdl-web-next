@@ -13,12 +13,13 @@ import {
   StatusBadge,
 } from "@/components/states";
 import { Button, Card, Input } from "@/components/ui";
+import { RuntimeSettingsForm, type RuntimeSettingsData } from "@/components/runtime-settings";
 import { apiFetch } from "@/lib/api";
 import { formatDate } from "@/lib/format";
 import { queryKeys } from "@/lib/query-keys";
 import type { Status } from "@/lib/types";
 
-interface SettingsData {
+interface SettingsData extends RuntimeSettingsData {
   app: { name: string; version: string; environment: string };
   paths: Record<string, string>;
   limits: Record<string, number>;
@@ -53,6 +54,7 @@ export default function SettingsPage() {
   const settings = useQuery({
     queryKey: queryKeys.settings,
     queryFn: () => apiFetch<SettingsData>("/api/v1/settings"),
+    refetchInterval: (query) => ["queued", "moving"].includes(query.state.data?.operation?.status ?? "") ? 2000 : false,
   });
   const status = useQuery({
     queryKey: queryKeys.status,
@@ -126,7 +128,7 @@ export default function SettingsPage() {
     <>
       <PageHeader
         title="Configuración"
-        description="Estado, rutas y sesión. Los valores son de solo lectura."
+        description="Estado, ajustes de descarga y sesión de Telegram."
       />
 
       <div className="grid gap-4 xl:grid-cols-2">
@@ -157,13 +159,10 @@ export default function SettingsPage() {
         </Card>
 
         <Card className="p-5">
-          <h2 className="font-semibold">Rutas y límites</h2>
+          <h2 className="font-semibold">Rutas del sistema</h2>
           <dl className="mt-3 space-y-2 text-sm">
-            {Object.entries(data.paths).map(([key, value]) => (
+            {Object.entries(data.paths).filter(([key]) => key !== "downloads_dir").map(([key, value]) => (
               <Row key={key} label={key} value={value} mono />
-            ))}
-            {Object.entries(data.limits).map(([key, value]) => (
-              <Row key={key} label={key} value={String(value)} />
             ))}
             <Row label="tdl" value={`${data.tdl.binary} · ns ${data.tdl.namespace}`} mono />
             <Row label="Authentik issuer" value={data.authentik.issuer || "—"} mono />
@@ -174,6 +173,8 @@ export default function SettingsPage() {
           </dl>
         </Card>
       </div>
+
+      <RuntimeSettingsForm data={data} />
 
       <Card className="mt-4 p-5">
         <div className="flex flex-wrap items-center justify-between gap-2">

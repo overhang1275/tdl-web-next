@@ -146,6 +146,19 @@ Puedes filtrar texto, hashtag, fechas y tipo de archivo. El progreso y la ETA se
 muestran solo cuando existen datos fiables. Reintentar conserva los archivos
 completos; eliminar exige confirmación y usa `wipe`.
 
+En Configuración puedes editar la carpeta de descargas y los límites de comando,
+lotes de descarga/exportación y espera sin progreso. Se guardan en SQLite y
+prevalecen sobre los valores iniciales del entorno. Guarda con la cola vacía.
+Cambiar la carpeta exige confirmar el traslado: el worker copia y verifica SHA-256,
+actualiza las rutas de los archivos y después vacía el origen. Si falla, muestra
+el error y permite reintentar; las descargas quedan bloqueadas hasta resolverlo.
+El destino debe estar vacío, tener espacio para una copia completa y ser escribible.
+
+En Docker utiliza una subcarpeta de DATA_DIR. Para otro volumen, móntalo con la
+misma ruta en API y worker y declara su raíz en DOWNLOADS_ALLOWED_ROOTS (separadas
+por dos puntos). La web no crea montajes del host. En LXC usa una carpeta dedicada
+escribible por telegramdl. No modifiques los archivos manualmente durante un traslado.
+
 El navegador solo llama al BFF de Next.js. Los access/refresh tokens permanecen
 en una cookie cifrada HttpOnly y el BFF añade el Bearer hacia FastAPI. Las
 escrituras verifican origen y `X-Requested-With`; la creación conserva

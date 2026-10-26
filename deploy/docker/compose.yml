@@ -19,6 +19,7 @@ x-api: &api
     TDL_SESSIONS_DIR: ${TDL_SESSIONS_DIR:-/opt/tld-web/data/sessions}
     EXPORTS_DIR: ${EXPORTS_DIR:-/opt/tld-web/data/exports}
     DOWNLOADS_DIR: ${DOWNLOADS_DIR:-/opt/tld-web/data/downloads}
+    DOWNLOADS_ALLOWED_ROOTS: ${DOWNLOADS_ALLOWED_ROOTS:-}
     LOGS_DIR: ${LOGS_DIR:-/opt/tld-web/data/logs}
     DATABASE_URL: ${DATABASE_URL:-sqlite:////opt/tld-web/data/telegram_downloader.sqlite3}
     DATABASE_DIR: ${DATABASE_DIR:-${DATA_DIR:-/opt/tld-web/data}}

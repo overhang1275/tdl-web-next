@@ -24,6 +24,11 @@ def init_db() -> None:
     Base.metadata.create_all(bind=engine)
     migrate_sqlite()
     migrate_exports_to_chat_paths()
+    from app.services.runtime_settings import load_runtime
+
+    with SessionLocal() as db:
+        load_runtime(db)
+    settings.ensure_directories()
 
 
 def migrate_sqlite() -> None:
@@ -164,6 +169,9 @@ def migrate_exports_to_chat_paths() -> None:
 def get_db():
     db = SessionLocal()
     try:
+        from app.services.runtime_settings import load_runtime
+
+        load_runtime(db)
         yield db
     finally:
         db.close()

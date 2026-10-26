@@ -1,17 +1,23 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Response
+from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user
 from app.config import settings
-from app.schemas import UserRead
+from app.database import get_db
+from app.schemas import SettingsUpdate, UserRead
+from app.services.runtime_settings import load_runtime, operation, retry_move, save_settings
 
 router = APIRouter(tags=["settings"])
 
 
 @router.get("/settings")
-def read_settings(_: UserRead = Depends(get_current_user)) -> dict:
+def read_settings(db: Session = Depends(get_db), _: UserRead = Depends(get_current_user)) -> dict:
+    load_runtime(db)
     return {
+        "operation": operation(db),
+        "downloads_storage_root": str(settings.base_dir),
         "app": {
             "name": settings.app_name,
             "version": settings.app_version,
@@ -41,3 +47,18 @@ def read_settings(_: UserRead = Depends(get_current_user)) -> dict:
         },
         "can_start_services": settings.environment != "production",
     }
+
+
+@router.put("/settings")
+def update_settings(payload: SettingsUpdate, response: Response,
+                    db: Session = Depends(get_db), _: UserRead = Depends(get_current_user)) -> dict:
+    moving = save_settings(db, payload)
+    response.status_code = 202 if moving else 200
+    return read_settings(db, _)
+
+
+@router.post("/settings/retry", status_code=202)
+def retry_settings_move(db: Session = Depends(get_db),
+                        _: UserRead = Depends(get_current_user)) -> dict:
+    retry_move(db)
+    return read_settings(db, _)

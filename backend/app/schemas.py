@@ -8,6 +8,17 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 MediaTypeLiteral = Literal["all", "video", "image", "audio", "document"]
 
 
+class SettingsUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    downloads_dir: str = Field(min_length=1, max_length=4096)
+    command_timeout_seconds: int = Field(ge=1, le=86400, strict=True)
+    download_batch_size: int = Field(ge=1, le=10000, strict=True)
+    download_idle_timeout_seconds: int = Field(ge=1, le=86400, strict=True)
+    export_batch_size: int = Field(ge=1, le=100000, strict=True)
+    confirm_move: bool = False
+
+
 class JobCreate(BaseModel):
     chat_id: str = Field(min_length=1, max_length=64)
     chat_title: str | None = Field(default=None, max_length=255)

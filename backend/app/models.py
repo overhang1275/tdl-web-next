@@ -47,6 +47,17 @@ class MediaType(str, enum.Enum):
     document = "document"
 
 
+class RuntimeSettings(Base):
+    __tablename__ = "runtime_settings"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    values_json: Mapped[str] = mapped_column(Text, default="{}", nullable=False)
+    pending_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    operation_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    operation_status: Mapped[str] = mapped_column(String(24), default="idle", nullable=False)
+    operation_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
 class DownloadJob(Base):
     __tablename__ = "download_jobs"
     __table_args__ = (

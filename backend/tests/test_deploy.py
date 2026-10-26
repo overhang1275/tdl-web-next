@@ -56,6 +56,16 @@ def test_backup_refuses_active_jobs_and_preserves_database(tmp_path):
     assert (destination / '.env').read_text() == env.read_text()
 
 
+def test_native_update_refuses_download_folder_migration(tmp_path):
+    admin = load('data-admin')
+    path = tmp_path / 'state.sqlite3'
+    with sqlite3.connect(path) as db:
+        db.execute('CREATE TABLE runtime_settings (id INTEGER, operation_status TEXT)')
+        db.execute("INSERT INTO runtime_settings VALUES (1, 'moving')")
+    with pytest.raises(RuntimeError, match='traslado'):
+        admin.require_idle({'DATABASE_URL': f'sqlite:///{path}'})
+
+
 def test_native_configuration_uses_external_oidc_and_no_container_defaults(tmp_path, monkeypatch):
     config = load('configure-env')
     monkeypatch.setenv('AUTHENTIK_ISSUER', 'https://identity.example.test/application/o/tdl/')

@@ -26,6 +26,9 @@ def require_idle(values: dict[str, str]) -> None:
     if not path.exists():
         return
     with sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True) as db:
+        if db.execute("SELECT name FROM sqlite_master WHERE name='runtime_settings'").fetchone():
+            if db.execute("SELECT count(*) FROM runtime_settings WHERE operation_status IN ('queued','moving','failed')").fetchone()[0]:
+                raise RuntimeError("Hay un traslado de descargas pendiente. Resuélvelo antes de actualizar.")
         if not db.execute("SELECT name FROM sqlite_master WHERE name='download_jobs'").fetchone():
             return
         if db.execute("SELECT count(*) FROM download_jobs WHERE status IN ('pending','running')").fetchone()[0]:

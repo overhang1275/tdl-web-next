@@ -179,7 +179,9 @@ async function mockApi(page: Page) {
       return json({
         app: { name: "TDL Console", version: "1.0.0", environment: "production" },
         paths: { data_dir: "/data", downloads_dir: "/data/downloads" },
-        limits: { download_batch_size: 100, export_batch_size: 5000 },
+          limits: { command_timeout_seconds: 7200, download_idle_timeout_seconds: 600, download_batch_size: 100, export_batch_size: 5000 },
+          downloads_storage_root: "/data",
+          operation: { id: null, status: "idle", error: null, source: null, destination: null },
         tdl: { binary: "/usr/local/bin/tdl", namespace: "default" },
         authentik: {
           issuer: "https://auth.example.com/application/o/tdl-console",
@@ -214,6 +216,35 @@ async function mockApi(page: Page) {
 test.beforeEach(async ({ page }) => {
   await authenticate(page);
   await mockApi(page);
+});
+
+test("settings validate input, confirm relocation and show server errors", async ({ page }) => {
+  let writes = 0;
+  await page.route("**/api/v1/settings", async (route) => {
+    if (route.request().method() !== "PUT") return route.fallback();
+    writes++;
+    return route.fulfill({ status: 409, json: { error: { code: "queue_busy", message: "Espera a que terminen las descargas." } } });
+  });
+  await page.goto("/settings");
+  const batch = page.getByLabel("Archivos por lote de descarga");
+  await batch.fill("0");
+  await page.getByRole("button", { name: "Guardar ajustes", exact: true }).click();
+  await expect(batch).toBeFocused();
+  expect(writes).toBe(0);
+  await batch.fill("25");
+  await page.getByRole("button", { name: "Guardar ajustes", exact: true }).click();
+  await expect(page.getByRole("alert").filter({ hasText: "Espera a que terminen" })).toBeVisible();
+  expect(writes).toBe(1);
+  await page.getByLabel("Carpeta de descargas").fill("/data/new-downloads");
+  await page.getByRole("button", { name: "Guardar ajustes", exact: true }).click();
+  await expect(page.getByRole("dialog")).toContainText("Trasladar archivos existentes");
+  expect(writes).toBe(1);
+  await page.getByRole("button", { name: "Guardar y trasladar", exact: true }).click();
+  await expect(page.getByRole("dialog")).not.toBeVisible();
+  await expect(page.getByRole("alert").filter({ hasText: "Espera a que terminen" })).toBeVisible();
+  await page.setViewportSize({ width: 390, height: 844 });
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+  await page.screenshot({ path: path.join(screenshots, "settings-editable-390.png"), fullPage: true });
 });
 
 test("templates can be saved, updated and deleted", async ({ page }) => {
