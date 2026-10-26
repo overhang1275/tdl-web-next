@@ -93,8 +93,8 @@ Contraste mínimo AA (4.5:1) en texto normal y 3:1 en texto grande/controles.
 - Móvil: barra superior compacta, bottom nav de 5 destinos, CTA “Nueva descarga” visible.
 - El contenido respira; no se usan tablas con scroll horizontal como patrón principal.
 - En móvil, tablas se convierten en tarjetas con la información clave y acciones.
-- Login: panel partido; marca/estado a la izquierda, formulario a la derecha. En móvil solo el
-  formulario, con la marca arriba.
+- Login: panel partido; marca/estado a la izquierda y un único botón “Continuar con Authentik”
+  a la derecha. En móvil solo el botón, con la marca arriba. No hay formulario de contraseña.
 
 ## 8. Componentes
 

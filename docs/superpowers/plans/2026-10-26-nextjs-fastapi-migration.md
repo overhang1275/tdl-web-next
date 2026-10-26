@@ -21,8 +21,9 @@ TanStack Query 5.105.0, Zod 4.6.7, React Hook Form 7.91.0; pytest, Vitest, Playw
 - Copia de trabajo: `C:\Users\init\Desktop\tdl-web-next`; el original no se toca.
 - Rama: `migration/nextjs-fastapi`; origin privado nuevo; upstream original.
 - Un solo worker Uvicorn y un solo worker RQ.
-- JWT con cookies HttpOnly (access 15 min, refresh 7 días); refresh revocable en Redis.
-- `SECRET_KEY` de 32+ y credenciales de administrador obligatorias en producción; TLS en Nginx.
+- Authentik es el único IdP; Auth.js gestiona la sesión web y el BFF inyecta el Bearer.
+- FastAPI valida JWT RS256 con JWKS, issuer y audience de Authentik.
+- Docker Compose es el camino de producción y de pruebas; systemd se retira.
 - Sin lógica de `tdl` en Next.js; sin `NEXT_PUBLIC_*` con secretos; tokens nunca en `localStorage`.
 - SQLite y raíz de datos existentes; migraciones aditivas.
 - No se borran datos reales sin autorización.
@@ -36,10 +37,11 @@ TanStack Query 5.105.0, Zod 4.6.7, React Hook Form 7.91.0; pytest, Vitest, Playw
 - Un archivo HTML/SVG no debe ejecutarse en el origen de la app.
 - Un job debe seguir siendo reanudable tras reiniciar API/worker.
 - La UI no debe mostrar progreso, velocidad o ETA inventados.
-- La app no debe arrancar en producción sin `SECRET_KEY` y credenciales.
-- Un access token no debe servir como refresh; el logout debe revocar el refresh.
-- Un 401 debe refrescar una vez y volver a `/login` si falla, sin bucles.
-- Las cookies críticas no deben ser legibles desde JavaScript.
+- La app no debe arrancar sin configuración de Authentik.
+- Un token de Authentik inválido, expirado o de otra audiencia/issuer no debe entrar.
+- El navegador no debe recibir ni guardar el access token de Authentik.
+- Un 401 del BFF debe volver a `/login` sin bucles.
+- Las cookies de sesión no deben ser legibles desde JavaScript.
 
 ---
 
@@ -98,6 +100,8 @@ frontend/
     not-found.tsx
     error.tsx
     login/page.tsx
+    api/auth/[...nextauth]/route.ts
+    api/v1/[...path]/route.ts
     (dashboard)/
       layout.tsx
       downloads/page.tsx
@@ -107,6 +111,7 @@ frontend/
       chats/[id]/page.tsx
       logs/page.tsx
       settings/page.tsx
+  auth.ts
   middleware.ts
   components/
     login-form.tsx
@@ -150,10 +155,12 @@ frontend/
   vitest.config.ts
   playwright.config.ts
 deploy/
+  docker/compose.yml
+  docker/compose.test.yml
+  docker/Dockerfile.api
+  docker/Dockerfile.web
   nginx/tdl-web.conf
-  systemd/tdl-web-api.service
-  systemd/tdl-web-worker.service
-  systemd/tdl-web-frontend.service
+  authentik/bootstrap.sh
   install.sh
   update.sh
 scripts/playwright.ps1
@@ -175,7 +182,7 @@ docs/design-audit/
 
 - [ ] Mover con `git mv`, conservando historial.
 - [ ] En `backend/requirements.txt`: conservar FastAPI/SQLAlchemy/Redis/RQ; retirar `jinja2` y
-      `python-multipart`; añadir `PyJWT` y `ruff`.
+      `python-multipart`; añadir `PyJWT[crypto]` y `ruff`.
 - [ ] Añadir `requirements-dev.txt` (`pytest`, `httpx`, `ruff`) y `pyproject.toml` con
       `pythonpath = ["."]`, `testpaths = ["tests"]`, `addopts = "-q"`, Ruff `line-length = 100`.
 - [ ] Añadir a `.gitignore`: `backend/data/`, `.pytest-tmp/`, `frontend/node_modules/`,
@@ -198,25 +205,22 @@ docs/design-audit/
 - Modify: `backend/app/config.py`, `backend/app/main.py`, `backend/requirements.txt`
 
 **Interfaces:**
-- `Settings.validate()` lanza `RuntimeError` si `APP_ENV=production` y falta `SECRET_KEY` (32+) o
-  `WEB_PASSWORD_HASH`/`WEB_PASSWORD` (12+).
-- `auth.hash_password(password) -> str` (scrypt), `auth.verify_password(password, encoded) -> bool`.
-- `auth.create_access_token(username) -> str`, `auth.create_refresh_token(username) -> tuple[str, str]`
-  (token, jti), `auth.decode_token(token, expected_type) -> dict`.
-- `auth.set_auth_cookies(response, access, refresh, jti)`, `auth.clear_auth_cookies(response)`.
-- `deps.get_current_user(request) -> User` valida el access JWT.
+- `Settings.validate()` lanza `RuntimeError` si `APP_ENV=production` y faltan
+  `AUTHENTIK_ISSUER`, `AUTHENTIK_AUDIENCE` o `AUTHENTIK_JWKS_URL`.
+- `auth.verify_authentik_token(token) -> dict` valida RS256 con JWKS, `iss`, `aud`, `exp`, `iat`
+  y, si `AUTHENTIK_ADMIN_GROUP` está definido, exige el grupo.
+- `deps.get_current_user(request) -> UserRead` lee `Authorization: Bearer` y valida el JWT.
 - `security.install(app)` registra CSRF, cabeceras y `TrustedHostMiddleware`.
-- `ApiError(code: str, message: str, status_code: int, detail: Any | None = None)`.
+- `ApiError(code, message, status_code=400, detail=None)`.
 - `status_service.get(force: bool = False) -> dict`.
 
-- [ ] Añadir `PyJWT` a `requirements.txt`.
-- [ ] Escribir pruebas de health 200 sin auth, `/api/v1/status` 401 sin cookie, token válido,
-      token de refresh rechazado como access y contraseña hash.
+- [ ] Añadir `PyJWT[crypto]` a `requirements.txt`.
+- [ ] Escribir pruebas de health 200, `/api/v1/status` 401 sin Bearer, token válido, token
+      expirado, audience/issuer incorrectos y grupo ausente.
 - [ ] Implementar `Settings.validate()` y `services/auth.py`:
-      - scrypt con sal; comparación con `hmac.compare_digest`.
-      - HS256, claims `sub/role/type/jti/iat/exp`; access 15 min, refresh 7 días.
-      - Redis `auth:refresh:<jti>` con TTL; fallo cerrado.
-      - Cookies HttpOnly/Secure/SameSite; access `Lax`, refresh `Strict`.
+      - `PyJWKClient` cacheado; `jwt.decode` con `algorithms=["RS256"]`, `issuer`, `audience`.
+      - `AUTHENTIK_ADMIN_GROUP` opcional; si está, exigir el claim `groups`.
+      - Sin emisión de tokens, sin cookies, sin contraseñas locales.
 - [ ] Implementar `security.py`: sin Basic; exigir `X-Requested-With` y origen propio en
       escrituras; cabeceras de seguridad; `TrustedHostMiddleware`.
 - [ ] Implementar `status_service` con TTL 10 s, Redis ping, `Worker.all`, `TdlService.is_logged_in`,
@@ -268,8 +272,7 @@ docs/design-audit/
   `backend/app/schemas.py`
 
 **Interfaces:**
-- `POST /auth/login` con `{username, password}`; set-cookie access/refresh; 401 genérico.
-- `POST /auth/refresh` rota el access; `POST /auth/logout` revoca; `GET /auth/me`.
+- `GET /auth/me` devuelve `UserRead` a partir del Bearer de Authentik; no hay login local.
 - `POST /telegram/login/start|input|cancel`, `GET /telegram/login`.
 - `POST /jobs` acepta `JobCreate` y `Idempotency-Key`; devuelve 201 o 409
   `duplicate_job` con `detail.job_id`.
@@ -279,12 +282,12 @@ docs/design-audit/
 - `POST /templates`, `PUT /templates/{id}`, `DELETE /templates/{id}`.
 - `POST /admin/reset` exige `{"confirmation": "REINICIAR", "keep_session": bool}`.
 
-- [ ] Pruebas de login/refresh/logout, cookies, CSRF, creación, duplicado, cola caída,
+- [ ] Pruebas de `/auth/me` con token válido/inválido, CSRF, creación, duplicado, cola caída,
       cancelación, reintento, borrado, plantillas y reset.
 - [ ] Implementar routers y validaciones; no confiar en `confirm()` del navegador.
 - [ ] `interactive_login` sin eco de entrada; import de `pty` dentro de `start()`.
 - [ ] Servicios de arranque solo si `APP_ENV != production`.
-- [ ] Commit: `feat: API de escritura, JWT y login de Telegram`.
+- [ ] Commit: `feat: API de escritura y login de Telegram`.
 
 **Verify:** `pytest tests/test_api_jobs.py tests/test_api_templates.py tests/test_api_security.py -q`.
 
@@ -344,18 +347,22 @@ docs/design-audit/
   `lib/utils.ts`, `components/providers.tsx`
 
 **Interfaces:**
-- `apiFetch<T>(path, init?)` añade `X-Requested-With`, `Content-Type`, `credentials: same-origin`;
-  en 401 intenta `POST /api/v1/auth/refresh` una vez y reintenta; si falla, va a `/login`.
-- `middleware.ts` verifica `tdl_access` con `jose` y protege las rutas privadas; `/login` es pública.
-- `next.config.ts` con `output: "standalone"` y rewrite `/api/:path*`.
+- `auth.ts` configura NextAuth v5 con provider OIDC `authentik` (issuer, client ID/secret, PKCE).
+- `middleware.ts` exporta `auth` y protege rutas privadas; `/login` y `/api/auth/*` son públicas.
+- `app/api/auth/[...nextauth]/route.ts` expone handlers de Auth.js.
+- `app/api/v1/[...path]/route.ts` es el BFF: `getToken`, valida origen, inyecta Bearer,
+  reenvía a `API_INTERNAL_URL` y streamea la respuesta.
+- `apiFetch<T>` usa rutas relativas, `X-Requested-With` y `credentials: same-origin`; en 401
+  redirige a `/login`.
+- `next.config.ts` con `output: "standalone"` y `API_INTERNAL_URL`.
 - `QueryClient` con `retry: 1`, `refetchOnWindowFocus: true`.
 
-- [ ] Escribir configuración y dependencias fijadas (`jose` incluido).
-- [ ] Implementar `apiFetch`, tipos, query keys y cliente de auth.
-- [ ] Implementar `middleware.ts` con verificación HS256 y redirect a `/login`.
+- [ ] Escribir configuración y dependencias fijadas (`next-auth@5.0.0-beta.32`).
+- [ ] Implementar `auth.ts`, handlers de Auth.js, middleware y BFF.
+- [ ] Implementar `apiFetch`, tipos y query keys.
 - [ ] Layout raíz, tema claro/oscuro, Toaster, fuente del sistema.
 - [ ] `npm install`, `npm run typecheck`, `npm run lint`.
-- [ ] Commit: `feat: scaffold Next.js con middleware JWT`.
+- [ ] Commit: `feat: scaffold Next.js con Authentik y BFF`.
 
 **Verify:** `cd frontend; npm run typecheck; npm run lint`.
 
@@ -375,7 +382,7 @@ docs/design-audit/
   `downloads/new/page.tsx`, `downloads/[id]/page.tsx`, `chats/page.tsx`, `chats/[id]/page.tsx`,
   `logs/page.tsx`, `settings/page.tsx`
 
-- [ ] Implementar login profesional (marca, formulario, errores, loading) y menú de usuario.
+- [ ] Implementar login de marca con botón “Continuar con Authentik” y menú de usuario con logout.
 - [ ] Implementar shell responsive con sidebar/bottom nav y búsqueda.
 - [ ] Resumen: estado, métricas, activos, errores, CTA.
 - [ ] Descargas: filtros, tabla/cards, paginación.
@@ -423,25 +430,27 @@ docs/design-audit/
 
 ---
 
-### Task 10: Despliegue LXC
+### Task 10: Docker Compose de producción y pruebas
 
 **Files:**
-- Create: `deploy/systemd/tdl-web-api.service`, `tdl-web-worker.service`,
-  `tdl-web-frontend.service`, `deploy/nginx/tdl-web.conf`, `deploy/install.sh`,
-  `deploy/update.sh`, `.env.example`, `README.md`
-- Delete/retirar: `Dockerfile`, `docker-compose.yml` del camino principal.
+- Create: `deploy/docker/compose.yml`, `deploy/docker/compose.test.yml`,
+  `deploy/docker/Dockerfile.api`, `deploy/docker/Dockerfile.web`,
+  `deploy/nginx/tdl-web.conf`, `deploy/authentik/bootstrap.sh`, `.env.example`, `README.md`
+- Delete/retirar: `Dockerfile` y `docker-compose.yml` antiguos; systemd como camino principal.
 
-- [ ] Script de instalación: usuario, venv, Redis, Node 22, build, `SECRET_KEY`,
-      `WEB_PASSWORD_HASH`, `ADMIN_USERNAME`, Nginx, systemd, permisos 700/600, health check.
-- [ ] Nginx: TLS, rate limit de login/API, `/api/` y `/`, health sin auth, timeouts. Sin Basic.
-- [ ] systemd: `UMask=0077`, `NoNewPrivileges`, `ProtectSystem=strict`, `ReadWritePaths`;
-      API y frontend reciben `SECRET_KEY`; solo API recibe `WEB_PASSWORD_HASH`.
-- [ ] Update: backup SQLite + WAL, build, migración, restart, rollback.
-- [ ] README con instalación, operación, logs, backup, login y migración.
-- [ ] Commit: `feat: despliegue LXC con JWT`.
+- [ ] Compose de producción: `postgres`, `redis`, `authentik-server`, `authentik-worker`,
+      `api`, `worker`, `web`, `nginx`; volúmenes y redes internas.
+- [ ] Compose de pruebas: Redis, mock OIDC/JWKS, contenedores `tests` y `playwright`.
+- [ ] Dockerfiles no root, con `tdl` y `wipe`; healthchecks; límites de recursos.
+- [ ] Nginx: TLS, rate limit, `app.${DOMAIN}` → web, `auth.${DOMAIN}` → Authentik, health.
+- [ ] Bootstrap de Authentik: grupo `tdl-admin`, provider OIDC, application y redirect URI;
+      script idempotente con token.
+- [ ] Update: backup de volúmenes/SQLite, pull/build, migración, restart, rollback.
+- [ ] README con `docker compose up`, bootstrap, TLS, backups, logs y migración.
+- [ ] Commit: `feat: docker compose con Authentik`.
 
-**Verify:** `bash -n deploy/install.sh deploy/update.sh`; revisar unidades con `systemd-analyze
-verify` si está disponible; no afirmar instalación real sin LXC.
+**Verify:** `docker compose -f deploy/docker/compose.yml config`; `docker compose -f
+deploy/docker/compose.test.yml config`; no afirmar un despliegue real sin ejecutarlo.
 
 ---
 

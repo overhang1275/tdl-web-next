@@ -23,34 +23,35 @@ no ofrece una API tipada. La migración debe reducir riesgo, no reescribir la l�
   presenta y consume la API.
 - API `/api/v1` tipada, con OpenAPI, errores consistentes y health/readiness.
 - Interfaz renovada, responsive, en español, con tema claro/oscuro y accesibilidad.
-- Despliegue en LXC Debian/Ubuntu sin Docker obligatorio.
+- Despliegue con Docker Compose en LXC Debian/Ubuntu, incluyendo Authentik, Postgres y Redis.
 - Corregir los riesgos de seguridad del informe y añadir pruebas que los cubran.
 
 ## 3. No objetivos
 
-- Multiusuario, roles, cuotas o aislamiento entre administradores.
+- Multiusuario, roles, cuotas o aislamiento entre administradores más allá de Authentik.
 - Pausar/reanudar de verdad: `tdl` no ofrece pausa; solo cancelar y reintentar.
 - WebSocket/SSE: el polling cubre el caso y es más simple.
 - Editar `.env` o configuración sensible desde la UI.
 - Límites de velocidad o programación: no verificados en la versión de `tdl`.
 - Sustituir Redis/RQ por una cola propia.
-- Docker como camino principal de despliegue.
+- Duplicar la lógica de negocio en Next.js (solo el proxy BFF de autenticación).
 
 ## 4. Anti-objetivos
 
-- Duplicar la lógica de `tdl`, filtros o trabajos en Next.js (API Routes/Server Actions).
+- Duplicar la lógica de `tdl`, filtros o trabajos en Next.js.
 - Mostrar porcentajes, ETA o velocidad inventados.
-- Exponer secretos, rutas absolutas o sesiones de Telegram al navegador.
+- Exponer secretos, rutas absolutas, tokens de Authentik o sesiones de Telegram al navegador.
 - Eliminar funciones existentes sin documentarlo.
 - Cambiar el formato de la base de datos o los archivos de datos sin migración y respaldo.
+- Mantener un segundo sistema de login local además de Authentik.
 
 ## 5. Restricciones
 
-- LXC Debian/Ubuntu, sin Docker obligatorio.
-- Python 3.12+; Node 22 LTS; Redis local; Nginx; `tdl` instalado por el script oficial.
+- LXC Debian/Ubuntu con Docker Compose; Authentik como proveedor de identidad.
+- Python 3.12+; Node 22 LTS; Redis; Postgres para Authentik; Nginx; `tdl`.
 - SQLite existente y directorios de datos actuales.
 - Un solo administrador y un solo worker de RQ.
-- La UI y la API deben compartir origen en producción.
+- La UI y la API comparten origen público; Next.js hace de BFF para `/api/`.
 - No se publican cambios ni se hace merge/pull request sin autorización.
 
 ## 6. Enfoques considerados
@@ -94,20 +95,22 @@ Se mantiene la UI actual y se añade Next.js como capa externa.
 │   │   ├── database.py       engine, sesión, migraciones
 │   │   ├── models.py         DownloadJob, DownloadFile, DownloadTemplate
 │   │   ├── schemas.py        entrada/salida Pydantic
-│   │   ├── security.py       Basic auth, CSRF, cabeceras, límites
-│   │   ├── api/v1/           health, status, auth, chats, jobs, files, templates,
+│   │   ├── security.py       validación JWT Authentik, CSRF, cabeceras
+│   │   ├── api/v1/           health, status, auth/me, chats, jobs, files, templates,
 │   │   │                     search, dashboard, settings, admin
 │   │   ├── services/         tdl, filtering, transfers, jobs, files, logs,
-│   │   │                     chat_cache, search, errors, paths, login, status
+│   │   │                     chat_cache, search, errors, paths, login, status, auth
 │   │   ├── worker.py         ejecución RQ (misma ruta de importación)
 │   │   └── rq_worker.py      arranque del worker
 │   ├── tests/
 │   └── requirements.txt
 ├── deploy/
+│   ├── docker/compose.yml
+│   ├── docker/compose.test.yml
+│   ├── docker/Dockerfile.api
+│   ├── docker/Dockerfile.web
 │   ├── nginx/tdl-web.conf
-│   ├── systemd/tdl-web-{api,worker,frontend}.service
-│   ├── install.sh
-│   └── update.sh
+│   └── authentik/bootstrap.sh
 ├── docs/
 │   ├── architecture/
 │   ├── audit/
@@ -123,6 +126,24 @@ El paquete Python sigue llamándose `app` y el directorio de trabajo del backend
 Así, la ruta `app.worker.run_download_job` no cambia y los jobs RQ en vuelo siguen siendo
 importables durante la transición.
 
+```mermaid
+flowchart LR
+  U[Browser] -->|HTTPS| N[Nginx]
+  N -->|app domain| W[Next.js + Auth.js]
+  N -->|auth domain| A[Authentik]
+  A --> P[(Postgres)]
+  A --> R[(Redis)]
+  W -->|OIDC| A
+  W -->|BFF + Bearer JWT| API[FastAPI]
+  API --> R
+  R --> WK[RQ Worker]
+  WK --> T[tdl]
+  API --> DB[(SQLite)]
+  WK --> DB
+  API --> D[(Datos)]
+  WK --> D
+```
+
 ## 8. Responsabilidades
 
 ### FastAPI
@@ -133,14 +154,22 @@ importables durante la transición.
 - Leer/escribir SQLite, exports, filtered, metadata, logs y descargas.
 - Validar filtros, rutas, tamaños, estados y confirmaciones.
 - Servir archivos con cabeceras seguras.
-- Aplicar autenticación, CSRF, límites y errores consistentes.
+- Validar el JWT de Authentik (JWKS, issuer, audience, expiración) y aplicar CSRF/errores.
 
 ### Next.js
 
-- Presentar las pantallas y consumir `/api/v1`.
+- Presentar las pantallas y consumir `/api/v1` a través del BFF.
+- Gestionar el login OIDC con Authentik y la sesión web con Auth.js.
+- Inyectar el `Authorization: Bearer` en el proxy BFF; nunca exponerlo al navegador.
 - Validar formularios en cliente para UX; la validación autoritativa es FastAPI.
 - Gestionar tema, navegación, estados de carga/vacío/error/reconexión y accesibilidad.
-- No ejecutar comandos, no leer archivos del servidor, no guardar secretos.
+- No ejecutar comandos, no leer archivos del servidor, no duplicar lógica de negocio.
+
+### Authentik
+
+- Ser el único proveedor de identidad y emitir los JWT.
+- Aplicar la política de acceso (grupo `tdl-admin`) antes de emitir el token.
+- Gestionar usuarios, MFA, sesiones y logout. La app no almacena contraseñas.
 
 ## 9. Modelo de trabajos
 
@@ -215,10 +244,7 @@ Rutas:
 |---|---|---|
 | GET | `/api/v1/health` | Liveness mínima, sin auth |
 | GET | `/api/v1/status` | tdl, sesión, Redis, worker, almacenamiento, versión |
-| POST | `/api/v1/auth/login` | Login de administrador; cookies JWT |
-| POST | `/api/v1/auth/refresh` | Renueva el access con el refresh |
-| POST | `/api/v1/auth/logout` | Revoca refresh y borra cookies |
-| GET | `/api/v1/auth/me` | Usuario y expiración |
+| GET | `/api/v1/auth/me` | Identidad del JWT de Authentik |
 | POST | `/api/v1/telegram/login/start` | Inicia login pty de Telegram |
 | POST | `/api/v1/telegram/login/input` | Envía teléfono/código/2FA |
 | POST | `/api/v1/telegram/login/cancel` | Cancela login de Telegram |
@@ -249,48 +275,43 @@ Rutas:
 Esquemas principales: `JobCreate`, `JobRead`, `JobFileRead`, `TemplateCreate`, `TemplateRead`,
 `ChatRead`, `StatusRead`, `DashboardRead`, `SearchRead`, `Page[T]`, `ApiError`.
 
+El login, callback, logout y sesión web viven en Next.js/Auth.js (`/api/auth/*`). FastAPI no
+emite tokens: solo valida el Bearer de Authentik que inyecta el BFF.
+
 ## 12. Autenticación y seguridad
 
-- **JWT con cookies HttpOnly.** El login es `POST /api/v1/auth/login` con usuario y contraseña.
-  FastAPI emite un access token JWT (15 min) y un refresh token JWT (7 días), ambos en cookies
-  HttpOnly (`tdl_access`, `tdl_refresh`). El navegador nunca guarda tokens en JavaScript.
-- **Contraseña de administrador.** `ADMIN_USERNAME` (por defecto `admin`) y
-  `WEB_PASSWORD_HASH` (scrypt con sal) o `WEB_PASSWORD` en desarrollo. En producción se exige
-  hash o contraseña de 12+ caracteres; el proceso no arranca sin credenciales.
-- **Firma y claims.** HS256 con `SECRET_KEY` de 32+ caracteres. Claims: `sub`, `role=admin`,
-  `type=access|refresh`, `jti`, `iat`, `exp`. El access token no se puede usar como refresh.
-- **Refresh y revocación.** `POST /auth/refresh` valida la cookie de refresh, comprueba el `jti`
-  en Redis (`auth:refresh:<jti>`) y emite un access nuevo (rotación de refresh opcional). El
-  logout borra el `jti` de Redis y las cookies. El access caduca en 15 min; no hay lista negra
-  de access para no añadir una consulta por petición.
-- **Web y API.** Next.js `middleware.ts` verifica el access token con `jose` y redirige a
-  `/login` si falta o expiró. FastAPI verifica el JWT en cada ruta protegida con `PyJWT`.
-  La API es la autoridad; el middleware es la puerta de navegación. `/login`, `/api/v1/health`,
-  `/api/docs` y los estáticos quedan fuera del middleware.
-- **Cookies.** `HttpOnly`, `Secure` en producción, `SameSite=Lax` para access y `SameSite=Strict`
-  para refresh, `Path=/` y `/api/v1/auth`. No se usan `localStorage` ni `NEXT_PUBLIC_*` para tokens.
-- **CSRF.** SameSite + `X-Requested-With: tdl-web` + `Origin`/`Referer` propio en escrituras.
-  Una petición cruzada con cabecera personalizada no pasa el preflight CORS. No hay CORS en
-  producción; en desarrollo se usa el rewrite de Next.js.
+- **Authentik como único IdP.** El login web lo gestiona Auth.js con el proveedor OIDC de
+  Authentik (authorization code + PKCE). La app no almacena contraseñas ni emite tokens.
+- **Sesión web.** Auth.js guarda la sesión en una cookie HttpOnly, Secure y SameSite=Lax,
+  cifrada con `AUTH_SECRET`. El navegador nunca ve el access token de Authentik.
+- **BFF.** El proxy `app/api/v1/[...path]/route.ts` lee la sesión con Auth.js, obtiene el
+  access token de Authentik y lo inyecta como `Authorization: Bearer` hacia FastAPI. El
+  navegador solo habla con Next.js; FastAPI no está publicado directamente.
+- **Validación en FastAPI.** `PyJWT` valida firma RS256 con JWKS de Authentik, `iss`, `aud`,
+  `exp` y `iat`; opcionalmente exige el grupo `tdl-admin` en `groups`. El JWKS se cachea.
+- **Renovación.** Auth.js renueva el access token con el refresh token de Authentik antes de
+  que caduque. Si el refresh falla, la sesión se invalida y se vuelve a `/login`.
+- **Autorización.** Authentik aplica la política de acceso al application `tdl-console` para el
+  grupo `tdl-admin`. FastAPI vuelve a comprobar el claim de grupo si está configurado.
+- **CSRF.** Cookie de sesión SameSite + `X-Requested-With: tdl-web` + `Origin`/`Referer` propio
+  en escrituras. El BFF valida el origen antes de reenviar. No hay CORS en producción.
 - **TLS obligatorio** en Nginx. `ALLOW_INSECURE_HTTP=true` solo para un laboratorio explícito.
-- **Rate limit:** `limit_req` de Nginx para `/api/` y `/api/v1/auth/login`; bloqueo temporal tras
-  fallos repetidos. Los fallos se registran sin contraseña.
+- **Rate limit:** `limit_req` de Nginx para `/api/` y `/api/auth/`; bloqueo temporal.
 - **XSS:** Next.js escapa por defecto; prohibido `dangerouslySetInnerHTML` con datos de Telegram.
   Los toasts usan texto, no HTML.
 - **Archivos:** `Content-Disposition: attachment` para HTML/SVG/XML; `CSP: sandbox` en respuestas
   de archivos; `X-Content-Type-Options: nosniff`; solo imágenes/video/audio/PDF inline.
-- **Secretos:** `SECRET_KEY` se comparte entre API y frontend por variables de entorno del
-  servidor, nunca en `NEXT_PUBLIC_*`. `WEB_PASSWORD_HASH` solo lo ve la API.
-- **Permisos:** `UMask=0077` en systemd y `os.umask(0o077)` al arrancar; DB, caché, logs y sesión
-  en 600; directorios en 700.
+- **Secretos:** `AUTH_SECRET`, `AUTHENTIK_CLIENT_SECRET` y `POSTGRES_PASSWORD` viven solo en
+  variables de entorno del servidor, nunca en `NEXT_PUBLIC_*`.
+- **Permisos:** `UMask=0077` en contenedores y `os.umask(0o077)` al arrancar; DB, caché, logs y
+  sesión en 600; directorios en 700.
 - **Login de Telegram:** no se registra la entrada del usuario; la salida de `tdl` se muestra con
   los valores sensibles redactados.
 - **Confirmaciones:** borrado de job, limpieza de chat, borrado de plantilla y reset exigen un
   campo/token de confirmación validado en FastAPI; no basta `confirm()` del navegador.
-- **Servicios:** `services/start` solo existe en desarrollo. En producción, systemd gestiona
-  Redis y worker.
-- **Redis:** bind a 127.0.0.1, sin exposición; opcional `requirepass` documentado. Redis guarda
-  los `jti` de refresh; si no está disponible, el refresh falla cerrado.
+- **Servicios:** `services/start` solo existe en desarrollo. En producción, Docker Compose
+  gestiona Redis y worker.
+- **Redis:** red interna de Docker, sin exposición; Authentik y RQ usan bases separadas.
 - **Cabeceras:** CSP con nonce de Next.js, `frame-ancestors 'none'`, `Referrer-Policy: same-origin`,
   `Permissions-Policy` mínima, HSTS cuando hay TLS.
 
@@ -313,8 +334,8 @@ Esquemas principales: `JobCreate`, `JobRead`, `JobFileRead`, `TemplateCreate`, `
 
 Pantallas:
 
-1. **Login** (`/login`): pantalla pública de acceso, marca del producto, formulario de usuario y
-   contraseña, errores genéricos y estado de carga. Sin registro ni recuperación pública.
+1. **Login** (`/login`): pantalla de marca con un único botón “Continuar con Authentik”. Redirige
+   al proveedor OIDC; no hay formulario de contraseña ni registro en la app.
 2. **Resumen** (`/`): estado de sesión/servicios, métricas, jobs activos, últimos errores,
    botón “Nueva descarga”.
 3. **Descargas** (`/downloads`): historial con filtros (estado, chat, texto), tabla en escritorio
@@ -337,24 +358,25 @@ contraste AA, `prefers-reduced-motion`.
 
 ## 15. Despliegue
 
-- **SO:** Debian 13 o Ubuntu 24.04 (Debian 12 requiere Python 3.12 de backports).
-- **Paquetes:** python3.12, venv, redis-server, nginx, nodejs 22 (NodeSource), build-essential,
-  curl, ca-certificates, wipe.
-- **tdl:** instalador oficial; `TDL_BINARY` configurable; validar versión y `tdl --version`.
-- **Servicios systemd:**
-  - `tdl-web-api.service`: `uvicorn app.main:app --host 127.0.0.1 --port 8000 --workers 1`.
-  - `tdl-web-worker.service`: `python -m app.rq_worker`.
-  - `tdl-web-frontend.service`: `node server.js` en 127.0.0.1:3000.
-  - `UMask=0077`, `NoNewPrivileges=true`, `ProtectSystem=strict`, `ReadWritePaths` solo datos.
-  - API y frontend reciben `SECRET_KEY` por `EnvironmentFile`; la web lo usa solo en el servidor
-    para verificar el JWT en middleware. `WEB_PASSWORD_HASH` solo lo recibe la API.
-- **Nginx:** TLS, rate limit, `/api/` → 8000, `/` → 3000, timeouts de descarga, límites de
-  petición, logs sin credenciales. No hay Basic auth; el login JWT lo gestiona la app.
-- **Datos:** `/opt/tdl-web/data/{sessions,exports,downloads,logs}`, DB y backups; 700/600.
-- **Actualización:** backup SQLite, build frontend, migración, restart, health check; rollback
-  conservando DB y datos.
-- **Docker:** opcional y fuera del camino principal; si se conserva, usuario no root,
-  `SECRET_KEY` y credenciales obligatorias.
+- **SO:** Debian 13 o Ubuntu 24.04 con Docker Engine y Compose v2.
+- **Stack:** `postgres` (Authentik), `redis` (Authentik db 0, RQ db 1), `authentik-server`,
+  `authentik-worker`, `api`, `worker`, `web`, `nginx`. Solo Nginx publica 80/443.
+- **Imágenes:** `ghcr.io/goauthentik/server:2026.8.5` (server y worker) y builds propios
+  `docker/Dockerfile.api`, `docker/Dockerfile.web`.
+- **tdl:** se instala en la imagen del worker/API desde el instalador oficial; se valida
+  `tdl --version` en el build. `TDL_BINARY` configurable.
+- **Authentik:** OIDC application `tdl-console`, grupo `tdl-admin`, redirect URI
+  `${APP_URL}/api/auth/callback/authentik`; bootstrap con token y script idempotente.
+- **Nginx:** TLS, rate limit, `app.${DOMAIN}` → `web:3000` (incluye `/api/` BFF) y
+  `auth.${DOMAIN}` → `authentik-server:9000`; health directo a `api:8000/health`.
+- **Datos:** volumen `app-data` para SQLite, sesión de Telegram, exports, descargas y logs;
+  `postgres-data`, `authentik-media` y `authentik-certs` para Authentik.
+- **Actualización:** backup SQLite + volúmenes, `docker compose pull`, migración, restart,
+  health check; rollback con la versión anterior.
+- **Tests:** `compose.test.yml` levanta Redis, un mock OIDC/JWKS y los contenedores de prueba;
+  los tests de backend y frontend corren dentro de Docker. El smoke test opcional usa Authentik
+  real en el stack de producción.
+- **Sin systemd:** se retira como camino principal; el LXC solo ejecuta Docker.
 
 ## 16. Migración de datos y corte
 
@@ -373,10 +395,12 @@ No se convierten ni borran datos reales sin autorización.
 
 - **Backend:** pytest con SQLite temporal, RQ falso y `TdlService` falso. Cubrir filtros, rutas,
   construcción de comandos, errores de tdl, ciclo de vida, duplicados, reanudación, export por
-  rangos, cancelación, borrado, auth, CSRF, content-disposition, idempotencia y progreso honesto.
+  rangos, cancelación, borrado, JWT de Authentik, CSRF, content-disposition, idempotencia y
+  progreso honesto.
 - **Frontend:** Vitest + Testing Library para formularios, estados y accesibilidad; Playwright para
-  los flujos esenciales con API mockeada y, cuando sea posible, con backend real + `tdl` falso.
-- **Verificación:** `ruff`, `pytest`, `eslint`, `tsc --noEmit`, `next build`, Playwright.
+  los flujos esenciales contra el stack Docker.
+- **Verificación:** `ruff`, `pytest`, `eslint`, `tsc --noEmit`, `next build`, Playwright y
+  `docker compose -f deploy/docker/compose.test.yml up --build`.
 - Las pruebas no usan Telegram real ni descargan archivos reales. Los mocks se identifican.
 
 ## 18. Riesgos
@@ -392,15 +416,17 @@ No se convierten ni borran datos reales sin autorización.
 | Lentitud por `tdl chat ls` | Caché de estado con TTL; health separado |
 | Búsqueda lenta | Consultar `DownloadFile`; límite y paginación |
 | SQLite con dos procesos | Worker y API usan WAL; escrituras cortas; no hay dos workers |
-| JWT sin TLS o en localStorage | TLS obligatorio; cookies HttpOnly/Secure; sin tokens en JS |
-| Refresh replay o logout no revocado | `jti` en Redis con TTL; rotación; logout borra el `jti` |
-| Pruebas en Windows | Backend se prueba en Linux/Docker; pty con import diferido |
+| JWT de Authentik sin validar audience/issuer | Validación estricta con JWKS, issuer y audience |
+| Token expuesto al navegador | BFF inyecta el Bearer; sesión Auth.js HttpOnly |
+| Authentik caído | El login falla cerrado; health muestra el estado; no hay login local |
+| Pruebas en Windows | Todo corre en Docker/Linux; pty con import diferido |
 
 ## 19. Decisiones del diseño
 
 - Se conserva Redis/RQ (A).
-- Autenticación JWT con cookies HttpOnly, access 15 min y refresh 7 días; refresh revocable en Redis.
-- Next.js middleware verifica el access; FastAPI lo verifica en cada router protegido.
+- Authentik es el único IdP; Auth.js gestiona la sesión web y el BFF inyecta el Bearer.
+- FastAPI valida el JWT de Authentik con JWKS, issuer y audience.
+- Docker Compose es el camino de producción y de pruebas; systemd se retira.
 - Polling, no SSE/WebSocket.
 - Un worker de API y uno de RQ.
 - SQLite existente, migraciones aditivas.
@@ -413,52 +439,51 @@ No se convierten ni borran datos reales sin autorización.
 ## 20. Criterios de aceptación
 
 - `GET /api/v1/health` responde 200; `GET /api/v1/status` informa tdl, Redis y worker.
-- Sin `SECRET_KEY` de 32+ ni credenciales en producción, la API no arranca.
-- `POST /auth/login` con credenciales válidas establece cookies HttpOnly; con inválidas devuelve
-  401 genérico.
-- `POST /auth/refresh` renueva el access; `POST /auth/logout` revoca el refresh y borra cookies.
+- `docker compose -f deploy/docker/compose.yml up -d --build` levanta el stack completo.
+- `/login` redirige a Authentik; un usuario del grupo `tdl-admin` entra y uno sin grupo no.
+- FastAPI rechaza un Bearer ausente, expirado o con audience/issuer incorrectos.
+- El navegador no recibe el access token de Authentik ni lo guarda en `localStorage`.
 - Un POST sin `X-Requested-With` o con origen cruzado recibe 403.
 - Un intento de crear dos jobs idénticos activos devuelve uno solo y 409 en el segundo.
 - Un job de prueba con `tdl` falso recorre export → filtro → descarga → completed.
 - Cancelar detiene el proceso; reintentar conserva archivos completados.
 - Eliminar un job usa `wipe`; si falla, el registro y la carpeta se conservan y se puede reintentar.
 - La UI funciona a 390x844, 1280x800 y 1440x900; sin scroll horizontal; foco visible; tema claro/oscuro.
-- `pytest`, `ruff`, `eslint`, `tsc --noEmit`, `next build` y Playwright pasan o queda documentado el bloqueo.
+- `pytest`, `ruff`, `eslint`, `tsc --noEmit`, `next build`, Playwright y los tests en Docker pasan
+  o queda documentado el bloqueo.
 - `/design-auditor` produce `docs/design-audit/latest.md` y capturas antes/después.
 - El proyecto original no cambia de rama, remotos, commits ni archivos.
 
 ## 21. Decisiones de implementación
 
-### 21.1 Autenticación JWT de extremo a extremo
+### 21.1 Authentik, Auth.js y BFF
 
-- `POST /api/v1/auth/login` recibe `{username, password}` y compara con
-  `WEB_PASSWORD_HASH` (scrypt) o, en desarrollo, con `WEB_PASSWORD`.
-- Emite `tdl_access` (15 min) y `tdl_refresh` (7 días) como cookies HttpOnly, `Secure` en
-  producción, `SameSite=Lax`/`Strict`.
-- `GET /api/v1/auth/me` devuelve `{username, role, expires_at}`.
-- `POST /api/v1/auth/refresh` valida el refresh contra Redis (`auth:refresh:<jti>`) y emite un
-  access nuevo. Si Redis no responde, falla cerrado.
-- `POST /api/v1/auth/logout` borra el `jti` de Redis y las cookies.
-- Next.js `middleware.ts` verifica el access con `jose` y redirige a `/login`; la API verifica
-  con `PyJWT` en cada router protegido. `/login`, health, docs y estáticos quedan fuera.
-- Las escrituras exigen `X-Requested-With: tdl-web` y origen propio. No hay Basic auth ni
-  `Authorization` manual en el navegador.
-- En desarrollo se puede usar `WEB_PASSWORD`; en producción se exige `SECRET_KEY` de 32+ y
-  `WEB_PASSWORD_HASH` (o contraseña de 12+ caracteres).
-- Un 401 del API intenta refresh una vez; si falla, limpia el estado y redirige a `/login`.
-- El login tiene rate limit en Nginx y un mensaje de error genérico; no revela si el usuario existe.
+- Authentik expone un application OIDC `tdl-console`; solo el grupo `tdl-admin` puede entrar.
+- Auth.js (NextAuth v5) usa un provider OIDC genérico con issuer, client ID/secret y PKCE.
+  La sesión se guarda en cookie HttpOnly cifrada con `AUTH_SECRET`.
+- `app/api/auth/[...nextauth]/route.ts` expone login/callback/session/logout.
+- `middleware.ts` de Auth.js protege las rutas privadas y redirige a `/login`; `/login` es pública.
+- `app/api/v1/[...path]/route.ts` es el BFF: lee el token con `getToken`, valida origen,
+  inyecta `Authorization: Bearer` y reenvía a `API_INTERNAL_URL`. No reenvía cookies ni el
+  `Authorization` del cliente.
+- FastAPI valida firma RS256, `iss`, `aud`, `exp` con JWKS de Authentik. Si `groups` está
+  configurado, exige `tdl-admin`. El JWKS se cachea.
+- `GET /api/v1/auth/me` devuelve la identidad validada (sub, email, name, groups).
+- El refresh lo hace Auth.js con el refresh token de Authentik; si falla, invalida la sesión.
+- Las escrituras exigen `X-Requested-With: tdl-web`; el BFF comprueba `Origin` contra el host.
+- El navegador nunca ve el access token ni lo guarda en `localStorage`.
 
 ### 21.2 Datos en el frontend
 
 - Las páginas usan componentes cliente para datos; el layout puede ser servidor.
-- `apiFetch` usa rutas relativas `/api/v1`, `credentials: "same-origin"` y la cabecera
+- `apiFetch` usa rutas relativas `/api/v1` (BFF), `credentials: "same-origin"` y la cabecera
   `X-Requested-With`. No existe `NEXT_PUBLIC_API_URL` ni token en `localStorage`.
-- En desarrollo, `next.config.ts` reescribe `/api/:path*` a `http://127.0.0.1:8000/api/:path*`.
-  En producción Nginx enruta `/api/` directamente. No hay CORS.
+- En desarrollo, el BFF de Next.js reenvía a `http://127.0.0.1:8000`; en Docker a `http://api:8000`.
+  No hay CORS porque el navegador solo habla con Next.js.
 - TanStack Query reintenta una vez, refresca al volver a la pestaña y detiene el polling cuando
   el job es terminal.
-- Un 401 se intenta refrescar; si el refresh falla, se redirige a `/login`. Un 403 se muestra
-  como estado de error, no como pantalla en blanco.
+- Un 401 del BFF redirige a `/login` (la sesión de Auth.js expiró). Un 403 se muestra como estado
+  de error, no como pantalla en blanco.
 - El layout autenticado incluye menú de usuario, cierre de sesión y nombre del workspace.
 
 ### 21.3 Corte y compatibilidad RQ
@@ -528,27 +553,29 @@ No se convierten ni borran datos reales sin autorización.
 - `next.config.ts`: `output: "standalone"`, `reactStrictMode: true`, `poweredByHeader: false`.
 - Build: `npm ci && npm run build`; luego copiar `public/` y `.next/static/` dentro de
   `.next/standalone/`.
-- systemd ejecuta `node server.js` en `.next/standalone` con `HOSTNAME=127.0.0.1`, `PORT=3000`,
-  `NEXT_TELEMETRY_DISABLED=1`.
-- Nginx enruta `/` a `127.0.0.1:3000` y `/api/` a `127.0.0.1:8000`.
+- `docker/Dockerfile.web` ejecuta `node server.js` en `.next/standalone` con `HOSTNAME=0.0.0.0`,
+  `PORT=3000`, `NEXT_TELEMETRY_DISABLED=1`, `AUTH_SECRET` y `API_INTERNAL_URL=http://api:8000`.
+- Nginx enruta `app.${DOMAIN}` a `web:3000` (incluye `/api/` BFF) y `auth.${DOMAIN}` a
+  `authentik-server:9000`.
 
-### 21.10 Pruebas en Windows y Linux
+### 21.10 Pruebas en Docker
 
-- Windows: `pytest --basetemp=.pytest-tmp`; `pty` con import diferido; `tdl` falso como `.cmd`;
-  Redis de pruebas en Docker solo si está disponible; Playwright con API fixture.
-- Linux/LXC: suite completa, `pty`, `bash`, `wipe` falso, `tdl` falso como script ejecutable.
-- Las pruebas de API usan `TestClient`, SQLite temporal y una cola RQ falsa.
-- Las pruebas de navegador usan datos fixture; la integración real se prueba con backend + `tdl`
-  falso y se identifica en el informe.
-- JWT: login válido/inválido, cookies HttpOnly/Secure/SameSite, access caducado, refresh válido,
-  refresh revocado, logout, middleware de Next.js, 401 → refresh → reintento y CSRF.
+- `docker compose -f deploy/docker/compose.test.yml up --build` levanta Redis, API, worker, web,
+  un mock OIDC/JWKS y el runner de pruebas.
+- Backend: `pytest` dentro del contenedor; SQLite temporal, RQ falsa, `TdlService` falsa.
+- Frontend: `npm test` y `npx playwright test` dentro del contenedor o contra el stack.
+- Auth: JWT RS256 de prueba, JWKS mock, audience/issuer incorrectos, expirado, grupo ausente,
+  BFF con y sin sesión, CSRF.
+- El smoke test opcional con Authentik real se ejecuta en el stack de producción y se documenta
+  como integración, no como unit test.
+- Playwright captura las pantallas para el design audit.
 
 ### 21.11 Alcance de Registros y Configuración
 
 - `/logs` lista la actividad reciente de jobs y enlaza al log de cada job; no agrega logs globales.
 - `/settings` muestra versión, entorno, rutas, límites, binario/namespace de `tdl`, estado de
-  Redis/worker, usuario y sesión. No muestra `SECRET_KEY`, `WEB_PASSWORD_HASH` ni URLs con
-  credenciales.
+  Redis/worker, usuario/sesión de Authentik. No muestra `AUTH_SECRET`, `AUTHENTIK_CLIENT_SECRET`
+  ni URLs con credenciales.
 - El botón de arranque de servicios solo aparece en desarrollo.
 
 ## 22. Respuestas a la revisión del constructor
@@ -569,10 +596,9 @@ No se convierten ni borran datos reales sin autorización.
 
 3. **¿Next.js renderiza datos en servidor?**
    No. El layout puede ser servidor, pero los datos se piden en componentes cliente con
-   TanStack Query. El JWT viaja en cookies HttpOnly; Next.js `middleware.ts` verifica el access
-   con `jose` para proteger la navegación, y FastAPI lo verifica en cada router. No hay llamadas
-   SSR que necesiten reenviar tokens. Por eso no hay URL interna de API ni CORS. En desarrollo
-   se usa un rewrite de Next.js; en producción Nginx enruta `/api/`.
+   TanStack Query. Auth.js gestiona la sesión OIDC en una cookie HttpOnly; el BFF de Next.js
+   inyecta el Bearer de Authentik hacia FastAPI. El navegador no maneja tokens. No hay llamadas
+   SSR que necesiten reenviar credenciales. Por eso no hay URL interna de API ni CORS.
 
 4. **¿Se permiten tablas nuevas?**
    No hacen falta. Las migraciones son aditivas: `ALTER TABLE` para `dedupe_key`,
@@ -589,13 +615,10 @@ No se convierten ni borran datos reales sin autorización.
    la sesión de Telegram. No borra el archivo `.sqlite3` ni los backups. Exige `REINICIAR`.
 
 6. **¿Hay runtime Linux para verificar?**
-   Sí, Docker está disponible y se usa solo para desarrollo/pruebas, no para el despliegue.
-   Windows puede ejecutar la mayoría de pruebas de servicios y API con `pytest --basetemp`,
-   `tdl` falso `.cmd` y Redis de pruebas en Docker. Las pruebas de `pty`, `bash` y scripts de
-   instalación se ejecutan en un contenedor Debian/Ubuntu o en el LXC; si el contenedor no
-   arranca, se documenta el bloqueo y no se afirma que pasaron. Playwright puede correr en
-   Windows con fixtures de API; la integración real con backend y `tdl` falso se hace con Redis
-   en Docker.
+   Sí. Todo el stack de producción y de pruebas se ejecuta con Docker Compose sobre el LXC
+   Debian/Ubuntu. Los tests de backend, frontend y Playwright corren en contenedores; `pty`,
+   `bash`, `wipe` y `tdl` falso se prueban en Linux. Windows solo se usa para editar y para
+   comandos auxiliares, no como entorno de verificación.
 
 La compatibilidad de importación de RQ es una red de seguridad, no una promesa de que un job
 antiguo siga corriendo durante el corte: el procedimiento por defecto es drenar la cola o dejar

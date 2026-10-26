@@ -19,7 +19,7 @@ Grafo inicial: `docs/architecture/graphify/initial/graph.json`
 
 | # | Funcionalidad | Archivos/símbolos actuales | Relaciones comprobadas | Destino propuesto | Acción | Depende de | Pruebas | Riesgos |
 |---|---|---|---|---|---|---|---|---|
-| 1 | Auth web de administrador y JWT | `app/main.py:basic_auth_ok`, `security_middleware`; `.env.example` | Middleware protege todo salvo `/health`; `secrets.compare_digest` | `/login` + `POST /auth/login|refresh|logout`, cookies HttpOnly, JWT en API y middleware Next.js | Sustituir | 1, 5 | Login válido/inválido, cookies, refresh, logout, CSRF, middleware, 401→refresh | Token robado, CSRF, refresh replay, sesión sin revocar |
+| 1 | Auth web con Authentik | `app/main.py:basic_auth_ok`, `security_middleware`; `.env.example` | Middleware protege todo salvo `/health`; `secrets.compare_digest` | Auth.js OIDC + Authentik; BFF inyecta Bearer; FastAPI valida JWKS | Sustituir | 1, 5 | Login Authentik, grupo, token inválido/expirado, BFF, CSRF, logout | Configuración OIDC, token expuesto, Authentik caído |
 | 2 | Login Telegram interactivo | `services/interactive_login.py`; `/setup/login/*` | pty → `tdl login --type code`; partials de consola | `POST/GET /api/v1/telegram/login/*`; consola en `/settings` | Adaptar | 1, 5 | Inicio, input, cancelación, redacción de secretos | pty solo Linux; códigos visibles |
 | 3 | Estado de servicios | `main.py:system_status`, `start_local_services`; `setup.html` | `tdl chat ls`, Redis ping, `Worker.all`, storage | `GET /api/v1/status`; `/settings` de solo lectura | Adaptar | 1 | tdl/Redis/worker caídos, caché TTL | Bloqueo por `tdl`; arranque desde web |
 | 4 | Caché y lista de chats | `services/chat_cache.py`; `main.py:chats_list`; `chats_table.html` | `read_chats_cache` → `refresh_chats_cache` → `TdlService.list_chats` | `GET /api/v1/chats`; `/chats` | Conservar/Adaptar | 2 | caché vacío, refresh, error, filtros | Lock solo en un proceso |
@@ -44,7 +44,7 @@ Grafo inicial: `docs/architecture/graphify/initial/graph.json`
 | 23 | Dashboard | `main.py:dashboard`, `dashboard_metrics`; `dashboard.html` | jobs + archivos + disco + chats | `GET /api/v1/dashboard`; `/` | Adaptar | 4, 9 | métricas, errores, disco | Escaneo de disco |
 | 24 | Reset total | `main.py:setup_reset`; `reset_application_state` | Confirmación `REINICIAR`; cancela, vacía Redis, borra datos | `POST /api/v1/admin/reset` | Conservar/Adaptar | 3, 13 | confirmación, keep_session, Redis caído | Borrado masivo |
 | 25 | Configuración/estado | `setup.html`; `config.Settings` | Env vars, rutas, límites | `GET /api/v1/settings`; `/settings` de solo lectura | Adaptar | 3 | rutas, límites, versión | Exponer secretos |
-| 26 | Instalación/actualización | `scripts/install.sh`, `update.sh`; `deploy/*` | venv, systemd, Nginx, backup SQLite | `deploy/install.sh`, `update.sh`; 3 servicios | Adaptar | 25 | instalación limpia, update, rollback | Permisos, TLS, Node/Python |
+| 26 | Instalación/actualización | `scripts/install.sh`, `update.sh`; `deploy/*` | venv, systemd, Nginx, backup SQLite | Docker Compose con Authentik/Postgres/Redis/API/worker/web/Nginx | Sustituir | 25 | stack limpio, bootstrap Authentik, update, rollback | Secretos, TLS, migraciones, arranque de Authentik |
 | 27 | Pruebas | `tests/*` | 37 passed/1 bloqueada en Windows | `backend/tests/*`, `frontend` tests, Playwright | Adaptar/Ampliar | 1-26 | suite completa, lint, build, e2e | Cobertura de seguridad |
 
 ## 3. Dependencias entre etapas

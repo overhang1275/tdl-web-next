@@ -112,7 +112,7 @@ terminar durante el corte.
 Base: `/api/v1`. JSON, Pydantic, OpenAPI en `/api/docs`.
 
 - `GET /health`, `GET /status`.
-- `POST /auth/login`, `POST /auth/refresh`, `POST /auth/logout`, `GET /auth/me`.
+- `GET /auth/me` (identidad del JWT de Authentik).
 - `POST /telegram/login/start`, `/telegram/login/input`, `/telegram/login/cancel`;
   `GET /telegram/login`.
 - `GET /chats`, `GET /chats/{chat_id}`, `DELETE /chats/{chat_id}/downloads`.
@@ -122,6 +122,9 @@ Base: `/api/v1`. JSON, Pydantic, OpenAPI en `/api/docs`.
 - `GET /jobs/{id}/events`, `/logs`, `/files`, `/files/{file_id}/content`.
 - `GET /search`, `GET /dashboard`, `GET /settings`.
 - `POST /admin/reset`, `POST /services/start` (solo desarrollo).
+
+El login, callback, sesión y logout viven en Next.js/Auth.js (`/api/auth/*`). FastAPI no emite
+tokens; valida el Bearer de Authentik que inyecta el BFF.
 
 Contratos:
 
@@ -135,7 +138,7 @@ Contratos:
 
 | Ruta | Pantalla | Funciones |
 |---|---|---|
-| `/login` | Login | Acceso de administrador, errores genéricos, marca |
+| `/login` | Login | Botón “Continuar con Authentik”; sin contraseña local |
 | `/` | Resumen | Estado, métricas, activos, errores, nueva descarga |
 | `/downloads` | Descargas | Historial, filtros, paginación, acciones |
 | `/downloads/new` | Nueva descarga | Chat, filtros, plantilla, export, validación |
@@ -145,34 +148,44 @@ Contratos:
 | `/logs` | Registros | Actividad y logs por job |
 | `/settings` | Configuración | Estado, login Telegram, usuario/sesión, rutas/límites, reset |
 
-Navegación: sidebar en escritorio, bottom nav en móvil, menú de usuario. “Nueva descarga” es la
-acción primaria. No se añaden landing pages ni pantallas de marketing.
+Navegación: sidebar en escritorio, bottom nav en móvil, menú de usuario con logout de Authentik.
+“Nueva descarga” es la acción primaria. No se añaden landing pages ni pantallas de marketing.
 
 ## 7. Flujo de un job
 
 ```mermaid
 sequenceDiagram
-  participant UI as Next.js
+  participant U as Browser
+  participant W as Next.js/Auth.js
+  participant A as Authentik
   participant API as FastAPI
   participant DB as SQLite
   participant R as Redis/RQ
-  participant W as Worker
+  participant WK as Worker
   participant T as tdl
 
-  UI->>API: POST /api/v1/auth/login
-  API-->>UI: cookies JWT HttpOnly
-  UI->>API: POST /api/v1/jobs + Idempotency-Key
+  U->>W: GET /
+  W->>U: redirect /login
+  U->>W: signIn("authentik")
+  W->>A: OIDC authorization code + PKCE
+  A-->>W: code + tokens
+  W->>A: userinfo/JWKS
+  W-->>U: session cookie HttpOnly
+  U->>W: POST /api/v1/jobs (BFF)
+  W->>API: Authorization: Bearer <authentik access>
   API->>DB: validar + insertar job (dedupe_key)
   API->>R: enqueue app.worker.run_download_job
-  API-->>UI: 201 JobRead
-  R->>W: run_download_job
-  W->>T: export por rangos
-  W->>DB: cursor / snapshot
-  W->>T: download batch
-  W->>DB: download_files + contadores
-  W->>R: enqueue siguiente lote
-  UI->>API: GET /jobs/{id} cada 2 s
-  API-->>UI: JobRead con progreso honesto
+  API-->>W: 201 JobRead
+  W-->>U: 201 JobRead
+  R->>WK: run_download_job
+  WK->>T: export por rangos
+  WK->>DB: cursor / snapshot
+  WK->>T: download batch
+  WK->>DB: download_files + contadores
+  WK->>R: enqueue siguiente lote
+  U->>W: GET /api/v1/jobs/{id} cada 2 s
+  W->>API: Bearer
+  API-->>W: JobRead con progreso honesto
 ```
 
 ## 8. Persistencia y migración
@@ -188,18 +201,18 @@ sequenceDiagram
 
 ## 9. Seguridad
 
-- JWT con cookies HttpOnly: access 15 min, refresh 7 días, refresh revocable en Redis.
-- `SECRET_KEY` de 32+ y credenciales obligatorias en producción; scrypt para la contraseña.
-- Next.js middleware verifica el access con `jose`; FastAPI lo verifica con `PyJWT`.
+- Authentik es el único IdP; Auth.js gestiona la sesión web con cookie HttpOnly.
+- El BFF inyecta el Bearer de Authentik; el navegador nunca ve el token.
+- FastAPI valida RS256, `iss`, `aud`, `exp` con JWKS y, si se configura, el grupo `tdl-admin`.
 - TLS; `ALLOW_INSECURE_HTTP` solo explícito para laboratorio.
 - `X-Requested-With` + Origin/Referer para escrituras; sin CORS en producción.
-- Rate limit en Nginx para login y API.
+- Rate limit en Nginx para `/api/` y `/api/auth/`.
 - CSP con nonce; sin CDN sin SRI; sin `dangerouslySetInnerHTML`.
 - Archivos peligrosos como `attachment`; `CSP: sandbox`; tipos seguros inline.
 - `UMask=0077`; datos 600/700.
 - Confirmaciones de servidor para acciones destructivas.
-- Sin secretos en `NEXT_PUBLIC_*`; tokens nunca en `localStorage`.
-- Redis en localhost; guarda los `jti` de refresh.
+- Sin secretos en `NEXT_PUBLIC_*`; tokens de Authentik nunca en `localStorage`.
+- Redis en red interna; Authentik y RQ usan bases separadas.
 - Un worker de API y uno de RQ.
 
 ## 10. Despliegue
@@ -207,20 +220,24 @@ sequenceDiagram
 ```mermaid
 flowchart LR
   Internet[Usuario] -->|HTTPS 443| Nginx
-  Nginx -->|/| Next[Next.js :3000]
-  Nginx -->|/api/| API[FastAPI :8000]
-  API --> Redis[(Redis :6379 localhost)]
+  Nginx -->|app.domain| Web[Next.js :3000]
+  Nginx -->|auth.domain| Auth[Authentik :9000]
+  Auth --> Pg[(Postgres)]
+  Auth --> Redis[(Redis)]
+  Web -->|OIDC| Auth
+  Web -->|BFF Bearer| API[FastAPI :8000]
+  API --> Redis
   Redis --> Worker[RQ Worker]
   Worker --> TDL[tdl]
   API --> SQLite[(SQLite)]
   Worker --> SQLite
-  API --> Data[(/opt/tdl-web/data)]
+  API --> Data[(/data)]
   Worker --> Data
 ```
 
-Servicios systemd: `tdl-web-api`, `tdl-web-worker`, `tdl-web-frontend`; Redis del sistema.
-Sin root; `ProtectSystem=strict`; `ReadWritePaths` solo datos. Nginx same-origin. Docker opcional
-y fuera del camino principal.
+Docker Compose: `nginx`, `web`, `api`, `worker`, `authentik-server`, `authentik-worker`,
+`postgres`, `redis`. Solo Nginx publica 80/443. Sin systemd como camino principal.
+`compose.test.yml` levanta el stack de pruebas y los runners.
 
 ## 11. Criterios de aceptación
 
