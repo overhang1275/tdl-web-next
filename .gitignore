@@ -2,11 +2,13 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.pytest-tmp/
 .coverage
 htmlcov/
 .mypy_cache/
 .ruff_cache/
 .venv/
+.venv-graphify/
 venv/
 data/
 *.sqlite3
@@ -22,3 +24,6 @@ exports/
 downloads/
 logs/
 sessions/
+graphify-out/
+node_modules/
+.next/
