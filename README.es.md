@@ -99,8 +99,7 @@ flowchart LR
 ├── scripts/                Pruebas, configuración, datos y `tdl` simulado
 ├── install-tld.sh          Instalador maestro para LXC
 ├── docker-compose.yml      Envoltorio del Compose de producción
-├── DESIGN.md               Guía visual y de producto
-└── docs/                   Arquitectura, auditorías, diseños y evidencias (local)
+└── DESIGN.md               Guía visual y de producto
 ```
 
 El paquete Python sigue llamándose `app` y el directorio de trabajo es `backend/`, por lo que
@@ -295,27 +294,7 @@ $env:PLAYWRIGHT_PRODUCTION='1'
 ```
 
 La última verificación registrada (2026-10-26) dejó Ruff, 89 pytest, ESLint, TypeScript,
-build, 18 Vitest y 10 Playwright en verde. Las capturas e informes quedan en
-`docs/design-audit/`.
-
-## Documentación
-
-| Documento | Contenido |
-|---|---|
-| [`DESIGN.md`](DESIGN.md) | Identidad visual, tokens, componentes, accesibilidad y criterios de diseño |
-| [`docs/architecture/current-state.md`](docs/architecture/current-state.md) | Estado implementado y análisis de la app anterior |
-| [`docs/architecture/target-state.md`](docs/architecture/target-state.md) | Arquitectura de referencia de la migración |
-| [`docs/architecture/migration-map.md`](docs/architecture/migration-map.md) | Trazabilidad función por función y qué se conserva, adapta o sustituye |
-| [`docs/audit/2026-10-26-current-app.md`](docs/audit/2026-10-26-current-app.md) | Auditoría de seguridad y deuda de la app anterior |
-| [`docs/design-audit/latest.md`](docs/design-audit/latest.md) | Última auditoría UI/UX con evidencia y capturas |
-| [`docs/authentik-local.md`](docs/authentik-local.md) | Configuración y operación local de Authentik |
-| [`docs/material-3-expressive-mobile-plan.md`](docs/material-3-expressive-mobile-plan.md) | Plan de evolución visual móvil |
-| [`docs/superpowers/specs/`](docs/superpowers/specs/) | Diseños de migración, ajustes editables, instalador y descargas reanudables |
-| [`docs/superpowers/plans/`](docs/superpowers/plans/) | Planes de implementación |
-| [`docs/architecture/graphify/`](docs/architecture/graphify/) | Grafos inicial y final, con informes |
-
-`docs/` y `graphify-out/` permanecen locales y están excluidos de Git; los enlaces funcionan
-en esta copia de trabajo. Las capturas de auditoría también son locales.
+build, 18 Vitest y 10 Playwright en verde.
 
 ## Límites conocidos
 

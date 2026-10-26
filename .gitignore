@@ -1,36 +1,36 @@
-.DS_Store
+# Python
 __pycache__/
 *.py[cod]
-.pytest_cache/
-.pytest-tmp/
-.superpowers/
-backend/data/
-.coverage
-htmlcov/
-.mypy_cache/
-.ruff_cache/
 .venv/
 .venv-graphify/
 venv/
-data/
+.pytest_cache/
+.pytest-tmp/
+.ruff_cache/
+
+# Runtime data
+/data/
+/backend/data/
 *.sqlite3
+*.sqlite3-*
 *.sqlite
+*.sqlite-*
 *.db
+*.db-*
+
+# Local configuration and logs
 .env
 .env.*
 !.env.example
 !.env.native.example
 *.log
-dump.rdb
-appendonlydir/
-/exports/
-/downloads/
-/logs/
-/sessions/
-.venv-graphify
+
+# Local-only documentation and analysis
 .superpowers/
-graphify-out/
 docs/
+graphify-out/
+
+# Frontend
 node_modules/
 .next/
 frontend/playwright-report/

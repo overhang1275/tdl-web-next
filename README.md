@@ -99,8 +99,7 @@ flowchart LR
 ├── scripts/                Tests, configuration, data and simulated `tdl`
 ├── install-tld.sh          Master installer for LXC
 ├── docker-compose.yml      Wrapper around the production Compose file
-├── DESIGN.md               Visual and product guidelines
-└── docs/                   Architecture, audits, designs and evidence (local)
+└── DESIGN.md               Visual and product guidelines
 ```
 
 The Python package is still named `app` and its working directory is `backend/`, so the
@@ -293,27 +292,7 @@ $env:PLAYWRIGHT_PRODUCTION='1'
 ```
 
 The last recorded verification (2026-10-26) left Ruff, 89 pytest tests, ESLint, TypeScript,
-the build, 18 Vitest tests and 10 Playwright tests green. Screenshots and reports are kept in
-`docs/design-audit/`.
-
-## Documentation
-
-| Document | Contents |
-|---|---|
-| [`DESIGN.md`](DESIGN.md) | Visual identity, tokens, components, accessibility and design criteria |
-| [`docs/architecture/current-state.md`](docs/architecture/current-state.md) | Implemented state and analysis of the previous app |
-| [`docs/architecture/target-state.md`](docs/architecture/target-state.md) | Reference architecture for the migration |
-| [`docs/architecture/migration-map.md`](docs/architecture/migration-map.md) | Feature-by-feature traceability and what is kept, adapted or replaced |
-| [`docs/audit/2026-10-26-current-app.md`](docs/audit/2026-10-26-current-app.md) | Security and technical-debt audit of the previous app |
-| [`docs/design-audit/latest.md`](docs/design-audit/latest.md) | Latest UI/UX audit with evidence and screenshots |
-| [`docs/authentik-local.md`](docs/authentik-local.md) | Local Authentik setup and operation |
-| [`docs/material-3-expressive-mobile-plan.md`](docs/material-3-expressive-mobile-plan.md) | Mobile visual evolution plan |
-| [`docs/superpowers/specs/`](docs/superpowers/specs/) | Migration, editable settings, installer and resumable-download designs |
-| [`docs/superpowers/plans/`](docs/superpowers/plans/) | Implementation plans |
-| [`docs/architecture/graphify/`](docs/architecture/graphify/) | Initial and final graphs, with reports |
-
-The documents themselves are in Spanish. `docs/` and `graphify-out/` remain local and are
-excluded from Git; the links work in this working copy. Audit screenshots are also local.
+the build, 18 Vitest tests and 10 Playwright tests green.
 
 ## Known limitations
 
