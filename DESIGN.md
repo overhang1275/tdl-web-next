@@ -39,7 +39,7 @@ Tokens semánticos; no se usan colores sueltos en componentes.
 | `--surface` | `#FFFFFF` | Tarjetas, tablas |
 | `--surface-muted` | `#F1F3F1` | Filas alternas, inputs |
 | `--foreground` | `#0F172A` | Texto principal |
-| `--muted-foreground` | `#64748B` | Texto secundario |
+| `--muted-foreground` | `#5D6C80` | Texto secundario; contraste mínimo 4.80:1 en superficies claras |
 | `--border` | `#E2E8F0` | Bordes |
 | `--primary` | `#0F766E` | Acción primaria, foco |
 | `--primary-hover` | `#115E59` | Hover |

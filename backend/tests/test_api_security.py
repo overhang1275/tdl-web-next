@@ -11,13 +11,33 @@ import pytest
 from cryptography.hazmat.primitives.asymmetric import rsa
 from fastapi.testclient import TestClient
 
-from app.config import settings
+from app.config import Settings, settings
 from app.main import app
 from app.services import auth
 
 ISSUER = "https://auth.test/application/o/tdl-console"
 AUDIENCE = "tdl-console"
 GROUP = "tdl-admin"
+
+
+def test_config_preserves_oidc_issuer_exactly(monkeypatch):
+    issuer = "https://auth.test/application/o/tdl-console/"
+    monkeypatch.setenv("AUTHENTIK_ISSUER", issuer)
+    monkeypatch.delenv("AUTHENTIK_JWKS_URL", raising=False)
+    config = Settings()
+    assert config.authentik_issuer == issuer
+    assert config.authentik_jwks_url == f"{issuer}jwks/"
+
+
+def test_docker_refuses_unmounted_database_path(monkeypatch, tmp_path):
+    monkeypatch.setenv("APP_ENV", "production")
+    monkeypatch.setenv("DEPLOYMENT_MODE", "docker")
+    monkeypatch.setenv("DATABASE_DIR", str(tmp_path / "mounted"))
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{tmp_path / 'outside' / 'app.sqlite'}")
+    monkeypatch.setenv("AUTHENTIK_ISSUER", ISSUER)
+    monkeypatch.setenv("AUTHENTIK_AUDIENCE", AUDIENCE)
+    with pytest.raises(RuntimeError, match="DATABASE_DIR"):
+        Settings().validate()
 
 
 def _b64(value: int) -> str:

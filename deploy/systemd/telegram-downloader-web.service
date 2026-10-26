@@ -1,18 +1,20 @@
 [Unit]
-Description=Telegram Downloader FastAPI web
-After=network.target redis-server.service
-Wants=redis-server.service
+Description=TDL Console Next.js frontend
+After=network-online.target telegram-downloader-api.service
+Wants=network-online.target telegram-downloader-api.service
 
 [Service]
 User=telegramdl
 Group=telegramdl
-WorkingDirectory=/opt/tld-web/app
+WorkingDirectory=/opt/tld-web/current/frontend/.next/standalone
 EnvironmentFile=/etc/telegram-downloader/telegram-downloader.env
-ExecStart=/opt/tld-web/venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000 --proxy-headers
+Environment=NODE_ENV=production HOSTNAME=127.0.0.1 PORT=3000
+ExecStart=/opt/tld-web/node/bin/node /opt/tld-web/current/frontend/.next/standalone/server.js
 Restart=on-failure
 RestartSec=5
 NoNewPrivileges=true
 PrivateTmp=true
+UMask=0077
 
 [Install]
 WantedBy=multi-user.target

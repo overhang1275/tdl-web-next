@@ -53,6 +53,7 @@ def job_read(db: Session, job: DownloadJob, queue_position: int | None = None) -
         total_filtered_messages=job.total_filtered_messages,
         total_downloaded_files=job.total_downloaded_files,
         total_failed_files=job.total_failed_files,
+        transfer_initialized=job.transfer_initialized,
         downloaded_bytes=downloaded,
         total_expected_bytes=expected,
         speed_bps=speed,

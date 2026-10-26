@@ -1,124 +1,150 @@
-# Telegram Downloader Web
+# TDL Console
 
-Interfaz web para descargar archivos de Telegram con `tdl`. Permite filtrar por
-texto, hashtag, fecha y tipo de archivo, ver el progreso y reanudar descargas.
+Consola en español para descargar archivos de Telegram con `tdl`. Next.js sirve la UI;
+FastAPI expone `/api/v1`; Redis/RQ ejecuta los trabajos. Se conservan SQLite, la sesión
+de Telegram, los archivos descargados y la ruta `app.worker.run_download_job`.
 
-## Instalar
+Hay dos instalaciones independientes: **nativa para LXC, sin Docker**, y **Docker
+Compose para producción**. Las pruebas completas usan un stack Docker aislado.
 
-En Debian 12 o Ubuntu 24.04, desde el repositorio:
+## Instalación nativa en LXC
+
+Debian 13 o Ubuntu 24.04, x86_64 o arm64. Ejecuta desde una copia del repositorio.
+El instalador usa binarios de Node y `tdl` con verificación SHA-256, Python en un
+venv, Redis y Nginx del sistema. No instala Docker.
+
+El login usa un **Authentik externo**. Primero crea allí un cliente OIDC confidencial
+con PKCE, firma RS256, scopes `openid profile email offline_access tdl-groups`, y el
+grupo `tdl-admin`. El scope `tdl-groups` debe emitir `groups` con los nombres de grupos
+del usuario. Configura el callback exacto:
+
+```text
+https://app.TU_DOMINIO/api/auth/callback/authentik
+```
+
+Prepara la configuración; reemplaza el dominio y los datos del proveedor:
 
 ```bash
+sudo install -d -m 750 /etc/telegram-downloader
+sudo install -m 600 .env.native.example /etc/telegram-downloader/telegram-downloader.env
+sudo nano /etc/telegram-downloader/telegram-downloader.env
 sudo bash scripts/install.sh
 ```
 
-El script instala las dependencias, configura los servicios y muestra la
-contraseña de acceso. Abre `http://IP_DEL_SERVIDOR:8000` y entra en **Setup**
-para iniciar sesión en Telegram.
+Si ya tienes una instalación, conserva su archivo de entorno y añade únicamente
+las variables de OIDC y `DOMAIN`/`AUTH_URL`. No copies la plantilla encima de una
+configuración existente. El instalador preserva las rutas y los secretos existentes;
+si falta el proveedor, termina antes de reemplazar los servicios.
 
-## Usar
+La plantilla nativa usa `NATIVE_INGRESS=tunnel`: Nginx escucha exclusivamente en
+`127.0.0.1:8080`, sin certificados locales ni redirección HTTP. Instala el conector
+`cloudflared` como servicio nativo en **el mismo LXC** siguiendo los comandos del
+panel Cloudflare. En la ruta publicada del túnel configura tu dominio de TDL y
+**Service URL `http://127.0.0.1:8080`**. `AUTH_URL` debe seguir siendo la URL pública
+`https://...`, y el callback de Authentik debe usar exactamente ese dominio.
+Referencia: [configurar el túnel](https://developers.cloudflare.com/tunnel/get-started/).
+El instalador no crea el túnel ni almacena su token.
 
-1. Selecciona un canal o grupo.
-2. Elige filtros y una subcarpeta de destino.
-3. Crea el job y consulta su progreso o sus archivos.
+Si prefieres acceso directo, usa `NATIVE_INGRESS=direct`, dirige el dominio al LXC
+y prepara los certificados. Si faltan, se genera uno interno en
+`/etc/telegram-downloader/certs/`; confía en él en tus clientes o reemplaza
+`fullchain.pem` y `privkey.pem` por certificados de tu CA/ACME y recarga Nginx.
 
-Las descargas se procesan por lotes y los fallos se reintentan hasta tres veces.
-**Reintentar pendientes** continúa el mismo job conservando los archivos
-completos. **Nuevo parecido** crea una búsqueda nueva.
-
-## Carpetas
-
-Por defecto, los datos están en `/opt/tld-web/data/`:
-
-```text
-sessions/                   Sesión de Telegram
-exports/                    Exportaciones y filtros
-logs/                       Logs de los jobs
-backups/                    Respaldos de actualización
-telegram_downloader.sqlite3 Historial y estado de descargas
-downloads/                  Archivos descargados
-```
-
-Las descargas siguen esta estructura:
+La instalación crea:
 
 ```text
-downloads/
-└── 123456789/          Canal o grupo
-    └── videos/         Subcarpeta elegida
-        └── job-42/     Trabajo de descarga
-            └── 1501/   Mensaje de Telegram
-                └── video.mp4
+/opt/tld-web/node/                  Node binario
+/opt/tld-web/bin/tdl                tdl binario
+/opt/tld-web/releases/<versión>/    Backend, venv y frontend standalone
+/opt/tld-web/current                Enlace a la versión activa
+/opt/tld-web/data/                  Datos existentes, sin reubicación
 ```
 
-Los archivos `.tmp` generados durante la transferencia son temporales.
-Reintentar mantiene las mismas carpetas. Los archivos antiguos conservan su
-ubicación; «omitir iguales» reutiliza los archivos completos ya verificados.
+Los servicios `telegram-downloader-api`, `telegram-downloader-worker` y
+`telegram-downloader-web` ejecutan API, RQ y Next.js con el usuario `telegramdl`.
+Solo Nginx publica la app; API y frontend escuchan en localhost.
 
-## Configurar
-
-Edita `/etc/telegram-downloader/telegram-downloader.env`:
-
-```ini
-WEB_PASSWORD=tu-contraseña
-DOWNLOADS_DIR=/opt/tld-web/data/downloads
-DOWNLOAD_BATCH_SIZE=100
-EXPORT_BATCH_SIZE=5000
-DOWNLOAD_IDLE_TIMEOUT_SECONDS=600
-COMMAND_TIMEOUT_SECONDS=7200
-```
-
-Los tiempos están en segundos. Después de modificar la configuración:
+Para actualizar, actualiza tu copia del código y ejecuta:
 
 ```bash
-sudo systemctl restart telegram-downloader-web telegram-downloader-worker
-```
-
-## Actualizar
-
-```bash
+git pull --ff-only
 sudo bash scripts/update.sh
 ```
 
-Respalda SQLite, actualiza el código, ejecuta la migración y reinicia los
-servicios. Conserva la configuración personalizada y permite respaldar las
-descargas. Si falla, detiene los servicios y muestra el error.
-
-## Ver logs
-
-```bash
-sudo journalctl -u telegram-downloader-web -f
-sudo journalctl -u telegram-downloader-worker -f
-```
-
-Si los jobs no avanzan, revisa Redis y el worker. Si falla la sesión de Telegram,
-vuelve a **Setup**.
-
-## Desarrollo local
-
-Requiere Python 3.12+, `tdl` y Redis instalados.
+Se construye la versión nueva antes del corte. La actualización exige una cola sin
+jobs activos o pendientes, respalda SQLite mediante su API de backup y guarda
+configuración, sesión, exports y logs en `DATA_DIR/backups/`. Conserva las descargas.
+Si falla el arranque, recupera la versión y las unidades de servicio anteriores.
+Las migraciones de SQLite son aditivas; los respaldos permiten una restauración
+manual si fuera necesario.
 
 ```bash
-python3 -m venv .venv
-.venv/bin/pip install -r requirements.txt
+sudo journalctl -u telegram-downloader-api -u telegram-downloader-worker -u telegram-downloader-web -f
 ```
 
-Ejecuta cada proceso en una terminal:
+## Producción con Docker Compose
+
+Esta vía incluye PostgreSQL, Authentik, Redis, API, worker, Next.js y Nginx. Solo Nginx
+publica 80/443. Es independiente del instalador nativo del LXC.
 
 ```bash
-redis-server
-.venv/bin/python -m app.rq_worker
-.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000
+python3 scripts/configure-env.py --deployment docker --output .env --domain example.test
+docker compose --env-file .env -f deploy/docker/compose.yml config --quiet
 ```
 
-Abre `http://localhost:8000`. Los datos se guardan en `./data`.
+Revisa `.env`, prepara `DATA_DIR` y `DOWNLOADS_DIR` con el UID/GID configurado
+(`APP_UID`/`APP_GID`, por defecto `10001`) y coloca los certificados para
+`app.DOMAIN` y `auth.DOMAIN` en `TLS_DIR`. Conserva las rutas absolutas originales al
+migrar datos existentes. `DATABASE_DIR` debe ser el directorio de `DATABASE_URL`;
+sesión, exports, logs y base tienen sus propios montajes aunque estén fuera de `DATA_DIR`. Después:
 
 ```bash
-.venv/bin/python -m pytest
+docker compose --env-file .env -f deploy/docker/compose.yml up -d --build --wait
+bash deploy/authentik/bootstrap.sh
 ```
 
-## Docker
+El blueprint crea el cliente OIDC y el grupo; el bootstrap añade `akadmin` a
+`tdl-admin`. La contraseña inicial está en `AUTHENTIK_BOOTSTRAP_PASSWORD` del `.env`.
+No publiques ese archivo. Antes de actualizar, drena la cola, respalda SQLite,
+`pg_dump` de Authentik y los volúmenes; conserva las imágenes anteriores para rollback.
+El archivo raíz `docker-compose.yml` incluye este mismo Compose.
+
+## Pruebas en Docker
 
 ```bash
-docker compose up -d --build
+bash scripts/test.sh
 ```
 
-Abre `http://localhost:8000`. Los datos persisten en `./data`.
+En Windows:
+
+```powershell
+./scripts/test.ps1
+```
+
+Los runners ejecutan Ruff, pytest, ESLint, TypeScript, Vitest y Playwright. El stack
+usa SQLite y Redis separados, OIDC/JWKS de prueba con RS256/PKCE y un ejecutable
+`tdl` falso. La integración recorre login → API → cola → export → filtro → descarga
+→ borrado persistido. No contacta Telegram ni monta datos de producción. Al salir,
+los scripts eliminan exclusivamente los contenedores y volúmenes de pruebas.
+
+Para una comprobación visual local después del build:
+
+```powershell
+$env:PLAYWRIGHT_PRODUCTION='1'
+./scripts/playwright.ps1 test
+```
+
+Las capturas e informes de auditoría quedan en `docs/design-audit/`. `docs/` y
+`graphify-out/` permanecen locales y están excluidos de los nuevos commits.
+
+## Uso
+
+Entra con Authentik, conecta Telegram en Configuración y selecciona un chat.
+Puedes filtrar texto, hashtag, fechas y tipo de archivo. El progreso y la ETA se
+muestran solo cuando existen datos fiables. Reintentar conserva los archivos
+completos; eliminar exige confirmación y usa `wipe`.
+
+El navegador solo llama al BFF de Next.js. Los access/refresh tokens permanecen
+en una cookie cifrada HttpOnly y el BFF añade el Bearer hacia FastAPI. Las
+escrituras verifican origen y `X-Requested-With`; la creación conserva
+`Idempotency-Key`. No hay contraseñas locales ni tokens en localStorage.

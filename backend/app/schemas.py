@@ -117,6 +117,7 @@ class JobRead(BaseModel):
     total_filtered_messages: int
     total_downloaded_files: int
     total_failed_files: int
+    transfer_initialized: bool
     downloaded_bytes: int
     total_expected_bytes: int | None = None
     speed_bps: int

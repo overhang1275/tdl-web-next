@@ -72,11 +72,11 @@ class Settings:
             1, int(os.getenv("DOWNLOAD_IDLE_TIMEOUT_SECONDS", "600"))
         )
         self.export_batch_size = max(1, int(os.getenv("EXPORT_BATCH_SIZE", "5000")))
-        self.authentik_issuer = os.getenv("AUTHENTIK_ISSUER", "").strip().rstrip("/")
+        self.authentik_issuer = os.getenv("AUTHENTIK_ISSUER", "").strip()
         self.authentik_audience = os.getenv("AUTHENTIK_AUDIENCE", "").strip()
         self.authentik_jwks_url = os.getenv("AUTHENTIK_JWKS_URL", "").strip()
         if not self.authentik_jwks_url and self.authentik_issuer:
-            self.authentik_jwks_url = f"{self.authentik_issuer}/jwks/"
+            self.authentik_jwks_url = f"{self.authentik_issuer.rstrip('/')}/jwks/"
         self.authentik_admin_group = os.getenv("AUTHENTIK_ADMIN_GROUP", "").strip()
         self.trusted_hosts = [
             host.strip() for host in os.getenv("TRUSTED_HOSTS", "*").split(",") if host.strip()
@@ -84,6 +84,11 @@ class Settings:
         self.enable_docs = _bool("ENABLE_DOCS", self.environment != "production")
 
     def validate(self) -> None:
+        if os.getenv("DEPLOYMENT_MODE") == "docker" and self.database_url.startswith("sqlite:///"):
+            database_dir = Path(self.database_url.removeprefix("sqlite:///")).resolve().parent
+            mounted_dir = Path(os.getenv("DATABASE_DIR", str(self.base_dir))).resolve()
+            if database_dir != mounted_dir:
+                raise RuntimeError("DATABASE_DIR must match the SQLite directory mounted by Docker")
         if self.environment != "production":
             return
         if not self.authentik_issuer or not self.authentik_audience or not self.authentik_jwks_url:
