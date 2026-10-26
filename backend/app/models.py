@@ -3,7 +3,19 @@ from __future__ import annotations
 import enum
 from datetime import datetime
 
-from sqlalchemy import Boolean, Date, DateTime, Enum, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import (
+    Boolean,
+    Date,
+    DateTime,
+    Enum,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    text,
+)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
@@ -37,6 +49,14 @@ class MediaType(str, enum.Enum):
 
 class DownloadJob(Base):
     __tablename__ = "download_jobs"
+    __table_args__ = (
+        Index(
+            "uq_download_jobs_active_dedupe",
+            "dedupe_key",
+            unique=True,
+            sqlite_where=text("status IN ('pending','running')"),
+        ),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
     files: Mapped[list[DownloadFile]] = relationship(cascade="all, delete-orphan")
@@ -74,6 +94,10 @@ class DownloadJob(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
     started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    dedupe_key: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    deletion_requested: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    deletion_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    deletion_rq_job_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
 
 
 class DownloadFile(Base):

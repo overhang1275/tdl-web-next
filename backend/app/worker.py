@@ -16,7 +16,11 @@ from app.services.logs import append_job_log
 from app.services.paths import safe_child
 from app.services.tdl import TdlCancelled, TdlError, TdlService
 from app.services.transfers import (
-    MAX_ATTEMPTS, canonical_export, initialize_transfers, reconcile_files, update_transfer_totals, write_json_atomic,
+    MAX_ATTEMPTS,
+    initialize_transfers,
+    reconcile_files,
+    update_transfer_totals,
+    write_json_atomic,
 )
 
 
@@ -296,3 +300,12 @@ def run_download_job(job_id: int, token: str | None = None) -> None:
         raise
     finally:
         db.close()
+
+
+def delete_job(job_id: int, token: str | None = None) -> None:
+    engine.dispose()
+    init_db()
+    from app.services.deletion import run_delete
+
+    run_delete(job_id, token)
+

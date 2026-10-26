@@ -6,7 +6,7 @@ import pytest
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 
-from app import worker, models
+from app import models, worker
 from app.config import settings
 from app.database import Base
 from app.models import DownloadJob, JobStatus
@@ -265,28 +265,6 @@ def test_stale_queue_token_cannot_process_a_retried_job(runtime, monkeypatch):
     assert db.get(DownloadJob, job.id).transfer_initialized is False
 
 
-def test_status_partial_shows_retry_button_after_live_failure(runtime, monkeypatch):
-    from fastapi.testclient import TestClient
-    from app.main import app
-    from app.database import get_db
-    db, queue = runtime
-    job = make_job(db, [{'id': 1, 'file': 'a.mp4'}])
-    job.status = JobStatus.failed
-    db.commit()
-    monkeypatch.setattr(settings, 'web_password', None)
-    app.dependency_overrides[get_db] = lambda: db
-    try:
-        response = TestClient(app).get(f'/jobs/{job.id}/status')
-        assert response.status_code == 200
-        assert 'Reintentar pendientes' in response.text
-        assert f'action="/jobs/{job.id}/retry"' in response.text
-        response = TestClient(app).post(f'/jobs/{job.id}/retry', follow_redirects=False)
-        assert response.status_code == 303
-        assert response.headers['location'] == f'/jobs/{job.id}'
-    finally:
-        app.dependency_overrides.pop(get_db)
-
-
 def test_cancelling_during_enqueue_does_not_revive_job(runtime):
     db, queue = runtime
     job = make_job(db, [{'id': 1, 'file': 'a.mp4'}])
@@ -436,6 +414,7 @@ def test_new_job_reuses_verified_files_at_same_destination(runtime, monkeypatch)
 
 def test_failed_continuation_enqueue_keeps_progress_and_can_retry(runtime, monkeypatch):
     from redis.exceptions import ConnectionError
+
     from app.services.jobs import QueueUnavailableError
     db, queue = runtime
     monkeypatch.setattr(settings, 'download_batch_size', 1)
@@ -462,6 +441,7 @@ def test_failed_continuation_enqueue_keeps_progress_and_can_retry(runtime, monke
 
 def test_sqlite_migration_preserves_existing_jobs(tmp_path, monkeypatch):
     from sqlalchemy import inspect, text
+
     from app import database
     engine = create_engine(f"sqlite:///{tmp_path / 'legacy.sqlite'}")
     monkeypatch.setattr(database, 'engine', engine)

@@ -3,8 +3,13 @@ from __future__ import annotations
 import mimetypes
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import quote
+
+from sqlalchemy import select
+from sqlalchemy.orm import Session
 
 from app.config import settings
+from app.models import DownloadFile
 from app.services.paths import safe_child
 
 
@@ -71,6 +76,39 @@ def list_downloaded_files(root: Path) -> list[dict[str, str | int | bool]]:
                 }
             )
     return sorted(files, key=lambda item: str(item["relative_path"]).lower())
+
+
+def job_file_entries(db: Session, job_id: int, root: Path) -> list[dict]:
+    files = list_downloaded_files(root)
+    records = list(
+        db.scalars(select(DownloadFile).where(DownloadFile.job_id == job_id)).all()
+    )
+    by_relative: dict[str, DownloadFile] = {}
+    for record in records:
+        if not record.local_path:
+            continue
+        try:
+            relative = Path(record.local_path).resolve().relative_to(root).as_posix()
+        except (OSError, ValueError):
+            continue
+        by_relative[relative] = record
+    for item in files:
+        record = by_relative.get(str(item["relative_path"]))
+        item["file_id"] = record.id if record else None
+        item["message_id"] = record.message_id if record else None
+        item["status"] = record.status if record else None
+        item["attempts"] = record.attempts if record else 0
+        item["last_error"] = record.last_error if record else None
+        if record:
+            content = f"/api/v1/jobs/{job_id}/files/{record.id}/content"
+        else:
+            content = (
+                f"/api/v1/jobs/{job_id}/files/content"
+                f"?path={quote(str(item['relative_path']))}"
+            )
+        item["content_url"] = content
+        item["download_url"] = f"{content}{'&' if '?' in content else '?'}download=true"
+    return files
 
 
 def job_download_root(job_id: int, download_path: str | None) -> Path:

@@ -6,7 +6,6 @@ from pathlib import Path
 from app.config import settings
 from app.services.paths import safe_child
 
-
 EVENT_TITLES = (
     ("exporting chat", "Export iniciado"),
     ("export ready", "Export listo"),

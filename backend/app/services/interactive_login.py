@@ -1,10 +1,9 @@
 from __future__ import annotations
 
+import os
+import signal
 import subprocess
 import threading
-import os
-import pty
-import signal
 from dataclasses import dataclass, field
 from datetime import datetime
 
@@ -50,6 +49,12 @@ class InteractiveLoginService:
             tdl.ensure_runtime_dirs()
             session = LoginSession(started_at=datetime.utcnow())
             try:
+                import pty
+            except ImportError as exc:
+                raise RuntimeError(
+                    "El login interactivo requiere pty (Linux). Usa el comando de terminal."
+                ) from exc
+            try:
                 master_fd, slave_fd = pty.openpty()
                 process = subprocess.Popen(
                     args,
@@ -94,7 +99,6 @@ class InteractiveLoginService:
             if not session.running or session.master_fd is None:
                 raise RuntimeError("No active login process")
             os.write(session.master_fd, (value + "\n").encode("utf-8"))
-            session.output.append("> " + ("********" if self._looks_sensitive(value) else value))
             return session
 
     def status(self) -> LoginSession:

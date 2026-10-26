@@ -1,22 +1,24 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
-from urllib.parse import quote
 
-from app.models import DownloadJob
+from app.models import DownloadFile, DownloadJob
 from app.services.chat_cache import read_chats_cache
-from app.services.files import job_download_root, list_downloaded_files
+from app.services.files import file_kind, human_size
 
 
 def global_search(db: Session, query: str, limit: int = 8) -> dict[str, list[dict]]:
     q = query.strip().lower()
     if not q:
         return {"chats": [], "jobs": [], "files": []}
-    chats = search_chats(q, limit)
-    jobs = search_jobs(db, q, limit)
-    files = search_files(db, q, limit)
-    return {"chats": chats, "jobs": jobs, "files": files}
+    return {
+        "chats": search_chats(q, limit),
+        "jobs": search_jobs(db, q, limit),
+        "files": search_files(db, q, limit),
+    }
 
 
 def search_chats(q: str, limit: int) -> list[dict]:
@@ -24,7 +26,8 @@ def search_chats(q: str, limit: int) -> list[dict]:
     results = []
     for chat in chats:
         haystack = " ".join(
-            str(chat.get(key) or "") for key in ("id", "title", "visible_name", "username", "type")
+            str(chat.get(key) or "")
+            for key in ("id", "title", "visible_name", "username", "type")
         ).lower()
         if q in haystack:
             title = chat.get("title") or chat.get("visible_name") or "Sin nombre"
@@ -32,7 +35,11 @@ def search_chats(q: str, limit: int) -> list[dict]:
                 {
                     "id": chat.get("id"),
                     "title": title,
-                    "subtitle": f"@{chat.get('username')}" if chat.get("username") else str(chat.get("type") or "chat"),
+                    "subtitle": (
+                        f"@{chat.get('username')}"
+                        if chat.get("username")
+                        else str(chat.get("type") or "chat")
+                    ),
                     "url": f"/chats/{chat.get('id')}",
                 }
             )
@@ -64,31 +71,46 @@ def search_jobs(db: Session, q: str, limit: int) -> list[dict]:
         {
             "id": job.id,
             "title": f"Job #{job.id} · {job.chat_title or job.chat_id}",
-            "subtitle": f"{job.status.value} · {job.media_type.value} · {job.total_downloaded_files} archivos",
-            "url": f"/jobs/{job.id}",
+            "subtitle": (
+                f"{job.status.value} · {job.media_type.value} · "
+                f"{job.total_downloaded_files} archivos"
+            ),
+            "url": f"/downloads/{job.id}",
         }
         for job in jobs
     ]
 
 
 def search_files(db: Session, q: str, limit: int) -> list[dict]:
-    results = []
-    jobs = list(db.scalars(select(DownloadJob).order_by(DownloadJob.created_at.desc())).all())
-    for job in jobs:
-        root = job_download_root(job.id, job.download_path)
-        for file in list_downloaded_files(root):
-            relative = str(file["relative_path"])
-            if q not in relative.lower() and q not in str(file["kind"]).lower():
-                continue
-            results.append(
-                {
-                    "job_id": job.id,
-                    "title": file["name"],
-                    "subtitle": f"{job.chat_title or job.chat_id} · {file['human_size']} · {file['kind']}",
-                    "url": f"/downloads/{job.id}/preview?path={quote(relative)}",
-                    "download_url": f"/downloads/{job.id}/file?path={quote(relative)}&download=true",
-                }
+    like = f"%{q}%"
+    rows = db.execute(
+        select(DownloadFile, DownloadJob)
+        .join(DownloadJob, DownloadJob.id == DownloadFile.job_id)
+        .where(
+            or_(
+                DownloadFile.file_name.ilike(like),
+                DownloadFile.last_error.ilike(like),
+                DownloadFile.status.ilike(like),
             )
-            if len(results) >= limit:
-                return results
+        )
+        .order_by(DownloadFile.id.desc())
+        .limit(limit)
+    ).all()
+    results = []
+    for record, job in rows:
+        kind = file_kind(Path(record.file_name))
+        results.append(
+            {
+                "id": record.id,
+                "title": record.file_name,
+                "subtitle": (
+                    f"{job.chat_title or job.chat_id} · "
+                    f"{human_size(record.size)} · {kind}"
+                ),
+                "url": f"/downloads/{job.id}?file={record.id}",
+                "download_url": (
+                    f"/api/v1/jobs/{job.id}/files/{record.id}/content?download=true"
+                ),
+            }
+        )
     return results

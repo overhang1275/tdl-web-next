@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import json
-from threading import Lock
 from datetime import UTC, datetime
 from pathlib import Path
+from threading import Lock
 from typing import Any
 
 from app.config import settings

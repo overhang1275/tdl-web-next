@@ -11,7 +11,6 @@ from app.services.files import job_download_root
 from app.services.filtering import find_messages_container, message_id
 from app.services.paths import safe_child
 
-
 MAX_ATTEMPTS = 3
 
 
@@ -142,6 +141,16 @@ def reset_pending_files(db: Session, job: DownloadJob) -> None:
     reconcile_files(db, items)
     for item in items:
         if item.status != "completed":
+            item.status, item.attempts, item.last_error = "pending", 0, None
+    job.operation_attempts = 0
+    db.commit()
+    update_transfer_totals(db, job)
+
+
+def reset_failed_files(db: Session, job: DownloadJob) -> None:
+    items = list(db.scalars(select(DownloadFile).where(DownloadFile.job_id == job.id)))
+    for item in items:
+        if item.status == "failed":
             item.status, item.attempts, item.last_error = "pending", 0, None
     job.operation_attempts = 0
     db.commit()

@@ -1,24 +1,26 @@
 from __future__ import annotations
 
+import json
 import shutil
 import subprocess
-import json
-from pathlib import Path
 from datetime import datetime, timedelta
+from pathlib import Path
 from uuid import uuid4
 
-from rq import Queue
-from rq.job import Job
-from rq.exceptions import NoSuchJobError
-from redis.exceptions import RedisError
 from redis import Redis
-from sqlalchemy import func, select, update
+from redis.exceptions import RedisError
+from rq import Queue
+from rq.exceptions import NoSuchJobError
+from rq.job import Job
+from sqlalchemy import func, or_, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.database import SessionLocal
 from app.models import DownloadFile, DownloadJob, JobStage, JobStatus, MediaType
 from app.schemas import JobCreate
+from app.services.dedupe import key_for_payload
 from app.services.files import job_download_root
 from app.services.logs import append_deleted_job_log, append_job_log
 from app.services.paths import chat_path_key, safe_child
@@ -28,7 +30,17 @@ class QueueUnavailableError(RuntimeError):
     pass
 
 
+class DuplicateJobError(RuntimeError):
+    def __init__(self, job: DownloadJob) -> None:
+        super().__init__(f"Duplicate active job: {job.id}")
+        self.job = job
+
+
 class DeleteJobError(RuntimeError):
+    pass
+
+
+class NoFailedFilesError(RuntimeError):
     pass
 
 
@@ -48,8 +60,24 @@ def ensure_queue_available() -> Queue:
     return queue
 
 
-def create_job(db: Session, payload: JobCreate, enqueue: bool = True) -> DownloadJob:
+def create_job(
+    db: Session,
+    payload: JobCreate,
+    enqueue: bool = True,
+    idempotency_key: str | None = None,
+) -> DownloadJob:
     queue = ensure_queue_available() if enqueue else None
+    dedupe_key = key_for_payload(payload, idempotency_key) if enqueue else None
+    existing = None
+    if dedupe_key:
+        existing = db.scalar(
+            select(DownloadJob).where(
+                DownloadJob.dedupe_key == dedupe_key,
+                DownloadJob.status.in_(ACTIVE_STATUSES),
+            )
+        )
+    if existing is not None:
+        raise DuplicateJobError(existing)
     job = DownloadJob(
         chat_id=payload.chat_id,
         chat_title=payload.chat_title,
@@ -62,9 +90,22 @@ def create_job(db: Session, payload: JobCreate, enqueue: bool = True) -> Downloa
         refresh_export=payload.refresh_export,
         export_only=payload.export_only,
         output_subfolder=payload.output_subfolder,
+        dedupe_key=dedupe_key,
     )
     db.add(job)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        existing = db.scalar(
+            select(DownloadJob).where(
+                DownloadJob.dedupe_key == dedupe_key,
+                DownloadJob.status.in_(ACTIVE_STATUSES),
+            )
+        )
+        if existing is not None:
+            raise DuplicateJobError(existing) from exc
+        raise
     db.refresh(job)
     chat_key = chat_path_key(job.chat_id)
     export_dir = safe_child(settings.exports_dir, chat_key)
@@ -154,9 +195,19 @@ def cancel_job(db: Session, job: DownloadJob) -> DownloadJob:
     return job
 
 
-def retry_job(db: Session, job: DownloadJob) -> DownloadJob:
+def retry_job(db: Session, job: DownloadJob, mode: str = "pending") -> DownloadJob:
+    if mode not in {"pending", "failed"}:
+        raise ValueError("mode must be pending or failed")
     if job.status in ACTIVE_STATUSES:
         return job
+    if mode == "failed":
+        failed = db.scalar(
+            select(func.count())
+            .select_from(DownloadFile)
+            .where(DownloadFile.job_id == job.id, DownloadFile.status == "failed")
+        )
+        if not failed:
+            raise NoFailedFilesError("No hay archivos fallidos para reintentar.")
     queue = ensure_queue_available()
     # Claim the retry in SQL so repeated/concurrent clicks cannot enqueue twice.
     claimed = db.execute(update(DownloadJob).where(
@@ -167,7 +218,7 @@ def retry_job(db: Session, job: DownloadJob) -> DownloadJob:
     db.refresh(job)
     if not claimed.rowcount:
         return job
-    from app.services.transfers import reset_pending_files, write_json_atomic
+    from app.services.transfers import reset_failed_files, reset_pending_files, write_json_atomic
 
     try:
         # Freeze legacy jobs' already-filtered selection before an export refresh.
@@ -176,7 +227,10 @@ def retry_job(db: Session, job: DownloadJob) -> DownloadJob:
             snapshot = Path(job.export_json_path).parent / f"export-job-{job.id}.json"
             if not snapshot.exists():
                 write_json_atomic(snapshot, json.loads(filtered.read_text(encoding="utf-8")))
-        reset_pending_files(db, job)
+        if mode == "failed":
+            reset_failed_files(db, job)
+        else:
+            reset_pending_files(db, job)
     except Exception as exc:
         db.rollback()
         job.status, job.stage = JobStatus.failed, JobStage.failed
@@ -189,7 +243,10 @@ def retry_job(db: Session, job: DownloadJob) -> DownloadJob:
     job.stage = JobStage.downloading if job.transfer_initialized else JobStage.exporting
     db.commit()
     enqueue_job(db, job, queue=queue)
-    append_job_log(job.id, "Reanudando desde los archivos pendientes; se conserva la selección original.")
+    if mode == "failed":
+        append_job_log(job.id, "Reintentando solo los archivos fallidos.")
+    else:
+        append_job_log(job.id, "Reanudando desde los archivos pendientes; se conserva la selección original.")
     return job
 
 
@@ -283,6 +340,56 @@ def list_jobs(db: Session, limit: int | None = None, offset: int = 0) -> list[Do
     if limit is not None:
         query = query.limit(limit)
     return list(db.scalars(query).all())
+
+
+def _job_filters(statuses, chat_id, q):
+    filters = []
+    if statuses:
+        filters.append(DownloadJob.status.in_(statuses))
+    if chat_id:
+        filters.append(DownloadJob.chat_id == chat_id)
+    if q:
+        like = f"%{q.strip()}%"
+        filters.append(
+            or_(
+                DownloadJob.chat_id.ilike(like),
+                DownloadJob.chat_title.ilike(like),
+                DownloadJob.hashtag.ilike(like),
+                DownloadJob.search_text.ilike(like),
+                DownloadJob.output_subfolder.ilike(like),
+            )
+        )
+    return filters
+
+
+def list_jobs_filtered(
+    db: Session,
+    statuses=None,
+    chat_id: str | None = None,
+    q: str | None = None,
+    limit: int | None = None,
+    offset: int = 0,
+) -> list[DownloadJob]:
+    sync_pending_jobs_with_queue(db)
+    query = select(DownloadJob)
+    for condition in _job_filters(statuses, chat_id, q):
+        query = query.where(condition)
+    query = query.order_by(DownloadJob.created_at.desc()).offset(offset)
+    if limit is not None:
+        query = query.limit(limit)
+    return list(db.scalars(query).all())
+
+
+def count_jobs_filtered(
+    db: Session,
+    statuses=None,
+    chat_id: str | None = None,
+    q: str | None = None,
+) -> int:
+    query = select(func.count()).select_from(DownloadJob)
+    for condition in _job_filters(statuses, chat_id, q):
+        query = query.where(condition)
+    return db.scalar(query) or 0
 
 
 def list_jobs_for_chat(db: Session, chat_id: str) -> list[DownloadJob]:

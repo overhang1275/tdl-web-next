@@ -3,7 +3,6 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-
 SAFE_SUBFOLDER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 SAFE_PATH_KEY_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
