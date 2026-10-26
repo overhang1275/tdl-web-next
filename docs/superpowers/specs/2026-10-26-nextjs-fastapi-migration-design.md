@@ -215,10 +215,14 @@ Rutas:
 |---|---|---|
 | GET | `/api/v1/health` | Liveness mínima, sin auth |
 | GET | `/api/v1/status` | tdl, sesión, Redis, worker, almacenamiento, versión |
-| POST | `/api/v1/auth/login/start` | Inicia login pty |
-| POST | `/api/v1/auth/login/input` | Envía teléfono/código/2FA |
-| POST | `/api/v1/auth/login/cancel` | Cancela login |
-| GET | `/api/v1/auth/login` | Estado y salida redactada |
+| POST | `/api/v1/auth/login` | Login de administrador; cookies JWT |
+| POST | `/api/v1/auth/refresh` | Renueva el access con el refresh |
+| POST | `/api/v1/auth/logout` | Revoca refresh y borra cookies |
+| GET | `/api/v1/auth/me` | Usuario y expiración |
+| POST | `/api/v1/telegram/login/start` | Inicia login pty de Telegram |
+| POST | `/api/v1/telegram/login/input` | Envía teléfono/código/2FA |
+| POST | `/api/v1/telegram/login/cancel` | Cancela login de Telegram |
+| GET | `/api/v1/telegram/login` | Estado y salida redactada |
 | GET | `/api/v1/chats` | Lista/cache, búsqueda, tipo, orden, paginación |
 | GET | `/api/v1/chats/{chat_id}` | Perfil, export, jobs, archivos |
 | DELETE | `/api/v1/chats/{chat_id}/downloads` | Limpia descargas con confirmación |
@@ -247,32 +251,48 @@ Esquemas principales: `JobCreate`, `JobRead`, `JobFileRead`, `TemplateCreate`, `
 
 ## 12. Autenticación y seguridad
 
-- **Basic auth obligatoria en producción.** `WEB_PASSWORD` es requerida si `APP_ENV=production`;
-  el proceso no arranca sin ella. Nginx protege páginas y `/api/` con `auth_basic`; FastAPI vuelve
-  a comprobar Basic como defensa en profundidad. No hay cookies de sesión.
+- **JWT con cookies HttpOnly.** El login es `POST /api/v1/auth/login` con usuario y contraseña.
+  FastAPI emite un access token JWT (15 min) y un refresh token JWT (7 días), ambos en cookies
+  HttpOnly (`tdl_access`, `tdl_refresh`). El navegador nunca guarda tokens en JavaScript.
+- **Contraseña de administrador.** `ADMIN_USERNAME` (por defecto `admin`) y
+  `WEB_PASSWORD_HASH` (scrypt con sal) o `WEB_PASSWORD` en desarrollo. En producción se exige
+  hash o contraseña de 12+ caracteres; el proceso no arranca sin credenciales.
+- **Firma y claims.** HS256 con `SECRET_KEY` de 32+ caracteres. Claims: `sub`, `role=admin`,
+  `type=access|refresh`, `jti`, `iat`, `exp`. El access token no se puede usar como refresh.
+- **Refresh y revocación.** `POST /auth/refresh` valida la cookie de refresh, comprueba el `jti`
+  en Redis (`auth:refresh:<jti>`) y emite un access nuevo (rotación de refresh opcional). El
+  logout borra el `jti` de Redis y las cookies. El access caduca en 15 min; no hay lista negra
+  de access para no añadir una consulta por petición.
+- **Web y API.** Next.js `middleware.ts` verifica el access token con `jose` y redirige a
+  `/login` si falta o expiró. FastAPI verifica el JWT en cada ruta protegida con `PyJWT`.
+  La API es la autoridad; el middleware es la puerta de navegación. `/login`, `/api/v1/health`,
+  `/api/docs` y los estáticos quedan fuera del middleware.
+- **Cookies.** `HttpOnly`, `Secure` en producción, `SameSite=Lax` para access y `SameSite=Strict`
+  para refresh, `Path=/` y `/api/v1/auth`. No se usan `localStorage` ni `NEXT_PUBLIC_*` para tokens.
+- **CSRF.** SameSite + `X-Requested-With: tdl-web` + `Origin`/`Referer` propio en escrituras.
+  Una petición cruzada con cabecera personalizada no pasa el preflight CORS. No hay CORS en
+  producción; en desarrollo se usa el rewrite de Next.js.
 - **TLS obligatorio** en Nginx. `ALLOW_INSECURE_HTTP=true` solo para un laboratorio explícito.
-- **CSRF:** las escrituras exigen `X-Requested-With: tdl-web` y `Origin`/`Referer` del mismo
-  origen. Una petición cruzada con cabecera personalizada no pasa el preflight CORS.
-- **CORS:** sin CORS en producción (mismo origen). En desarrollo, lista explícita
-  `CORS_ORIGINS=http://localhost:3000`.
-- **Rate limit:** `limit_req` de Nginx para `/api/` y `/api/v1/auth/login/input`; bloqueo temporal
-  tras fallos repetidos.
+- **Rate limit:** `limit_req` de Nginx para `/api/` y `/api/v1/auth/login`; bloqueo temporal tras
+  fallos repetidos. Los fallos se registran sin contraseña.
 - **XSS:** Next.js escapa por defecto; prohibido `dangerouslySetInnerHTML` con datos de Telegram.
   Los toasts usan texto, no HTML.
 - **Archivos:** `Content-Disposition: attachment` para HTML/SVG/XML; `CSP: sandbox` en respuestas
   de archivos; `X-Content-Type-Options: nosniff`; solo imágenes/video/audio/PDF inline.
-- **Secretos:** nunca en `NEXT_PUBLIC_*`; el frontend solo conoce la URL relativa de la API.
+- **Secretos:** `SECRET_KEY` se comparte entre API y frontend por variables de entorno del
+  servidor, nunca en `NEXT_PUBLIC_*`. `WEB_PASSWORD_HASH` solo lo ve la API.
 - **Permisos:** `UMask=0077` en systemd y `os.umask(0o077)` al arrancar; DB, caché, logs y sesión
   en 600; directorios en 700.
-- **Login:** no se registra la entrada del usuario; la salida de `tdl` se muestra con los valores
-  sensibles redactados.
+- **Login de Telegram:** no se registra la entrada del usuario; la salida de `tdl` se muestra con
+  los valores sensibles redactados.
 - **Confirmaciones:** borrado de job, limpieza de chat, borrado de plantilla y reset exigen un
   campo/token de confirmación validado en FastAPI; no basta `confirm()` del navegador.
 - **Servicios:** `services/start` solo existe en desarrollo. En producción, systemd gestiona
   Redis y worker.
-- **Redis:** bind a 127.0.0.1, sin exposición; opcional `requirepass` documentado.
-- **Cabeceras:** CSP con `script-src 'self'` y nonce de Next.js, `frame-ancestors 'none'`,
-  `Referrer-Policy: same-origin`, `Permissions-Policy` mínima, HSTS cuando hay TLS.
+- **Redis:** bind a 127.0.0.1, sin exposición; opcional `requirepass` documentado. Redis guarda
+  los `jti` de refresh; si no está disponible, el refresh falla cerrado.
+- **Cabeceras:** CSP con nonce de Next.js, `frame-ancestors 'none'`, `Referrer-Policy: same-origin`,
+  `Permissions-Policy` mínima, HSTS cuando hay TLS.
 
 ## 13. Progreso y reconexión
 
@@ -293,22 +313,25 @@ Esquemas principales: `JobCreate`, `JobRead`, `JobFileRead`, `TemplateCreate`, `
 
 Pantallas:
 
-1. **Resumen** (`/`): estado de sesión/servicios, métricas, jobs activos, últimos errores,
+1. **Login** (`/login`): pantalla pública de acceso, marca del producto, formulario de usuario y
+   contraseña, errores genéricos y estado de carga. Sin registro ni recuperación pública.
+2. **Resumen** (`/`): estado de sesión/servicios, métricas, jobs activos, últimos errores,
    botón “Nueva descarga”.
-2. **Descargas** (`/downloads`): historial con filtros (estado, chat, texto), tabla en escritorio
+3. **Descargas** (`/downloads`): historial con filtros (estado, chat, texto), tabla en escritorio
    y tarjetas en móvil, paginación, acciones.
-3. **Nueva descarga** (`/downloads/new`): selector de chat con búsqueda, filtros, plantillas,
+4. **Nueva descarga** (`/downloads/new`): selector de chat con búsqueda, filtros, plantillas,
    aviso de export existente, validación y confirmación.
-4. **Detalle** (`/downloads/[id]`): progreso honesto, acciones (cancelar, reintentar, eliminar),
+5. **Detalle** (`/downloads/[id]`): progreso honesto, acciones (cancelar, reintentar, eliminar),
    eventos, logs con autocarga, archivos.
-5. **Chats** (`/chats`, `/chats/[id]`): lista, perfil, export, jobs, limpiar descargas.
-6. **Registros** (`/logs`): actividad reciente y acceso a logs por job.
-7. **Configuración** (`/settings`): estado, rutas y límites de solo lectura, login Telegram,
-   servicios (solo lectura en producción), zona de peligro con confirmación.
+6. **Chats** (`/chats`, `/chats/[id]`): lista, perfil, export, jobs, limpiar descargas.
+7. **Registros** (`/logs`): actividad reciente y acceso a logs por job.
+8. **Configuración** (`/settings`): estado, rutas y límites de solo lectura, login Telegram,
+   usuario/sesión, servicios (solo lectura en producción), zona de peligro con confirmación.
 
 Navegación: sidebar en escritorio, bottom nav en móvil; “Nueva descarga” como acción primaria.
-Tema claro/oscuro con `next-themes`; tipografía Inter; tokens en `DESIGN.md`.
-Estados: carga (skeleton), vacío, error, reconexión, sin permiso, job eliminando.
+Menú de usuario con nombre, rol y cerrar sesión. Tema claro/oscuro con `next-themes`; tipografía
+del sistema; tokens en `DESIGN.md`.
+Estados: carga (skeleton), vacío, error, reconexión, sin permiso, job eliminando, sesión expirada.
 Accesibilidad: foco visible, navegación por teclado, labels, `aria-live` para progreso/toasts,
 contraste AA, `prefers-reduced-motion`.
 
@@ -321,15 +344,17 @@ contraste AA, `prefers-reduced-motion`.
 - **Servicios systemd:**
   - `tdl-web-api.service`: `uvicorn app.main:app --host 127.0.0.1 --port 8000 --workers 1`.
   - `tdl-web-worker.service`: `python -m app.rq_worker`.
-  - `tdl-web-frontend.service`: `node .next/standalone/server.js` en 127.0.0.1:3000.
+  - `tdl-web-frontend.service`: `node server.js` en 127.0.0.1:3000.
   - `UMask=0077`, `NoNewPrivileges=true`, `ProtectSystem=strict`, `ReadWritePaths` solo datos.
-- **Nginx:** TLS, Basic auth, `/api/` → 8000, `/` → 3000, timeouts de descarga, límites de
-  petición, logs sin credenciales.
+  - API y frontend reciben `SECRET_KEY` por `EnvironmentFile`; la web lo usa solo en el servidor
+    para verificar el JWT en middleware. `WEB_PASSWORD_HASH` solo lo recibe la API.
+- **Nginx:** TLS, rate limit, `/api/` → 8000, `/` → 3000, timeouts de descarga, límites de
+  petición, logs sin credenciales. No hay Basic auth; el login JWT lo gestiona la app.
 - **Datos:** `/opt/tdl-web/data/{sessions,exports,downloads,logs}`, DB y backups; 700/600.
 - **Actualización:** backup SQLite, build frontend, migración, restart, health check; rollback
   conservando DB y datos.
-- **Docker:** opcional y fuera del camino principal; si se conserva, usuario no root y
-  `WEB_PASSWORD` obligatoria.
+- **Docker:** opcional y fuera del camino principal; si se conserva, usuario no root,
+  `SECRET_KEY` y credenciales obligatorias.
 
 ## 16. Migración de datos y corte
 
@@ -367,25 +392,31 @@ No se convierten ni borran datos reales sin autorización.
 | Lentitud por `tdl chat ls` | Caché de estado con TTL; health separado |
 | Búsqueda lenta | Consultar `DownloadFile`; límite y paginación |
 | SQLite con dos procesos | Worker y API usan WAL; escrituras cortas; no hay dos workers |
-| Basic auth sin TLS | Nginx TLS obligatorio; `ALLOW_INSECURE_HTTP` explícito |
+| JWT sin TLS o en localStorage | TLS obligatorio; cookies HttpOnly/Secure; sin tokens en JS |
+| Refresh replay o logout no revocado | `jti` en Redis con TTL; rotación; logout borra el `jti` |
 | Pruebas en Windows | Backend se prueba en Linux/Docker; pty con import diferido |
 
 ## 19. Decisiones del diseño
 
 - Se conserva Redis/RQ (A).
-- Basic auth con Nginx + FastAPI, sin cookies de sesión.
+- Autenticación JWT con cookies HttpOnly, access 15 min y refresh 7 días; refresh revocable en Redis.
+- Next.js middleware verifica el access; FastAPI lo verifica en cada router protegido.
 - Polling, no SSE/WebSocket.
 - Un worker de API y uno de RQ.
 - SQLite existente, migraciones aditivas.
 - Se elimina Jinja/HTMX del runtime; la UI antigua queda en el historial de Git.
 - Se conserva `app.worker.run_download_job` como ruta de importación.
-- Se añaden `dedupe_key`, `deletion_requested`, `total_expected_bytes` y `eta_seconds` calculado.
+- Se añaden `dedupe_key`, `deletion_requested`, `deletion_error`, `deletion_rq_job_id` y el
+  cálculo de `total_expected_bytes`/`eta_seconds`.
 - La UI nueva no muestra rutas absolutas ni secretos.
 
 ## 20. Criterios de aceptación
 
 - `GET /api/v1/health` responde 200; `GET /api/v1/status` informa tdl, Redis y worker.
-- Sin `WEB_PASSWORD` en producción, la API no arranca.
+- Sin `SECRET_KEY` de 32+ ni credenciales en producción, la API no arranca.
+- `POST /auth/login` con credenciales válidas establece cookies HttpOnly; con inválidas devuelve
+  401 genérico.
+- `POST /auth/refresh` renueva el access; `POST /auth/logout` revoca el refresh y borra cookies.
 - Un POST sin `X-Requested-With` o con origen cruzado recibe 403.
 - Un intento de crear dos jobs idénticos activos devuelve uno solo y 409 en el segundo.
 - Un job de prueba con `tdl` falso recorre export → filtro → descarga → completed.
@@ -398,29 +429,37 @@ No se convierten ni borran datos reales sin autorización.
 
 ## 21. Decisiones de implementación
 
-### 21.1 Autenticación en dos capas
+### 21.1 Autenticación JWT de extremo a extremo
 
-- Nginx protege `/` y `/api/` con `auth_basic` y
-  `auth_basic_user_file /etc/nginx/tdl-web.htpasswd`.
-- `location = /api/v1/health` y `location = /health` tienen `auth_basic off`.
-- El instalador crea el usuario `admin` en el htpasswd con
-  `openssl passwd -apr1 "$WEB_PASSWORD"`; no guarda la contraseña en el htpasswd.
-- FastAPI vuelve a comprobar Basic en todas las rutas salvo health. Si Nginx ya autenticó,
-  la cabecera `Authorization` llega al backend; el navegador la reenvía en las llamadas same-origin.
-- No hay cookies de sesión. Las escrituras exigen `X-Requested-With: tdl-web` y origen propio.
-- En desarrollo se puede omitir `WEB_PASSWORD`; la API solo escucha en `127.0.0.1`.
-- Un 401 en el frontend muestra “No autorizado” y pide recargar; no se guardan credenciales en JS.
+- `POST /api/v1/auth/login` recibe `{username, password}` y compara con
+  `WEB_PASSWORD_HASH` (scrypt) o, en desarrollo, con `WEB_PASSWORD`.
+- Emite `tdl_access` (15 min) y `tdl_refresh` (7 días) como cookies HttpOnly, `Secure` en
+  producción, `SameSite=Lax`/`Strict`.
+- `GET /api/v1/auth/me` devuelve `{username, role, expires_at}`.
+- `POST /api/v1/auth/refresh` valida el refresh contra Redis (`auth:refresh:<jti>`) y emite un
+  access nuevo. Si Redis no responde, falla cerrado.
+- `POST /api/v1/auth/logout` borra el `jti` de Redis y las cookies.
+- Next.js `middleware.ts` verifica el access con `jose` y redirige a `/login`; la API verifica
+  con `PyJWT` en cada router protegido. `/login`, health, docs y estáticos quedan fuera.
+- Las escrituras exigen `X-Requested-With: tdl-web` y origen propio. No hay Basic auth ni
+  `Authorization` manual en el navegador.
+- En desarrollo se puede usar `WEB_PASSWORD`; en producción se exige `SECRET_KEY` de 32+ y
+  `WEB_PASSWORD_HASH` (o contraseña de 12+ caracteres).
+- Un 401 del API intenta refresh una vez; si falla, limpia el estado y redirige a `/login`.
+- El login tiene rate limit en Nginx y un mensaje de error genérico; no revela si el usuario existe.
 
 ### 21.2 Datos en el frontend
 
 - Las páginas usan componentes cliente para datos; el layout puede ser servidor.
 - `apiFetch` usa rutas relativas `/api/v1`, `credentials: "same-origin"` y la cabecera
-  `X-Requested-With`. No existe `NEXT_PUBLIC_API_URL`.
+  `X-Requested-With`. No existe `NEXT_PUBLIC_API_URL` ni token en `localStorage`.
 - En desarrollo, `next.config.ts` reescribe `/api/:path*` a `http://127.0.0.1:8000/api/:path*`.
   En producción Nginx enruta `/api/` directamente. No hay CORS.
 - TanStack Query reintenta una vez, refresca al volver a la pestaña y detiene el polling cuando
   el job es terminal.
-- Un 401/403 se muestra como estado de error, no como pantalla en blanco.
+- Un 401 se intenta refrescar; si el refresh falla, se redirige a `/login`. Un 403 se muestra
+  como estado de error, no como pantalla en blanco.
+- El layout autenticado incluye menú de usuario, cierre de sesión y nombre del workspace.
 
 ### 21.3 Corte y compatibilidad RQ
 
@@ -501,12 +540,15 @@ No se convierten ni borran datos reales sin autorización.
 - Las pruebas de API usan `TestClient`, SQLite temporal y una cola RQ falsa.
 - Las pruebas de navegador usan datos fixture; la integración real se prueba con backend + `tdl`
   falso y se identifica en el informe.
+- JWT: login válido/inválido, cookies HttpOnly/Secure/SameSite, access caducado, refresh válido,
+  refresh revocado, logout, middleware de Next.js, 401 → refresh → reintento y CSRF.
 
 ### 21.11 Alcance de Registros y Configuración
 
 - `/logs` lista la actividad reciente de jobs y enlaza al log de cada job; no agrega logs globales.
 - `/settings` muestra versión, entorno, rutas, límites, binario/namespace de `tdl`, estado de
-  Redis/worker y sesión. No muestra `SECRET_KEY`, `WEB_PASSWORD` ni URLs con credenciales.
+  Redis/worker, usuario y sesión. No muestra `SECRET_KEY`, `WEB_PASSWORD_HASH` ni URLs con
+  credenciales.
 - El botón de arranque de servicios solo aparece en desarrollo.
 
 ## 22. Respuestas a la revisión del constructor
@@ -527,8 +569,9 @@ No se convierten ni borran datos reales sin autorización.
 
 3. **¿Next.js renderiza datos en servidor?**
    No. El layout puede ser servidor, pero los datos se piden en componentes cliente con
-   TanStack Query. Basic auth la resuelve Nginx en el navegador; no hay llamadas SSR que
-   necesiten reenviar `Authorization`. Por eso no hay URL interna de API ni CORS. En desarrollo
+   TanStack Query. El JWT viaja en cookies HttpOnly; Next.js `middleware.ts` verifica el access
+   con `jose` para proteger la navegación, y FastAPI lo verifica en cada router. No hay llamadas
+   SSR que necesiten reenviar tokens. Por eso no hay URL interna de API ni CORS. En desarrollo
    se usa un rewrite de Next.js; en producción Nginx enruta `/api/`.
 
 4. **¿Se permiten tablas nuevas?**

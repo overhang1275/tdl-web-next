@@ -109,10 +109,12 @@ terminar durante el corte.
 
 ## 5. API
 
-Base: `/api/v1`. JSON, Pydantic, OpenAPI en `/api/docs` (protegido en producción).
+Base: `/api/v1`. JSON, Pydantic, OpenAPI en `/api/docs`.
 
 - `GET /health`, `GET /status`.
-- `POST /auth/login/start`, `/auth/login/input`, `/auth/login/cancel`; `GET /auth/login`.
+- `POST /auth/login`, `POST /auth/refresh`, `POST /auth/logout`, `GET /auth/me`.
+- `POST /telegram/login/start`, `/telegram/login/input`, `/telegram/login/cancel`;
+  `GET /telegram/login`.
 - `GET /chats`, `GET /chats/{chat_id}`, `DELETE /chats/{chat_id}/downloads`.
 - `GET/POST /templates`, `PUT/DELETE /templates/{id}`.
 - `GET/POST /jobs`, `GET /jobs/{id}`, `POST /jobs/{id}/cancel`, `POST /jobs/{id}/retry`,
@@ -126,13 +128,14 @@ Contratos:
 - Error uniforme `{"error": {"code", "message", "detail"}}`.
 - Paginación uniforme `{"items", "page", "per_page", "total", "page_count"}`.
 - Fechas ISO 8601 con zona UTC.
-- No se exponen rutas absolutas ni tokens de Telegram.
+- No se exponen rutas absolutas, tokens de Telegram ni JWT en el cuerpo.
 - `Idempotency-Key` opcional en `POST /jobs`.
 
 ## 6. Pantallas
 
 | Ruta | Pantalla | Funciones |
 |---|---|---|
+| `/login` | Login | Acceso de administrador, errores genéricos, marca |
 | `/` | Resumen | Estado, métricas, activos, errores, nueva descarga |
 | `/downloads` | Descargas | Historial, filtros, paginación, acciones |
 | `/downloads/new` | Nueva descarga | Chat, filtros, plantilla, export, validación |
@@ -140,10 +143,10 @@ Contratos:
 | `/chats` | Chats | Cache, búsqueda, tipo, orden |
 | `/chats/[id]` | Perfil | Export, jobs, descargas, limpiar |
 | `/logs` | Registros | Actividad y logs por job |
-| `/settings` | Configuración | Estado, login, rutas/límites de solo lectura, reset |
+| `/settings` | Configuración | Estado, login Telegram, usuario/sesión, rutas/límites, reset |
 
-Navegación: sidebar en escritorio, bottom nav en móvil. “Nueva descarga” es la acción primaria.
-No se añaden landing pages ni pantallas de marketing.
+Navegación: sidebar en escritorio, bottom nav en móvil, menú de usuario. “Nueva descarga” es la
+acción primaria. No se añaden landing pages ni pantallas de marketing.
 
 ## 7. Flujo de un job
 
@@ -156,6 +159,8 @@ sequenceDiagram
   participant W as Worker
   participant T as tdl
 
+  UI->>API: POST /api/v1/auth/login
+  API-->>UI: cookies JWT HttpOnly
   UI->>API: POST /api/v1/jobs + Idempotency-Key
   API->>DB: validar + insertar job (dedupe_key)
   API->>R: enqueue app.worker.run_download_job
@@ -172,8 +177,9 @@ sequenceDiagram
 
 ## 8. Persistencia y migración
 
-- Mismo esquema SQLite; columnas nuevas: `dedupe_key`, `deletion_requested`,
-  `total_expected_bytes` (derivado) y `eta_seconds` (calculado en lectura/worker).
+- Mismo esquema SQLite; columnas nuevas: `dedupe_key`, `deletion_requested`, `deletion_error`,
+  `deletion_rq_job_id`.
+- `total_expected_bytes` y `eta_seconds` se calculan; no se añade una columna para el primero.
 - Índice único parcial para jobs activos con la misma `dedupe_key`.
 - Mismos directorios de datos y mismas rutas de archivos.
 - Migraciones aditivas al arrancar; backup de SQLite antes de actualizar.
@@ -182,16 +188,18 @@ sequenceDiagram
 
 ## 9. Seguridad
 
-- `WEB_PASSWORD` obligatoria en producción; Basic auth en Nginx + FastAPI.
+- JWT con cookies HttpOnly: access 15 min, refresh 7 días, refresh revocable en Redis.
+- `SECRET_KEY` de 32+ y credenciales obligatorias en producción; scrypt para la contraseña.
+- Next.js middleware verifica el access con `jose`; FastAPI lo verifica con `PyJWT`.
 - TLS; `ALLOW_INSECURE_HTTP` solo explícito para laboratorio.
 - `X-Requested-With` + Origin/Referer para escrituras; sin CORS en producción.
-- Rate limit en Nginx; bloqueo temporal.
+- Rate limit en Nginx para login y API.
 - CSP con nonce; sin CDN sin SRI; sin `dangerouslySetInnerHTML`.
 - Archivos peligrosos como `attachment`; `CSP: sandbox`; tipos seguros inline.
 - `UMask=0077`; datos 600/700.
 - Confirmaciones de servidor para acciones destructivas.
-- Sin secretos en `NEXT_PUBLIC_*`.
-- Redis en localhost.
+- Sin secretos en `NEXT_PUBLIC_*`; tokens nunca en `localStorage`.
+- Redis en localhost; guarda los `jti` de refresh.
 - Un worker de API y uno de RQ.
 
 ## 10. Despliegue
