@@ -112,13 +112,18 @@ x86_64 o arm64. Usa Node y `tdl` oficiales con SHA-256, Python con venv y Next.j
 El instalador **no crea el LXC ni configura Cloudflare Tunnel**; tampoco instala Docker.
 
 ```bash
-sudo bash install-tld.sh --source-dir "$PWD"
+curl -fsSL https://raw.githubusercontent.com/overhang1275/tdl-web-next/refs/heads/main/install-tld.sh | sudo bash
 ```
 
-El asistente permite instalar, actualizar, reparar, reconfigurar o cancelar. Enter acepta los
-valores mostrados. Por defecto usa `/opt/tld-web`, escucha en `127.0.0.1:8080`, crea el usuario
-de servicio `tld-web` sin login y ofrece Redis local opcional. La API usa un puerto loopback
-separado (`8000`); los puertos ocupados se rechazan.
+La ejecución por pipe no es interactiva: usa los valores por defecto y exige las credenciales
+de Authentik en el entorno o en un `/etc/tld-web/tld-web.env` existente. Para el asistente
+interactivo, descarga el script y ejecútalo con `sudo bash install-tld.sh`; desde una copia
+local, añade `--source-dir "$PWD"`.
+
+El instalador permite instalar, actualizar, reparar, reconfigurar o cancelar. De forma
+interactiva, Enter acepta los valores mostrados. Por defecto usa `/opt/tld-web`, escucha en
+`127.0.0.1:8080`, crea el usuario de servicio `tld-web` sin login y ofrece Redis local
+opcional. La API usa un puerto loopback separado (`8000`); los puertos ocupados se rechazan.
 
 El login requiere un Authentik externo. El asistente solicita issuer HTTPS, client ID y
 secreto si faltan. Configura un proveedor OIDC confidencial con PKCE, firma RS256, scopes

@@ -113,13 +113,19 @@ and the Next.js standalone build. The installer **does not create the LXC, confi
 Cloudflare Tunnel or install Docker**.
 
 ```bash
-sudo bash install-tld.sh --source-dir "$PWD"
+curl -fsSL https://raw.githubusercontent.com/overhang1275/tdl-web-next/refs/heads/main/install-tld.sh | sudo bash
 ```
 
-The wizard supports install, update, repair, reconfigure and cancel. Enter accepts the
-displayed defaults. By default it uses `/opt/tld-web`, listens on `127.0.0.1:8080`, creates
-the passwordless `tld-web` service account and offers optional local Redis. The API uses a
-separate loopback port (`8000`); occupied ports are rejected.
+The piped installer runs non-interactively: it uses the defaults and requires the Authentik
+credentials in the environment or in an existing `/etc/tld-web/tld-web.env`. For the
+interactive wizard, download the script and run `sudo bash install-tld.sh`; from a checkout,
+add `--source-dir "$PWD"`.
+
+The installer supports install, update, repair, reconfigure and cancel. When run
+interactively, Enter accepts the displayed defaults. By default it uses `/opt/tld-web`,
+listens on `127.0.0.1:8080`, creates the passwordless `tld-web` service account and offers
+optional local Redis. The API uses a separate loopback port (`8000`); occupied ports are
+rejected.
 
 Login requires an external Authentik instance. The wizard asks for the HTTPS issuer, client ID
 and secret if they are missing. Configure a confidential OIDC provider with PKCE, RS256
