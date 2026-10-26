@@ -19,10 +19,12 @@ grupo `tdl-admin`. El scope `tdl-groups` debe emitir `groups` con los nombres de
 del usuario. Configura el callback exacto:
 
 ```text
-https://app.TU_DOMINIO/api/auth/callback/authentik
+https://tld.opencore.dpdns.org/api/auth/callback/authentik
 ```
 
-Prepara la configuración; reemplaza el dominio y los datos del proveedor:
+La plantilla ya usa `https://tld.opencore.dpdns.org` y el Authentik externo en
+`https://oak.opencore.dpdns.org`. Completa el client ID y el secreto del proveedor
+(y confirma el issuer exacto después de crear la aplicación OIDC):
 
 ```bash
 sudo install -d -m 750 /etc/telegram-downloader
@@ -39,7 +41,7 @@ si falta el proveedor, termina antes de reemplazar los servicios.
 La plantilla nativa usa `NATIVE_INGRESS=tunnel`: Nginx escucha exclusivamente en
 `127.0.0.1:8080`, sin certificados locales ni redirección HTTP. Instala el conector
 `cloudflared` como servicio nativo en **el mismo LXC** siguiendo los comandos del
-panel Cloudflare. En la ruta publicada del túnel configura tu dominio de TDL y
+panel Cloudflare. En la ruta publicada del túnel configura `tld.opencore.dpdns.org` y
 **Service URL `http://127.0.0.1:8080`**. `AUTH_URL` debe seguir siendo la URL pública
 `https://...`, y el callback de Authentik debe usar exactamente ese dominio.
 Referencia: [configurar el túnel](https://developers.cloudflare.com/tunnel/get-started/).
