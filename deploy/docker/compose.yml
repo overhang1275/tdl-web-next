@@ -1,0 +1,187 @@
+name: tdl-console
+
+x-api: &api
+  image: tdl-console-api:${APP_VERSION:-local}
+  build:
+    context: ../..
+    dockerfile: deploy/docker/Dockerfile.api
+    target: runtime
+    args:
+      APP_UID: ${APP_UID:-10001}
+      APP_GID: ${APP_GID:-10001}
+  restart: unless-stopped
+  init: true
+  environment:
+    APP_ENV: production
+    DEPLOYMENT_MODE: docker
+    APP_VERSION: ${APP_VERSION:-local}
+    DATA_DIR: ${DATA_DIR:-/opt/tld-web/data}
+    TDL_SESSIONS_DIR: ${TDL_SESSIONS_DIR:-/opt/tld-web/data/sessions}
+    EXPORTS_DIR: ${EXPORTS_DIR:-/opt/tld-web/data/exports}
+    DOWNLOADS_DIR: ${DOWNLOADS_DIR:-/opt/tld-web/data/downloads}
+    DOWNLOADS_ALLOWED_ROOTS: ${DOWNLOADS_ALLOWED_ROOTS:-}
+    LOGS_DIR: ${LOGS_DIR:-/opt/tld-web/data/logs}
+    DATABASE_URL: ${DATABASE_URL:-sqlite:////opt/tld-web/data/telegram_downloader.sqlite3}
+    DATABASE_DIR: ${DATABASE_DIR:-${DATA_DIR:-/opt/tld-web/data}}
+    REDIS_URL: redis://redis:6379/1
+    TDL_BINARY: /usr/local/bin/tdl
+    TDL_NAMESPACE: ${TDL_NAMESPACE:-default}
+    COMMAND_TIMEOUT_SECONDS: ${COMMAND_TIMEOUT_SECONDS:-7200}
+    DOWNLOAD_BATCH_SIZE: ${DOWNLOAD_BATCH_SIZE:-100}
+    DOWNLOAD_IDLE_TIMEOUT_SECONDS: ${DOWNLOAD_IDLE_TIMEOUT_SECONDS:-600}
+    EXPORT_BATCH_SIZE: ${EXPORT_BATCH_SIZE:-5000}
+    AUTHENTIK_ISSUER: ${AUTHENTIK_ISSUER:?Set AUTHENTIK_ISSUER}
+    AUTHENTIK_AUDIENCE: ${AUTHENTIK_CLIENT_ID:?Set AUTHENTIK_CLIENT_ID}
+    AUTHENTIK_JWKS_URL: ${AUTHENTIK_JWKS_URL:?Set AUTHENTIK_JWKS_URL}
+    AUTHENTIK_ADMIN_GROUP: tdl-admin
+    TRUSTED_HOSTS: api,localhost,127.0.0.1
+    SSL_CERT_FILE: /etc/tdl/fullchain.pem
+  volumes:
+    - ${DATA_DIR:-/opt/tld-web/data}:${DATA_DIR:-/opt/tld-web/data}
+    - ${DOWNLOADS_DIR:-/opt/tld-web/data/downloads}:${DOWNLOADS_DIR:-/opt/tld-web/data/downloads}
+    - ${TDL_SESSIONS_DIR:-/opt/tld-web/data/sessions}:${TDL_SESSIONS_DIR:-/opt/tld-web/data/sessions}
+    - ${EXPORTS_DIR:-/opt/tld-web/data/exports}:${EXPORTS_DIR:-/opt/tld-web/data/exports}
+    - ${LOGS_DIR:-/opt/tld-web/data/logs}:${LOGS_DIR:-/opt/tld-web/data/logs}
+    - ${DATABASE_DIR:-${DATA_DIR:-/opt/tld-web/data}}:${DATABASE_DIR:-${DATA_DIR:-/opt/tld-web/data}}
+    - ${TLS_DIR:-/etc/telegram-downloader/certs}/fullchain.pem:/etc/tdl/fullchain.pem:ro
+  networks: [services, edge]
+  mem_limit: 1g
+
+x-authentik-env: &authentik-env
+  AUTHENTIK_POSTGRESQL__HOST: postgres
+  AUTHENTIK_POSTGRESQL__NAME: authentik
+  AUTHENTIK_POSTGRESQL__USER: authentik
+  AUTHENTIK_POSTGRESQL__PASSWORD: ${PG_PASS:?Set PG_PASS}
+  AUTHENTIK_SECRET_KEY: ${AUTHENTIK_SECRET_KEY:?Set AUTHENTIK_SECRET_KEY}
+  AUTHENTIK_BOOTSTRAP_PASSWORD: ${AUTHENTIK_BOOTSTRAP_PASSWORD:?Set AUTHENTIK_BOOTSTRAP_PASSWORD}
+  AUTHENTIK_BOOTSTRAP_EMAIL: ${AUTHENTIK_BOOTSTRAP_EMAIL:-admin@example.test}
+  AUTHENTIK_CLIENT_ID: ${AUTHENTIK_CLIENT_ID:?Set AUTHENTIK_CLIENT_ID}
+  AUTHENTIK_CLIENT_SECRET: ${AUTHENTIK_CLIENT_SECRET:?Set AUTHENTIK_CLIENT_SECRET}
+  AUTH_URL: ${AUTH_URL:?Set AUTH_URL}
+  AUTHENTIK_ERROR_REPORTING__ENABLED: 'false'
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: authentik
+      POSTGRES_USER: authentik
+      POSTGRES_PASSWORD: ${PG_PASS:?Set PG_PASS}
+    volumes: [postgres-data:/var/lib/postgresql/data]
+    networks: [services]
+    healthcheck:
+      test: [CMD-SHELL, 'pg_isready -U authentik -d authentik']
+      interval: 10s
+      timeout: 5s
+      retries: 20
+    mem_limit: 768m
+  redis:
+    image: redis:7.4-alpine
+    restart: unless-stopped
+    command: [redis-server, --appendonly, 'yes', --maxmemory, 192mb, --maxmemory-policy, noeviction]
+    volumes: [redis-data:/data]
+    networks: [services]
+    healthcheck:
+      test: [CMD, redis-cli, ping]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    mem_limit: 256m
+  authentik-server:
+    image: ghcr.io/goauthentik/server:2026.8.5
+    command: server
+    restart: unless-stopped
+    environment: *authentik-env
+    volumes: [authentik-data:/data]
+    networks: [services, edge]
+    depends_on:
+      postgres: {condition: service_healthy}
+    healthcheck:
+      test: [CMD, ak, healthcheck]
+      interval: 15s
+      timeout: 10s
+      start_period: 90s
+      retries: 20
+    mem_limit: 1536m
+    shm_size: 256mb
+  authentik-worker:
+    image: ghcr.io/goauthentik/server:2026.8.5
+    command: worker
+    restart: unless-stopped
+    environment: *authentik-env
+    volumes:
+      - authentik-data:/data
+      - ../authentik:/blueprints/custom:ro
+    networks: [services, edge]
+    depends_on:
+      authentik-server: {condition: service_healthy}
+    mem_limit: 1536m
+    shm_size: 256mb
+  api:
+    <<: *api
+    depends_on:
+      redis: {condition: service_healthy}
+    mem_limit: 512m
+  worker:
+    <<: *api
+    command: [python, -m, app.rq_worker]
+    depends_on:
+      api: {condition: service_healthy}
+    healthcheck: {disable: true}
+  web:
+    image: tdl-console-web:${APP_VERSION:-local}
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.web
+      target: runtime
+    restart: unless-stopped
+    init: true
+    environment:
+      AUTH_SECRET: ${AUTH_SECRET:?Set AUTH_SECRET}
+      AUTH_URL: ${AUTH_URL:?Set AUTH_URL}
+      AUTHENTIK_ISSUER: ${AUTHENTIK_ISSUER:?Set AUTHENTIK_ISSUER}
+      AUTHENTIK_CLIENT_ID: ${AUTHENTIK_CLIENT_ID:?Set AUTHENTIK_CLIENT_ID}
+      AUTHENTIK_CLIENT_SECRET: ${AUTHENTIK_CLIENT_SECRET:?Set AUTHENTIK_CLIENT_SECRET}
+      AUTHENTIK_ADMIN_GROUP: tdl-admin
+      API_INTERNAL_URL: http://api:8000
+      NODE_EXTRA_CA_CERTS: /etc/tdl/fullchain.pem
+    volumes:
+      - ${TLS_DIR:-/etc/telegram-downloader/certs}/fullchain.pem:/etc/tdl/fullchain.pem:ro
+    networks: [services, edge]
+    depends_on:
+      api: {condition: service_healthy}
+    mem_limit: 512m
+  nginx:
+    image: nginx:1.28-alpine
+    restart: unless-stopped
+    environment:
+      DOMAIN: ${DOMAIN:?Set DOMAIN}
+      NGINX_ENVSUBST_FILTER: DOMAIN
+    ports:
+      - '${HTTP_PORT:-80}:80'
+      - '${HTTPS_PORT:-443}:443'
+    volumes:
+      - ../nginx/tdl-web.conf.template:/etc/nginx/templates/default.conf.template:ro
+      - ${TLS_DIR:-/etc/telegram-downloader/certs}:/etc/nginx/certs:ro
+    networks:
+      services:
+      edge:
+        aliases: ['app.${DOMAIN}', 'auth.${DOMAIN}']
+    depends_on:
+      web: {condition: service_healthy}
+      authentik-server: {condition: service_healthy}
+    healthcheck:
+      test: [CMD, nginx, -t]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+    mem_limit: 128m
+
+volumes:
+  postgres-data:
+  redis-data:
+  authentik-data:
+networks:
+  services: {internal: true}
+  edge:
