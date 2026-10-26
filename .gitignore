@@ -3,6 +3,8 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .pytest-tmp/
+.superpowers/
+backend/data/
 .coverage
 htmlcov/
 .mypy_cache/
@@ -27,3 +29,6 @@ sessions/
 graphify-out/
 node_modules/
 .next/
+frontend/playwright-report/
+frontend/test-results/
+*.tsbuildinfo
