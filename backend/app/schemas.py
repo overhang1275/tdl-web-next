@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
 from typing import Literal
 
-from pydantic import BaseModel, Field, field_validator, model_validator
-
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 MediaTypeLiteral = Literal["all", "video", "image", "audio", "document"]
 
@@ -48,7 +47,54 @@ class JobCreate(BaseModel):
         return sanitize_subfolder(value)
 
     @model_validator(mode="after")
-    def validate_date_range(self) -> "JobCreate":
+    def validate_date_range(self) -> JobCreate:
         if self.date_from and self.date_to and self.date_from > self.date_to:
             raise ValueError("date_from must be before or equal to date_to")
         return self
+
+
+class UserRead(BaseModel):
+    username: str
+    email: str | None = None
+    name: str | None = None
+    groups: list[str] = Field(default_factory=list)
+    expires_at: datetime | None = None
+
+
+class StatusRead(BaseModel):
+    environment: str
+    version: str
+    session_active: bool
+    session_error: str | None = None
+    tdl_installed: bool
+    tdl_binary: str
+    redis_connected: bool
+    redis_error: str | None = None
+    worker_connected: bool
+    worker_count: int
+    storage: str
+    can_start_services: bool
+    authentik_configured: bool
+
+
+class Page[T](BaseModel):
+    items: list[T]
+    page: int
+    per_page: int
+    total: int
+    page_count: int
+
+
+class ErrorBody(BaseModel):
+    code: str
+    message: str
+    detail: object | None = None
+
+
+class ErrorResponse(BaseModel):
+    error: ErrorBody
+
+
+class ORMModel(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
