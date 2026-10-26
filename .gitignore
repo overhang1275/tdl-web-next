@@ -22,3 +22,5 @@ exports/
 downloads/
 logs/
 sessions/
+.venv-graphify
+.superpowers/
