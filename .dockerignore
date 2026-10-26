@@ -1,4 +1,12 @@
 .git
+.superpowers
+.venv-graphify
+docs
+graphify-out
+frontend/node_modules
+frontend/.next
+frontend/test-results
+frontend/playwright-report
 .venv
 venv
 __pycache__

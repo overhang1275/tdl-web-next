@@ -1,0 +1,10 @@
+FROM mcr.microsoft.com/playwright:v1.64.1-noble
+WORKDIR /app/frontend
+ENV CI=1 NEXT_TELEMETRY_DISABLED=1
+COPY frontend/package.json frontend/package-lock.json ./
+RUN npm ci
+COPY frontend .
+RUN mkdir -p /app/docs/design-audit /app/frontend/test-results \
+    && chown pwuser:pwuser /app/frontend /app/frontend/test-results /app/docs /app/docs/design-audit
+USER pwuser
+CMD ["npm", "run", "test:e2e"]

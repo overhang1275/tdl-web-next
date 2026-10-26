@@ -1,0 +1,451 @@
+from __future__ import annotations
+
+import json
+import shutil
+import subprocess
+from datetime import datetime, timedelta
+from pathlib import Path
+from uuid import uuid4
+
+from redis import Redis
+from redis.exceptions import RedisError
+from rq import Queue
+from rq.exceptions import NoSuchJobError
+from rq.job import Job
+from sqlalchemy import func, or_, select, update
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
+
+from app.config import settings
+from app.database import SessionLocal
+from app.models import DownloadFile, DownloadJob, JobStage, JobStatus, MediaType
+from app.schemas import JobCreate
+from app.services.dedupe import key_for_payload
+from app.services.files import job_download_root
+from app.services.logs import append_deleted_job_log, append_job_log
+from app.services.paths import chat_path_key, safe_child
+
+
+class QueueUnavailableError(RuntimeError):
+    pass
+
+
+class DuplicateJobError(RuntimeError):
+    def __init__(self, job: DownloadJob) -> None:
+        super().__init__(f"Duplicate active job: {job.id}")
+        self.job = job
+
+
+class DeleteJobError(RuntimeError):
+    pass
+
+
+class NoFailedFilesError(RuntimeError):
+    pass
+
+
+ACTIVE_STATUSES = (JobStatus.pending, JobStatus.running)
+
+
+def get_queue() -> Queue:
+    return Queue("telegram-downloads", connection=Redis.from_url(settings.redis_url))
+
+
+def ensure_queue_available() -> Queue:
+    queue = get_queue()
+    try:
+        queue.connection.ping()
+    except RedisError as exc:
+        raise QueueUnavailableError(f"Redis is not available at {settings.redis_url}") from exc
+    return queue
+
+
+def create_job(
+    db: Session,
+    payload: JobCreate,
+    enqueue: bool = True,
+    idempotency_key: str | None = None,
+) -> DownloadJob:
+    queue = ensure_queue_available() if enqueue else None
+    dedupe_key = key_for_payload(payload, idempotency_key) if enqueue else None
+    existing = None
+    if dedupe_key:
+        existing = db.scalar(
+            select(DownloadJob).where(
+                DownloadJob.dedupe_key == dedupe_key,
+                DownloadJob.status.in_(ACTIVE_STATUSES),
+            )
+        )
+    if existing is not None:
+        raise DuplicateJobError(existing)
+    job = DownloadJob(
+        chat_id=payload.chat_id,
+        chat_title=payload.chat_title,
+        hashtag=payload.hashtag,
+        media_type=MediaType(payload.media_type),
+        search_text=payload.search_text,
+        date_from=payload.date_from,
+        date_to=payload.date_to,
+        skip_same=payload.skip_same,
+        refresh_export=payload.refresh_export,
+        export_only=payload.export_only,
+        output_subfolder=payload.output_subfolder,
+        dedupe_key=dedupe_key,
+    )
+    db.add(job)
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        existing = db.scalar(
+            select(DownloadJob).where(
+                DownloadJob.dedupe_key == dedupe_key,
+                DownloadJob.status.in_(ACTIVE_STATUSES),
+            )
+        )
+        if existing is not None:
+            raise DuplicateJobError(existing) from exc
+        raise
+    db.refresh(job)
+    chat_key = chat_path_key(job.chat_id)
+    export_dir = safe_child(settings.exports_dir, chat_key)
+    download_dir = safe_child(settings.downloads_dir, chat_key, job.output_subfolder)
+    job.export_json_path = str(export_dir / "export.json")
+    job.filtered_json_path = str(export_dir / f"filtered-job-{job.id}.json")
+    job.download_path = str(download_dir)
+    db.commit()
+    db.refresh(job)
+    if enqueue:
+        try:
+            enqueue_job(db, job, queue=queue)
+        except RedisError as exc:
+            job.stage = JobStage.failed
+            job.status = JobStatus.failed
+            job.error_message = f"Could not enqueue job in Redis: {exc}"
+            db.commit()
+            raise QueueUnavailableError(job.error_message) from exc
+    return job
+
+
+def enqueue_job(db: Session, job: DownloadJob, delay: int = 0, queue=None) -> bool:
+    queue = queue or ensure_queue_available()
+    token = uuid4().hex
+    claimed = db.execute(update(DownloadJob).where(
+        DownloadJob.id == job.id,
+        DownloadJob.status.in_(ACTIVE_STATUSES),
+        DownloadJob.cancel_requested.is_(False),
+        DownloadJob.rq_job_id == job.rq_job_id,
+    ).values(rq_job_id=token, rq_enqueued_at=datetime.utcnow(), status=JobStatus.pending))
+    db.commit()
+    db.refresh(job)
+    if not claimed.rowcount:
+        if job.cancel_requested and job.status in ACTIVE_STATUSES:
+            job.status, job.stage = JobStatus.cancelled, JobStage.cancelled
+            job.finished_at = datetime.utcnow()
+            db.commit()
+        return False
+    kwargs = {"job_id": token, "job_timeout": settings.command_timeout_seconds + 120}
+    try:
+        if delay:
+            queue.enqueue_in(timedelta(seconds=delay), "app.worker.run_download_job", job.id, token, **kwargs)
+        else:
+            queue.enqueue("app.worker.run_download_job", job.id, token, **kwargs)
+    except RedisError as exc:
+        job.status, job.stage = JobStatus.failed, JobStage.failed
+        job.error_message = f"Could not enqueue continuation in Redis: {exc}"
+        db.commit()
+        raise QueueUnavailableError(job.error_message) from exc
+    return True
+
+
+def find_duplicate_active_job(db: Session, payload: JobCreate) -> DownloadJob | None:
+    return db.scalar(
+        select(DownloadJob)
+        .where(
+            DownloadJob.status.in_(ACTIVE_STATUSES),
+            DownloadJob.chat_id == payload.chat_id,
+            DownloadJob.hashtag == payload.hashtag,
+            DownloadJob.media_type == MediaType(payload.media_type),
+            DownloadJob.search_text == payload.search_text,
+            DownloadJob.date_from == payload.date_from,
+            DownloadJob.date_to == payload.date_to,
+            DownloadJob.output_subfolder == payload.output_subfolder,
+            DownloadJob.export_only == payload.export_only,
+        )
+        .order_by(DownloadJob.created_at.desc())
+    )
+
+
+def cancel_job(db: Session, job: DownloadJob) -> DownloadJob:
+    if job.status not in ACTIVE_STATUSES:
+        return job
+    was_pending = job.status == JobStatus.pending
+    job.cancel_requested = True
+    if job.status == JobStatus.pending:
+        job.status = JobStatus.cancelled
+        job.stage = JobStage.cancelled
+    db.commit()
+    if job.rq_job_id and was_pending:
+        try:
+            rq_job = Job.fetch(job.rq_job_id, connection=get_queue().connection)
+            rq_job.cancel()
+        except Exception:
+            pass
+    db.refresh(job)
+    return job
+
+
+def retry_job(db: Session, job: DownloadJob, mode: str = "pending") -> DownloadJob:
+    if mode not in {"pending", "failed"}:
+        raise ValueError("mode must be pending or failed")
+    if job.status in ACTIVE_STATUSES:
+        return job
+    if mode == "failed":
+        failed = db.scalar(
+            select(func.count())
+            .select_from(DownloadFile)
+            .where(DownloadFile.job_id == job.id, DownloadFile.status == "failed")
+        )
+        if not failed:
+            raise NoFailedFilesError("No hay archivos fallidos para reintentar.")
+    queue = ensure_queue_available()
+    # Claim the retry in SQL so repeated/concurrent clicks cannot enqueue twice.
+    claimed = db.execute(update(DownloadJob).where(
+        DownloadJob.id == job.id,
+        DownloadJob.status.in_((JobStatus.failed, JobStatus.cancelled)),
+    ).values(status=JobStatus.pending))
+    db.commit()
+    db.refresh(job)
+    if not claimed.rowcount:
+        return job
+    from app.services.transfers import reset_failed_files, reset_pending_files, write_json_atomic
+
+    try:
+        # Freeze legacy jobs' already-filtered selection before an export refresh.
+        filtered = Path(job.filtered_json_path) if job.filtered_json_path else None
+        if not job.transfer_initialized and filtered and filtered.exists():
+            snapshot = Path(job.export_json_path).parent / f"export-job-{job.id}.json"
+            if not snapshot.exists():
+                write_json_atomic(snapshot, json.loads(filtered.read_text(encoding="utf-8")))
+        if mode == "failed":
+            reset_failed_files(db, job)
+        else:
+            reset_pending_files(db, job)
+    except Exception as exc:
+        db.rollback()
+        job.status, job.stage = JobStatus.failed, JobStage.failed
+        job.error_message = str(exc)
+        db.commit()
+        raise
+    job.cancel_requested = False
+    job.error_message = None
+    job.finished_at = None
+    job.stage = JobStage.downloading if job.transfer_initialized else JobStage.exporting
+    db.commit()
+    enqueue_job(db, job, queue=queue)
+    if mode == "failed":
+        append_job_log(job.id, "Reintentando solo los archivos fallidos.")
+    else:
+        append_job_log(job.id, "Reanudando desde los archivos pendientes; se conserva la selección original.")
+    return job
+
+
+def wipe_delete_job(db: Session, job: DownloadJob) -> None:
+    if not shutil.which("wipe"):
+        raise DeleteJobError("wipe no está instalado.")
+
+    try:
+        path = job_download_root(job.id, job.download_path).resolve()
+    except (OSError, ValueError) as exc:
+        raise DeleteJobError("La ruta del job no pertenece al directorio de descargas.") from exc
+
+    downloads_dir = settings.downloads_dir.resolve()
+    if path == downloads_dir or downloads_dir not in path.parents:
+        raise DeleteJobError("Ruta insegura: no pertenece al directorio de jobs.")
+    if not path.exists():
+        append_job_log(job.id, f"La carpeta del job no existe, se elimina solo el registro: {path}")
+        append_deleted_job_log(job.id, f"registro eliminado; carpeta inexistente: {path}")
+        db.delete(job)
+        db.commit()
+        return
+    if not path.is_dir():
+        raise DeleteJobError(f"La ruta del job no es una carpeta: {path}")
+
+    command = ["wipe", "-rfiq", str(path)]
+    append_job_log(job.id, f"Ejecutando: wipe -rfiq {path}")
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    output: list[str] = []
+    if process.stdout:
+        for line in process.stdout:
+            line = line.rstrip()
+            if line:
+                output.append(line)
+                append_job_log(job.id, line)
+    returncode = process.wait()
+    if returncode != 0:
+        detail = "\n".join(output[-20:]) or f"wipe falló con código {returncode}"
+        append_deleted_job_log(job.id, f"falló eliminación segura de {path}: {detail}")
+        raise DeleteJobError(detail)
+
+    append_job_log(job.id, f"Job eliminado con wipe: {path}")
+    append_deleted_job_log(job.id, f"eliminado con wipe: {path}")
+    db.delete(job)
+    db.commit()
+
+
+def wipe_delete_job_by_id(job_id: int) -> None:
+    db = SessionLocal()
+    try:
+        job = db.get(DownloadJob, job_id)
+        if not job:
+            return
+        try:
+            wipe_delete_job(db, job)
+        except DeleteJobError as exc:
+            job.error_message = f"No se eliminó el job: {exc}"
+            append_job_log(job.id, job.error_message)
+            db.commit()
+    finally:
+        db.close()
+
+
+def queue_position(job: DownloadJob) -> int | None:
+    if job.status != JobStatus.pending or not job.rq_job_id:
+        return None
+    try:
+        job_ids = get_queue().job_ids
+    except Exception:
+        return None
+    try:
+        return list(job_ids).index(job.rq_job_id) + 1
+    except ValueError:
+        return None
+
+
+def count_jobs(db: Session) -> int:
+    return db.scalar(select(func.count()).select_from(DownloadJob)) or 0
+
+
+def list_jobs(db: Session, limit: int | None = None, offset: int = 0) -> list[DownloadJob]:
+    sync_pending_jobs_with_queue(db)
+    query = select(DownloadJob).order_by(DownloadJob.created_at.desc())
+    if offset:
+        query = query.offset(offset)
+    if limit is not None:
+        query = query.limit(limit)
+    return list(db.scalars(query).all())
+
+
+def _job_filters(statuses, chat_id, q):
+    filters = []
+    if statuses:
+        filters.append(DownloadJob.status.in_(statuses))
+    if chat_id:
+        filters.append(DownloadJob.chat_id == chat_id)
+    if q:
+        like = f"%{q.strip()}%"
+        filters.append(
+            or_(
+                DownloadJob.chat_id.ilike(like),
+                DownloadJob.chat_title.ilike(like),
+                DownloadJob.hashtag.ilike(like),
+                DownloadJob.search_text.ilike(like),
+                DownloadJob.output_subfolder.ilike(like),
+            )
+        )
+    return filters
+
+
+def list_jobs_filtered(
+    db: Session,
+    statuses=None,
+    chat_id: str | None = None,
+    q: str | None = None,
+    limit: int | None = None,
+    offset: int = 0,
+) -> list[DownloadJob]:
+    sync_pending_jobs_with_queue(db)
+    query = select(DownloadJob)
+    for condition in _job_filters(statuses, chat_id, q):
+        query = query.where(condition)
+    query = query.order_by(DownloadJob.created_at.desc()).offset(offset)
+    if limit is not None:
+        query = query.limit(limit)
+    return list(db.scalars(query).all())
+
+
+def count_jobs_filtered(
+    db: Session,
+    statuses=None,
+    chat_id: str | None = None,
+    q: str | None = None,
+) -> int:
+    query = select(func.count()).select_from(DownloadJob)
+    for condition in _job_filters(statuses, chat_id, q):
+        query = query.where(condition)
+    return db.scalar(query) or 0
+
+
+def list_jobs_for_chat(db: Session, chat_id: str) -> list[DownloadJob]:
+    sync_pending_jobs_with_queue(db)
+    return list(
+        db.scalars(
+            select(DownloadJob)
+            .where(DownloadJob.chat_id == chat_id)
+            .order_by(DownloadJob.created_at.desc())
+        ).all()
+    )
+
+
+def sync_pending_jobs_with_queue(db: Session, job_id: int | None = None) -> None:
+    query = select(DownloadJob).where(
+        DownloadJob.status.in_(ACTIVE_STATUSES), DownloadJob.rq_job_id.is_not(None),
+    )
+    if job_id is not None:
+        query = query.where(DownloadJob.id == job_id)
+    pending_jobs = list(
+        db.scalars(query).all()
+    )
+    if not pending_jobs:
+        return
+    try:
+        redis = Redis.from_url(settings.redis_url, socket_connect_timeout=0.5, socket_timeout=0.5)
+        redis.ping()
+    except RedisError:
+        return
+    changed = False
+    for job in pending_jobs:
+        token = job.rq_job_id
+        error = None
+        try:
+            rq_job = Job.fetch(token, connection=redis)
+            rq_status = str(rq_job.get_status()).lower()
+        except NoSuchJobError:
+            # The SQL token is committed just before enqueue; allow that gap.
+            if job.rq_enqueued_at and (datetime.utcnow() - job.rq_enqueued_at).total_seconds() < 30:
+                continue
+            error = "Trabajo ausente de la cola. Usa Reintentar pendientes para recuperar el avance guardado."
+            rq_status = "missing"
+        except RedisError:
+            continue
+        if any(state in rq_status for state in ("failed", "stopped", "canceled")):
+            error = (rq_job.exc_info or "Worker interrumpido. Usa Reintentar pendientes.")[:4000]
+        elif "finished" in rq_status:
+            error = "Worker interrumpido. Usa Reintentar pendientes para continuar desde el avance guardado."
+        if error:
+            result = db.execute(update(DownloadJob).where(
+                DownloadJob.id == job.id, DownloadJob.rq_job_id == token,
+                DownloadJob.status.in_(ACTIVE_STATUSES),
+            ).values(stage=JobStage.failed, status=JobStatus.failed,
+                     error_message=error, finished_at=datetime.utcnow()),
+                execution_options={"synchronize_session": False})
+            changed = changed or bool(result.rowcount)
+    if changed:
+        db.commit()
+        db.expire_all()
