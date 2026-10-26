@@ -32,7 +32,11 @@ def _client() -> PyJWKClient:
         raise AuthError("auth_not_configured", "Authentik no está configurado.", 503)
     with _jwks_lock:
         if _jwks_client is None or _jwks_url != settings.authentik_jwks_url:
-            _jwks_client = PyJWKClient(settings.authentik_jwks_url, cache_keys=True)
+            _jwks_client = PyJWKClient(
+                settings.authentik_jwks_url,
+                cache_keys=True,
+                headers={"User-Agent": "TDL-Console/1.0"},
+            )
             _jwks_url = settings.authentik_jwks_url
         return _jwks_client
 

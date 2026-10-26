@@ -69,6 +69,11 @@ def jwks_server(rsa_key):
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
+            # Reproduce the reverse proxy rejecting Python's generic default User-Agent.
+            if self.headers.get("User-Agent", "").startswith("Python-urllib/"):
+                self.send_response(403)
+                self.end_headers()
+                return
             if self.path == "/jwks/":
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
