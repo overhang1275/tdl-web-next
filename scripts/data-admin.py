@@ -33,12 +33,18 @@ def require_idle(values: dict[str, str]) -> None:
             return
         if db.execute("SELECT count(*) FROM download_jobs WHERE status IN ('pending','running')").fetchone()[0]:
             raise RuntimeError("Hay jobs pendientes o activos. Deja terminar la cola antes de actualizar.")
+        columns = {row[1] for row in db.execute('PRAGMA table_info(download_jobs)')}
+        if 'deletion_requested' in columns and db.execute(
+            'SELECT count(*) FROM download_jobs WHERE deletion_requested = 1'
+        ).fetchone()[0]:
+            raise RuntimeError('Hay borrados pendientes. Deja terminar la cola antes de actualizar.')
 
 
-def backup(env_file: Path) -> Path:
+def backup(env_file: Path, destination_root: Path | None = None) -> Path:
     values = config.read_env(env_file)
     require_idle(values)
-    destination = Path(values["DATA_DIR"]) / "backups" / datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+    base = destination_root or Path(values.get('BACKUPS_DIR', str(Path(values['DATA_DIR']) / 'backups')))
+    destination = base / datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
     destination.mkdir(parents=True, mode=0o700)
     source = database_path(values)
     if source.exists():
@@ -56,12 +62,25 @@ def backup(env_file: Path) -> Path:
     return destination
 
 
+def restore_database(env_file: Path, directory: Path) -> None:
+    destination = database_path(config.read_env(env_file))
+    # All application processes must have stopped before restoring the snapshot.
+    with sqlite3.connect(str(directory / 'database.sqlite3')) as source, sqlite3.connect(str(destination)) as target:
+        source.backup(target)
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("command", choices=["check-idle", "backup"])
+    parser.add_argument("command", choices=["check-idle", "backup", "restore-database"])
     parser.add_argument("--env", type=Path, required=True)
+    parser.add_argument('--destination-root', type=Path)
+    parser.add_argument('--backup', type=Path)
     args = parser.parse_args()
     if args.command == "check-idle":
         require_idle(config.read_env(args.env))
+    elif args.command == 'backup':
+        print(backup(args.env, args.destination_root))
     else:
-        print(backup(args.env))
+        if args.backup is None:
+            parser.error('--backup is required for restore-database')
+        restore_database(args.env, args.backup)

@@ -9,80 +9,77 @@ Compose para producción**. Las pruebas completas usan un stack Docker aislado.
 
 ## Instalación nativa en LXC
 
-Debian 13 o Ubuntu 24.04, x86_64 o arm64. Ejecuta desde una copia del repositorio.
-El instalador usa binarios de Node y `tdl` con verificación SHA-256, Python en un
-venv, Redis y Nginx del sistema. No instala Docker.
+Ejecuta `install-tld.sh` como root dentro de un LXC existente con systemd, Debian 13
+(o Ubuntu 24.04/26.04), x86_64 o arm64. Usa Node y tdl oficiales con SHA-256, Python
+con venv y Next.js standalone. El maestro no crea el LXC ni configura cloudflared.
 
-El login usa un **Authentik externo**. Primero crea allí un cliente OIDC confidencial
-con PKCE, firma RS256, scopes `openid profile email offline_access tdl-groups`, y el
-grupo `tdl-admin`. El scope `tdl-groups` debe emitir `groups` con los nombres de grupos
-del usuario. Configura el callback exacto:
+Desde una copia de este repositorio:
+
+```bash
+sudo bash install-tld.sh --source-dir "$PWD"
+```
+
+El asistente permite instalar, actualizar, reparar, reconfigurar o cancelar. Enter
+acepta los valores mostrados. Por defecto usa `/opt/tld-web`, `127.0.0.1:8080`, un
+usuario de servicio `tld-web` sin login y Redis local opcional. Si eliges Redis
+externo solicita su URL sin mostrarla y no configura el servicio Redis del LXC.
+La API usa un puerto loopback separado (8000); los puertos ocupados se rechazan.
+
+El login requiere Authentik externo. El asistente solicita issuer HTTPS, client ID
+y secreto si faltan. Configura un proveedor OIDC confidencial con PKCE, firma
+RS256, scopes `openid profile email offline_access tdl-groups`, y grupo `tdl-admin`.
+El scope `tdl-groups` debe emitir `groups` con los nombres de los grupos. El callback
+es exactamente `AUTH_URL/api/auth/callback/authentik`; para el acceso local por
+defecto: `http://localhost:8080/api/auth/callback/authentik`.
+
+`PUBLIC_URL` es una referencia opcional, vacía por defecto. No modifica `AUTH_URL`.
+Para acceder por `https://tld.opencore.dpdns.org`, configura por tu cuenta el túnel
+hacia `http://127.0.0.1:8080`, establece esa URL HTTPS como `AUTH_URL` y registra
+`https://tld.opencore.dpdns.org/api/auth/callback/authentik` en Authentik.
+
+Los defaults sin secretos se guardan en `/etc/tld-web/install.conf`; el entorno
+sensible en `/etc/tld-web/tld-web.env`. Puedes preparar este último desde
+`.env.native.example` antes de ejecutar. No sobrescribas un entorno existente.
+Las instalaciones anteriores conservan su archivo en `/etc/telegram-downloader`,
+usuario, rutas y nombres de servicio; su Nginx existente se mantiene.
 
 ```text
-https://tld.opencore.dpdns.org/api/auth/callback/authentik
+/opt/tld-web/tools/                Binarios versionados
+/opt/tld-web/releases/<versión>/   Backend, venv y frontend standalone
+/opt/tld-web/current               Enlace a la versión activa
+/opt/tld-web/data/                 SQLite, sesión y archivos
+/opt/tld-web/logs/                 Logs (ruta anterior si ya existía)
+/opt/tld-web/tmp/                  Temporales
+/opt/tld-web/backups/              Respaldos de recuperación, solo root
 ```
 
-La plantilla ya usa `https://tld.opencore.dpdns.org` y el Authentik externo en
-`https://oak.opencore.dpdns.org`. Completa el client ID y el secreto del proveedor
-(y confirma el issuer exacto después de crear la aplicación OIDC):
+Código, herramientas y respaldos pertenecen a root; el servicio escribe en sus
+carpetas de datos y caché. Los servicios nuevos son `tld-web-api`, `tld-web-worker`
+y `tld-web`. Para mantenimiento:
 
 ```bash
-sudo install -d -m 750 /etc/telegram-downloader
-sudo install -m 600 .env.native.example /etc/telegram-downloader/telegram-downloader.env
-sudo nano /etc/telegram-downloader/telegram-downloader.env
-sudo bash scripts/install.sh
+sudo bash install-tld.sh --action update --source-dir "$PWD"
+sudo bash install-tld.sh --action repair
+sudo bash install-tld.sh --dry-run
+sudo journalctl -u tld-web-api -u tld-web-worker -u tld-web -f
 ```
 
-Si ya tienes una instalación, conserva su archivo de entorno y añade únicamente
-las variables de OIDC y `DOMAIN`/`AUTH_URL`. No copies la plantilla encima de una
-configuración existente. El instalador preserva las rutas y los secretos existentes;
-si falta el proveedor, termina antes de reemplazar los servicios.
+Sin `--source-dir`, `auto` busca un bundle GitHub Release para la arquitectura y,
+si no existe, construye desde Git. Puedes indicar `--ref latest`, tag o commit,
+y `--method source|release|auto`. El contrato de bundle es
+`tld-web-linux-x64.tar.gz` o `tld-web-linux-arm64.tar.gz` más `SHA256SUMS`; incluye
+backend/requirements.txt, scripts de configuración/backup y frontend standalone.
+No se omite un checksum inválido. Repositorios privados requieren credenciales de
+Git y, para consultar Releases, `GH_TOKEN` en el entorno, sin persistirlo.
 
-La plantilla nativa usa `NATIVE_INGRESS=tunnel`: Nginx escucha exclusivamente en
-`127.0.0.1:8080`, sin certificados locales ni redirección HTTP. Instala el conector
-`cloudflared` como servicio nativo en **el mismo LXC** siguiendo los comandos del
-panel Cloudflare. En la ruta publicada del túnel configura `tld.opencore.dpdns.org` y
-**Service URL `http://127.0.0.1:8080`**. `AUTH_URL` debe seguir siendo la URL pública
-`https://...`, y el callback de Authentik debe usar exactamente ese dominio.
-Referencia: [configurar el túnel](https://developers.cloudflare.com/tunnel/get-started/).
-El instalador no crea el túnel ni almacena su token.
-
-Si prefieres acceso directo, usa `NATIVE_INGRESS=direct`, dirige el dominio al LXC
-y prepara los certificados. Si faltan, se genera uno interno en
-`/etc/telegram-downloader/certs/`; confía en él en tus clientes o reemplaza
-`fullchain.pem` y `privkey.pem` por certificados de tu CA/ACME y recarga Nginx.
-
-La instalación crea:
-
-```text
-/opt/tld-web/node/                  Node binario
-/opt/tld-web/bin/tdl                tdl binario
-/opt/tld-web/releases/<versión>/    Backend, venv y frontend standalone
-/opt/tld-web/current                Enlace a la versión activa
-/opt/tld-web/data/                  Datos existentes, sin reubicación
-```
-
-Los servicios `telegram-downloader-api`, `telegram-downloader-worker` y
-`telegram-downloader-web` ejecutan API, RQ y Next.js con el usuario `telegramdl`.
-Solo Nginx publica la app; API y frontend escuchan en localhost.
-
-Para actualizar, actualiza tu copia del código y ejecuta:
-
-```bash
-git pull --ff-only
-sudo bash scripts/update.sh
-```
-
-Se construye la versión nueva antes del corte. La actualización exige una cola sin
-jobs activos o pendientes, respalda SQLite mediante su API de backup y guarda
-configuración, sesión, exports y logs en `DATA_DIR/backups/`. Conserva las descargas.
-Si falla el arranque, recupera la versión y las unidades de servicio anteriores.
-Las migraciones de SQLite son aditivas; los respaldos permiten una restauración
-manual si fuera necesario.
-
-```bash
-sudo journalctl -u telegram-downloader-api -u telegram-downloader-worker -u telegram-downloader-web -f
-```
+Se construye antes del corte. La activación exige que no haya jobs, borrados ni
+traslados pendientes, respalda SQLite, entorno, defaults, unidades, sesión,
+exports y logs, y conserva las descargas en su sitio. Un fallo recupera el enlace,
+configuración, unidades, base de datos y servicios anteriores. Los respaldos no
+incluyen los archivos descargados; mantén también tu respaldo externo de datos.
+`repair` y `configure` reutilizan la versión instalada sin descargar ni compilar.
+Con entrada no interactiva, una instalación existente cancela si no se indica
+`--action`. `--yes` acepta defaults; requiere las credenciales OIDC ya configuradas.
 
 ## Producción con Docker Compose
 

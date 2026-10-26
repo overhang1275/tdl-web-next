@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
-import os
 import sqlite3
-import subprocess
 from pathlib import Path
 
 import pytest
@@ -32,6 +30,17 @@ def test_env_keeps_existing_paths_and_secrets(tmp_path, monkeypatch):
     assert first['DOWNLOADS_DIR'] == '/mnt/telegram'
     assert first['AUTHENTIK_ISSUER'].endswith('/tdl-console/')
     assert len(first['AUTH_SECRET']) == 64
+
+
+def test_env_round_trip_preserves_quoted_secret(tmp_path):
+    config = load('configure-env')
+    output = tmp_path / '.env'
+    config.configure(output, 'example.test', tmp_path / 'missing', tmp_path)
+    with output.open('a') as stream:
+        stream.write('CUSTOM_SECRET="literal \\"quote\\" and \\\\ slash $value"\n')
+    expected = 'literal "quote" and \\ slash $value'
+    config.configure(output, 'example.test', output, tmp_path)
+    assert config.read_env(output)['CUSTOM_SECRET'] == expected
 
 
 def test_backup_refuses_active_jobs_and_preserves_database(tmp_path):
@@ -86,19 +95,30 @@ def test_native_configuration_uses_external_oidc_and_no_container_defaults(tmp_p
     assert 'AUTHENTIK_BOOTSTRAP_PASSWORD' not in values
 
 
-@pytest.mark.skipif(os.name == 'nt', reason='Bash activation recovery runs on Linux')
-def test_failed_backup_restarts_previously_running_services(tmp_path):
-    log = tmp_path / 'commands'
-    script = '''
-id() { echo 0; }
-systemctl() { printf '%s\\n' "$*" >> "$COMMAND_LOG"; return 0; }
-python3() { [[ "${2:-}" != backup ]]; }
-source "$HELPER"
-activate_release
-'''
-    result = subprocess.run(['bash', '-c', script], env={**os.environ, 'APP_ROOT': str(tmp_path),
-        'ENV_FILE': str(tmp_path / '.env'), 'COMMAND_LOG': str(log),
-        'HELPER': str(SCRIPTS / 'native-common.sh')}, capture_output=True, text=True)
-    assert result.returncode != 0
-    commands = log.read_text()
-    assert 'start telegram-downloader-api telegram-downloader-worker telegram-downloader-web' in commands
+def test_native_backup_uses_protected_destination_and_can_restore_database(tmp_path):
+    config = load('configure-env')
+    admin = load('data-admin')
+    env = tmp_path / 'app.env'
+    config.configure(env, 'example.test', tmp_path / 'missing', tmp_path)
+    db_path = admin.database_path(config.read_env(env))
+    db_path.parent.mkdir()
+    with sqlite3.connect(db_path) as db:
+        db.execute('CREATE TABLE marker (value TEXT)')
+        db.execute("INSERT INTO marker VALUES ('before')")
+    snapshot = admin.backup(env, tmp_path / 'protected-backups')
+    assert snapshot.parent == tmp_path / 'protected-backups'
+    with sqlite3.connect(db_path) as db:
+        db.execute("UPDATE marker SET value='after'")
+    admin.restore_database(env, snapshot)
+    with sqlite3.connect(db_path) as db:
+        assert db.execute('SELECT value FROM marker').fetchone()[0] == 'before'
+
+
+def test_native_backup_rejects_pending_deletion(tmp_path):
+    admin = load('data-admin')
+    path = tmp_path / 'state.sqlite3'
+    with sqlite3.connect(path) as db:
+        db.execute('CREATE TABLE download_jobs (status TEXT, deletion_requested INTEGER)')
+        db.execute("INSERT INTO download_jobs VALUES ('completed', 1)")
+    with pytest.raises(RuntimeError, match='borrados'):
+        admin.require_idle({'DATABASE_URL': f'sqlite:///{path}'})

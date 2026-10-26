@@ -23,6 +23,7 @@ COPY --chown=app backend/app ./app
 COPY --chown=app backend/tests ./tests
 COPY --chown=app backend/pyproject.toml .
 COPY --chown=app scripts /app/scripts
+COPY --chown=app install-tld.sh /app/install-tld.sh
 RUN chmod +x /app/scripts/fake-tdl.sh
 USER app
 HEALTHCHECK NONE
