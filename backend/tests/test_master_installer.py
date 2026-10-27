@@ -238,3 +238,83 @@ def test_master_refuses_overlapping_data_and_code(tmp_path):
     result = shell('collect_options\nvalidate_data_paths', tmp_path)
     assert result.returncode != 0
     assert 'datos' in result.stderr.lower()
+
+
+def test_existing_account_uses_its_primary_group_for_units(tmp_path):
+    result = shell('''
+collect_options
+NODE_BINARY=/usr/bin/node
+APP_GROUP=shared-services
+render_units "$SYSTEMD_DIR"
+''', tmp_path, APP_USER='operator')
+    assert result.returncode == 0, result.stderr
+    assert 'Group=shared-services' in (tmp_path / 'units' / 'tld-web.service').read_text()
+
+
+def test_private_release_uses_authenticated_asset_api(tmp_path):
+    root = tmp_path / 'app-root'
+    root.mkdir()
+    result = shell('''
+collect_options
+WORK="$APP_ROOT/work"; mkdir "$WORK"
+NODE_ARCH=x64
+INSTALL_METHOD=release
+curl() {
+    local out='' previous='' value
+    for value in "$@"; do
+        [[ "$previous" != -o ]] || out="$value"
+        previous="$value"
+    done
+    if [[ "$*" == *'/releases/tags/v1'* ]]; then
+        cat > "$out" <<'JSON'
+{"tag_name":"v1","assets":[{"name":"tld-web-linux-x64.tar.gz","url":"https://api.github.com/repos/owner/repo/releases/assets/1","browser_download_url":"https://github.com/private/asset"},{"name":"SHA256SUMS","url":"https://api.github.com/repos/owner/repo/releases/assets/2","browser_download_url":"https://github.com/private/checksum"}]}
+JSON
+        printf 200
+    else
+        [[ "$*" == *'Authorization: Bearer test-token'* && "$*" == *'Accept: application/octet-stream'* && "$*" == *'api.github.com'* ]] || return 23
+        touch "$out"
+    fi
+}
+verify_checksum() { :; }
+extract_release() {
+    mkdir -p "$2/backend" "$2/scripts"
+    touch "$2/backend/requirements.txt" "$2/scripts/configure-env.py" "$2/scripts/data-admin.py"
+}
+resolve_source
+echo "$RESOLVED_METHOD"
+''', tmp_path, APP_REF='v1', GH_TOKEN='test-token')
+    assert result.returncode == 0, result.stderr
+    assert 'release' in result.stdout
+
+
+def test_database_parent_cannot_be_system_configuration(tmp_path):
+    config = tmp_path / 'etc'
+    config.mkdir()
+    (config / 'tld-web.env').write_text('DATABASE_URL=sqlite:////etc/database.sqlite3\n')
+    result = shell('collect_options\nvalidate_data_paths', tmp_path)
+    assert result.returncode != 0
+    assert 'datos' in result.stderr.lower()
+
+
+def test_oidc_discovery_must_match_exact_issuer(tmp_path):
+    result = shell('''
+collect_options
+WORK="$APP_ROOT/work"; mkdir -p "$WORK"
+fetch() { echo '{"issuer":"https://other.test/"}' > "$2"; }
+ensure_oidc
+''', tmp_path, AUTHENTIK_ISSUER='https://identity.test/application/o/tdl/',
+        AUTHENTIK_CLIENT_ID='client', AUTHENTIK_CLIENT_SECRET='secret')
+    assert result.returncode != 0
+    assert 'issuer' in result.stderr.lower()
+
+
+def test_layout_aliases_preserve_existing_app_directory(tmp_path):
+    root = tmp_path / 'app-root'
+    (root / 'app').mkdir(parents=True)
+    marker = root / 'app' / 'keep'
+    marker.write_text('existing')
+    result = shell('collect_options\nlink_layout_aliases', tmp_path)
+    assert result.returncode == 0, result.stderr
+    assert marker.read_text() == 'existing'
+    assert (root / 'config').is_symlink()
+    assert os.readlink(root / 'config') == str(tmp_path / 'etc')

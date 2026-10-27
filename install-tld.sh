@@ -196,7 +196,7 @@ After=network-online.target $SERVICE_API.service
 Wants=network-online.target $SERVICE_API.service
 [Service]
 User=$APP_USER
-Group=$APP_USER
+Group=${APP_GROUP:-$APP_USER}
 WorkingDirectory=$APP_ROOT/current/frontend/.next/standalone
 EnvironmentFile=$ENV_FILE
 Environment=NODE_ENV=production HOSTNAME=127.0.0.1 PORT=$APP_PORT
@@ -219,7 +219,7 @@ After=network-online.target
 Wants=network-online.target
 [Service]
 User=$APP_USER
-Group=$APP_USER
+Group=${APP_GROUP:-$APP_USER}
 WorkingDirectory=$APP_ROOT/current/backend
 EnvironmentFile=$ENV_FILE
 ExecStart=$APP_ROOT/current/venv/bin/uvicorn app.main:app --host 127.0.0.1 --port $API_PORT --workers 1
@@ -319,6 +319,14 @@ check_service_ports() {
 
 fetch() { curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 "$1" -o "$2"; }
 
+fetch_asset() {
+    [[ "$1" =~ ^https://api\.github\.com/repos/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/releases/assets/[0-9]+$ ]] || die 'URL de asset GitHub inválida.'
+    local -a auth=()
+    [[ -z "${GH_TOKEN:-}" ]] || auth=(-H "Authorization: Bearer $GH_TOKEN")
+    curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+        "${auth[@]}" -H 'Accept: application/octet-stream' "$1" -o "$2"
+}
+
 verify_checksum() {
     python3 - "$1" "$2" <<'PY'
 import hashlib, sys
@@ -380,7 +388,7 @@ resolve_source() {
             if [[ "$status" == 200 ]]; then
                 python3 - "$metadata" "$NODE_ARCH" > "$WORK/assets" <<'PY'
 import json, sys
-release=json.load(open(sys.argv[1])); assets={a['name']:a['browser_download_url'] for a in release.get('assets',[])}
+release=json.load(open(sys.argv[1])); assets={a['name']:a['url'] for a in release.get('assets',[])}
 name=f'tld-web-linux-{sys.argv[2]}.tar.gz'
 if name in assets and 'SHA256SUMS' in assets:
     print(release['tag_name']); print(assets[name]); print(assets['SHA256SUMS'])
@@ -390,7 +398,7 @@ PY
                     mapfile -t assets < "$WORK/assets"
                     RESOLVED_VERSION=${assets[0]}; RESOLVED_METHOD=release
                     local archive="tld-web-linux-$NODE_ARCH.tar.gz"
-                    fetch "${assets[1]}" "$WORK/$archive"; fetch "${assets[2]}" "$WORK/SHA256SUMS"
+                    fetch_asset "${assets[1]}" "$WORK/$archive"; fetch_asset "${assets[2]}" "$WORK/SHA256SUMS"
                     verify_checksum "$WORK/$archive" "$WORK/SHA256SUMS"
                     mkdir "$WORK/source"; extract_release "$WORK/$archive" "$WORK/source"
                     SOURCE_DIR="$WORK/source"
@@ -476,6 +484,12 @@ PY
         printf -v "$name" '%s' "$value"; export "${name?}"
     done
     [[ "$AUTHENTIK_ISSUER" == https://* ]] || die 'El issuer de Authentik debe usar HTTPS.'
+    fetch "${AUTHENTIK_ISSUER%/}/.well-known/openid-configuration" "$WORK/discovery.json"
+    python3 - "$WORK/discovery.json" "$AUTHENTIK_ISSUER" <<'PY'
+import json,sys
+if json.load(open(sys.argv[1])).get('issuer') != sys.argv[2]:
+    raise SystemExit('AUTHENTIK_ISSUER debe coincidir exactamente con el issuer de discovery.')
+PY
 }
 
 prepare_candidate() {
@@ -507,7 +521,13 @@ from pathlib import Path
 spec=importlib.util.spec_from_file_location('config',Path(sys.argv[1])/'configure-env.py')
 config=importlib.util.module_from_spec(spec);spec.loader.exec_module(config)
 values=config.read_env(Path(sys.argv[2])); root=Path(sys.argv[3]).resolve(); configdir=Path(sys.argv[4]).resolve()
-for key in ('DATA_DIR','TDL_SESSIONS_DIR','EXPORTS_DIR','DOWNLOADS_DIR','LOGS_DIR','TMP_DIR'):
+keys=['DATA_DIR','TDL_SESSIONS_DIR','EXPORTS_DIR','DOWNLOADS_DIR','LOGS_DIR','TMP_DIR']
+if values.get('DATABASE_URL'):
+    if not values['DATABASE_URL'].startswith('sqlite:///'):
+        raise SystemExit('Ruta de datos DATABASE_URL debe usar SQLite.')
+    values['DATABASE_PARENT']=str(Path(values['DATABASE_URL'].removeprefix('sqlite:///')).parent)
+    keys.append('DATABASE_PARENT')
+for key in keys:
     if not values.get(key):
         continue
     raw=Path(values[key]); path=raw.resolve()
@@ -524,6 +544,14 @@ data_admin() { python3 "$SOURCE_DIR/scripts/data-admin.py" "$1" --env "$ENV_FILE
 health_check() {
     curl --fail --silent --retry 15 --retry-delay 2 --retry-connrefused "http://127.0.0.1:$API_PORT/health" >/dev/null
     curl --fail --silent --retry 15 --retry-delay 2 --retry-connrefused "http://127.0.0.1:$APP_PORT/login" >/dev/null
+}
+
+link_layout_aliases() {
+    local name target
+    for name in app config; do
+        target="$APP_ROOT/current"; [[ "$name" != config ]] || target="$(dirname "$ENV_FILE")"
+        if [[ ! -e "$APP_ROOT/$name" && ! -L "$APP_ROOT/$name" ]]; then ln -s "$target" "$APP_ROOT/$name"; fi
+    done
 }
 
 activate_release() (
@@ -596,8 +624,10 @@ activate_release() (
     systemctl enable "${SERVICES[@]}"
     systemctl restart "${SERVICES[@]}"
     health_check
+    link_layout_aliases
     trap - EXIT
     printf 'Versión activa: %s\nRespaldo: %s\nAcceso local: http://localhost:%s\n' "$RELEASE" "$backup" "$APP_PORT"
+    printf 'Servicios: systemctl status %s %s %s\n' "$SERVICE_API" "$SERVICE_WORKER" "$SERVICE_WEB"
 )
 
 run_installation() {
@@ -642,6 +672,7 @@ main() {
     collect_options
     validate_options
     if [[ "$dry_run" == 1 ]]; then print_summary; return; fi
+    print_summary
     [[ $(id -u) == 0 ]] || die 'Ejecuta el maestro como root dentro del LXC.'
     run_installation
 }
