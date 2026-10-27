@@ -65,6 +65,12 @@ flowchart LR
 
 ## Seguridad
 
+Sin sesión, `/` y `/login` inician OIDC automáticamente en Authentik. `AUTH_URL`
+debe ser el origen de TDL; `AUTHENTIK_ISSUER` identifica al proveedor. Los destinos
+de retorno se limitan al origen de TDL. Cerrar sesión borra la sesión local y muestra
+una confirmación sin reentrada automática; la sesión del proveedor es independiente.
+`/health` comprueba la web sin iniciar autenticaciones.
+
 - **Identidad:** Authentik emite JWT RS256 con PKCE. FastAPI valida firma, issuer, audiencia,
   expiración y, si está configurado, el grupo `tdl-admin`.
 - **Sesión web:** Auth.js guarda la sesión en una cookie HttpOnly cifrada. Los tokens de

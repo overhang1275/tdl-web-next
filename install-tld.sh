@@ -114,7 +114,7 @@ collect_options() {
     APP_USER="$(prompt_default 'Usuario del servicio' "$(pick_value APP_USER "$default_user")")"
     PUBLIC_URL="$(prompt_default 'URL del túnel (solo referencia; vacío para desactivar)' "$(pick_value PUBLIC_URL '')")"
     PUBLIC_URL="${PUBLIC_URL%/}"
-    AUTH_URL="$(prompt_default 'URL canónica de acceso OIDC' "$(pick_value AUTH_URL "http://localhost:$APP_PORT")")"
+    AUTH_URL="$(prompt_default 'URL de ESTA consola TDL (no el dominio de Authentik)' "$(pick_value AUTH_URL "http://localhost:$APP_PORT")")"
     AUTH_URL="${AUTH_URL%/}"
     SAVE_DEFAULTS="$(yes_no "$(prompt_default '¿Guardar estas opciones como defaults? S/n' "$(pick_value SAVE_DEFAULTS S)")")"
     local web=tld-web api=tld-web-api worker=tld-web-worker
@@ -629,8 +629,10 @@ PY
 
 data_admin() { python3 "$SOURCE_DIR/scripts/data-admin.py" "$1" --env "$ENV_FILE" "${@:2}"; }
 health_check() {
+    local web_health=login
+    [[ ! -f "${SOURCE_DIR:-}/frontend/app/health/route.ts" ]] || web_health=health
     curl --fail --silent --retry 15 --retry-delay 2 --retry-connrefused "http://127.0.0.1:$API_PORT/health" >/dev/null
-    curl --fail --silent --retry 15 --retry-delay 2 --retry-connrefused "http://127.0.0.1:$APP_PORT/login" >/dev/null
+    curl --fail --silent --retry 15 --retry-delay 2 --retry-connrefused "http://127.0.0.1:$APP_PORT/$web_health" >/dev/null
 }
 
 link_layout_aliases() {

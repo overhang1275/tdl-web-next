@@ -119,7 +119,7 @@ function UserMenu({ user }: { user: { name?: string | null; email?: string | nul
         </p>
         <button
           type="button"
-          onClick={() => signOut({ callbackUrl: "/login" })}
+          onClick={() => signOut({ callbackUrl: "/signed-out" })}
           className="mt-3 flex w-full items-center gap-2 rounded-lg px-2 py-2 text-sm text-destructive hover:bg-destructive/10"
         >
           <LogOut className="h-4 w-4" />

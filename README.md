@@ -63,6 +63,12 @@ flowchart LR
 
 ## Security
 
+Without a session, `/` and `/login` start OIDC automatically. `AUTH_URL` is the TDL
+origin; `AUTHENTIK_ISSUER` identifies the provider. Return URLs are restricted to
+the TDL origin. Signing out clears the local session and shows a signed-out page
+without automatic re-entry; the provider session is separate. `/health` checks the
+web server without starting authentication.
+
 - **Identity:** Authentik issues RS256 JWTs with PKCE. FastAPI validates signature, issuer,
   audience, expiry and, when configured, the `tdl-admin` group.
 - **Web session:** Auth.js stores the session in an encrypted HttpOnly cookie. Access and
