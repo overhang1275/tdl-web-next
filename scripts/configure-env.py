@@ -77,9 +77,9 @@ def configure(output: Path, domain: str, legacy: Path, root: Path, deployment: s
         values[name] = os.getenv(name, "10001")
     values = {**values, **(old if deployment == "native" else {}), **existing}
     if deployment == "native" and native_options:
-        allowed = {"APP_ROOT", "APP_HOST", "APP_PORT", "API_PORT", "APP_USER", "INSTALL_REDIS",
+        allowed = {"APP_ROOT", "APP_HOST", "APP_ALLOWED_SUBNET", "APP_PORT", "API_PORT", "APP_USER", "INSTALL_REDIS",
                    "PUBLIC_URL", "AUTH_URL", "REDIS_URL", "CONFIG_DIR", "BACKUPS_DIR", "LOGS_DIR",
-                   "SERVICE_WEB", "SERVICE_API", "SERVICE_WORKER", "NODE_BINARY", "TDL_BINARY", "RESOLVED_METHOD"}
+                   "SERVICE_WEB", "SERVICE_API", "SERVICE_WORKER", "SERVICE_NETWORK", "NODE_BINARY", "TDL_BINARY", "RESOLVED_METHOD"}
         for name, value in native_options.items():
             if name in allowed:
                 value = str(value)

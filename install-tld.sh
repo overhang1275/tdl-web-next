@@ -7,9 +7,9 @@ if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
     SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 fi
 WORK=''
-DEFAULT_KEYS=(APP_ROOT APP_PORT API_PORT APP_USER CREATE_USER INSTALL_REDIS APP_REF
+DEFAULT_KEYS=(APP_ROOT APP_HOST APP_ALLOWED_SUBNET APP_PORT API_PORT APP_USER CREATE_USER INSTALL_REDIS APP_REF
               INSTALL_METHOD SOURCE_REPO PUBLIC_URL AUTH_URL SAVE_DEFAULTS SERVICE_WEB
-              SERVICE_API SERVICE_WORKER)
+              SERVICE_API SERVICE_WORKER SERVICE_NETWORK)
 
 die() { printf 'Error: %s\n' "$*" >&2; exit 1; }
 
@@ -87,6 +87,13 @@ collect_options() {
     SOURCE_REPO="$(pick_value SOURCE_REPO https://github.com/overhang1275/tdl-web-next.git)"
     SOURCE_DIR="${SOURCE_DIR:-}"
     APP_HOST="$(pick_value APP_HOST 127.0.0.1)"
+    local lan_default=n
+    [[ "$APP_HOST" == 127.0.0.1 || "$APP_HOST" == 0.0.0.0 ]] || die 'Interfaz web inválida.'
+    [[ "$APP_HOST" != 0.0.0.0 ]] || lan_default=S
+    if [[ "$(yes_no "$(prompt_default '¿El túnel está en otra máquina de 192.168.100.0/24? S/n' "$lan_default")")" == 1 ]]; then
+        APP_HOST=0.0.0.0
+    else APP_HOST=127.0.0.1; fi
+    APP_ALLOWED_SUBNET="$(pick_value APP_ALLOWED_SUBNET 192.168.100.0/24)"
     APP_PORT="$(prompt_default 'Puerto web local' "$(pick_value APP_PORT "$old_port")")"
     local api_default
     api_default="$(env_read "$ENV_FILE" API_INTERNAL_URL)"
@@ -115,10 +122,13 @@ collect_options() {
     SERVICE_WEB="$(pick_value SERVICE_WEB "$web")"
     SERVICE_API="$(pick_value SERVICE_API "$api")"
     SERVICE_WORKER="$(pick_value SERVICE_WORKER "$worker")"
+    SERVICE_NETWORK="$(pick_value SERVICE_NETWORK "$web-network")"
     SERVICES=("$SERVICE_API" "$SERVICE_WORKER" "$SERVICE_WEB")
+    if [[ "$APP_HOST" == 0.0.0.0 ]]; then SERVICES=("$SERVICE_NETWORK" "${SERVICES[@]}"); fi
     BACKUPS_DIR="$APP_ROOT/backups"
     export APP_ROOT APP_HOST APP_PORT API_PORT APP_USER INSTALL_REDIS CREATE_USER PUBLIC_URL
     export AUTH_URL APP_REF INSTALL_METHOD SOURCE_REPO SERVICE_WEB SERVICE_API SERVICE_WORKER BACKUPS_DIR REDIS_URL
+    export APP_ALLOWED_SUBNET SERVICE_NETWORK
 }
 
 valid_path() { [[ "$1" =~ ^/[A-Za-z0-9_./-]+$ && "$1" != / && "$1" != *'/../'* && "$1" != */.. && "$1" != *'/./'* ]]; }
@@ -126,7 +136,8 @@ valid_path() { [[ "$1" =~ ^/[A-Za-z0-9_./-]+$ && "$1" != / && "$1" != *'/../'* &
 validate_options() {
     valid_path "$APP_ROOT" && valid_path "$CONFIG_DIR" && valid_path "$ENV_FILE" && valid_path "$SYSTEMD_DIR" || die 'Usa rutas absolutas sin espacios ni segmentos . o ...'
     [[ "$APP_ROOT" != /etc && "$APP_ROOT" != /usr && "$APP_ROOT" != /var && "$APP_ROOT" != /home && "$APP_ROOT" != /opt ]] || die 'Elige una carpeta exclusiva para la aplicación.'
-    [[ "$APP_HOST" == 127.0.0.1 ]] || die 'APP_HOST debe ser 127.0.0.1.'
+    [[ "$APP_HOST" == 127.0.0.1 || "$APP_HOST" == 0.0.0.0 ]] || die 'APP_HOST debe ser 127.0.0.1 o 0.0.0.0 con firewall.'
+    [[ "$APP_ALLOWED_SUBNET" == 192.168.100.0/24 ]] || die 'La subred autorizada debe ser 192.168.100.0/24.'
     local port service
     for port in "$APP_PORT" "$API_PORT"; do
         [[ "$port" =~ ^[0-9]{1,5}$ ]] && ((10#$port > 0 && 10#$port <= 65535)) || die 'Puerto inválido (1–65535).'
@@ -153,12 +164,12 @@ validate_options() {
 print_summary() {
     printf '%s\n' "APP_ROOT=$APP_ROOT" "APP_HOST=$APP_HOST" "APP_PORT=$APP_PORT" "API_PORT=$API_PORT" \
         "APP_USER=$APP_USER" "APP_REF=$APP_REF" "INSTALL_METHOD=$INSTALL_METHOD" \
-        "INSTALL_REDIS=$INSTALL_REDIS" "PUBLIC_URL=$PUBLIC_URL" "AUTH_URL=$AUTH_URL" "ENV_FILE=$ENV_FILE"
+        "INSTALL_REDIS=$INSTALL_REDIS" "PUBLIC_URL=$PUBLIC_URL" "AUTH_URL=$AUTH_URL" "ENV_FILE=$ENV_FILE" "APP_ALLOWED_SUBNET=$APP_ALLOWED_SUBNET"
 }
 
 options_json() {
     export CONFIG_DIR NODE_BINARY="${NODE_BINARY:-}" RESOLVED_VERSION="${RESOLVED_VERSION:-local}" RESOLVED_METHOD="${RESOLVED_METHOD:-source}"
-    python3 -c 'import json,os; names="APP_ROOT APP_HOST APP_PORT API_PORT APP_USER INSTALL_REDIS PUBLIC_URL AUTH_URL REDIS_URL CONFIG_DIR BACKUPS_DIR SERVICE_WEB SERVICE_API SERVICE_WORKER NODE_BINARY RESOLVED_VERSION RESOLVED_METHOD".split(); result={k:os.environ.get(k, "") for k in names}; result.update({"TDL_BINARY":os.environ["TDL_BINARY"]} if os.environ.get("TDL_BINARY") else {}); print(json.dumps(result))'
+    python3 -c 'import json,os; names="APP_ROOT APP_HOST APP_ALLOWED_SUBNET APP_PORT API_PORT APP_USER INSTALL_REDIS PUBLIC_URL AUTH_URL REDIS_URL CONFIG_DIR BACKUPS_DIR SERVICE_WEB SERVICE_API SERVICE_WORKER SERVICE_NETWORK NODE_BINARY RESOLVED_VERSION RESOLVED_METHOD".split(); result={k:os.environ.get(k, "") for k in names}; result.update({"TDL_BINARY":os.environ["TDL_BINARY"]} if os.environ.get("TDL_BINARY") else {}); print(json.dumps(result))'
 }
 
 write_defaults() {
@@ -225,7 +236,7 @@ User=$APP_USER
 Group=${APP_GROUP:-$APP_USER}
 WorkingDirectory=$APP_ROOT/current/frontend/.next/standalone
 EnvironmentFile=$ENV_FILE
-Environment=NODE_ENV=production HOSTNAME=127.0.0.1 PORT=$APP_PORT
+Environment=NODE_ENV=production HOSTNAME=$APP_HOST PORT=$APP_PORT
 ExecStart=$NODE_BINARY $APP_ROOT/current/frontend/.next/standalone/server.js
 Restart=on-failure
 RestartSec=5
@@ -237,6 +248,24 @@ UMask=0077
 [Install]
 WantedBy=multi-user.target
 EOF
+    if [[ "$APP_HOST" == 0.0.0.0 ]]; then
+        sed -i "/^After=/s/$/ $SERVICE_NETWORK.service/;/^Wants=/a Requires=$SERVICE_NETWORK.service" "$directory/$SERVICE_WEB.service"
+        cat > "$directory/$SERVICE_NETWORK.service" <<EOF
+# Managed by install-tld.sh: $APP_ROOT
+[Unit]
+Description=TLD Web restricted LAN access
+After=network-online.target nftables.service
+Wants=network-online.target
+Before=$SERVICE_WEB.service
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nft --file $CONFIG_DIR/network.nft
+ExecStop=-/usr/sbin/nft delete table inet ${SERVICE_WEB//[^a-zA-Z0-9_]/_}_access
+[Install]
+WantedBy=multi-user.target
+EOF
+    fi
     cat > "$directory/$SERVICE_API.service" <<EOF
 # Managed by install-tld.sh: $APP_ROOT
 [Unit]
@@ -262,6 +291,33 @@ WantedBy=multi-user.target
 EOF
     sed "s/Description=TLD Web API/Description=TLD Web worker/;s|^ExecStart=.*|ExecStart=$APP_ROOT/current/venv/bin/python -m app.rq_worker|;/^ExecStartPost=/d;s/^After=network-online.target$/After=network-online.target $SERVICE_API.service/" \
         "$directory/$SERVICE_API.service" > "$directory/$SERVICE_WORKER.service"
+}
+
+render_firewall() {
+    local destination=$1 table="${SERVICE_WEB//[^a-zA-Z0-9_]/_}_access"
+    mkdir -p -- "$(dirname "$destination")"
+    cat > "$destination" <<EOF
+add table inet $table
+flush table inet $table
+table inet $table {
+    chain frontend {
+        type filter hook input priority -10; policy accept;
+        iifname "lo" tcp dport $APP_PORT accept
+        ip saddr $APP_ALLOWED_SUBNET tcp dport $APP_PORT accept
+        tcp dport $APP_PORT drop
+    }
+}
+EOF
+}
+
+check_network_access() {
+    [[ "$APP_HOST" == 0.0.0.0 ]] || return 0
+    [[ ! -f "$SYSTEMD_DIR/$SERVICE_NETWORK.service" ]] || owned_service "$SERVICE_NETWORK" || die 'La unidad de firewall pertenece a otra instalación.'
+    if nft list table inet "${SERVICE_WEB//[^a-zA-Z0-9_]/_}_access" >/dev/null 2>&1 && ! owned_service "$SERVICE_NETWORK"; then
+        die 'La tabla de firewall ya existe sin una unidad administrada de esta instalación; no se modificará.'
+    fi
+    render_firewall "$WORK/network.nft"
+    nft --check --file "$WORK/network.nft" || die 'No se puede aplicar el firewall dentro del LXC. No se expondrá el frontend; revisa CAP_NET_ADMIN en Proxmox.'
 }
 
 configure_redis() {
@@ -604,6 +660,10 @@ activate_release() (
                 local destination="$ENV_FILE"; [[ "$file" != defaults ]] || destination="$INSTALL_CONF"
                 if [[ -f "$backup/$file" ]]; then cp -p -- "$backup/$file" "$destination"; else rm -f -- "$destination"; fi
             done
+            if [[ "$APP_HOST" == 0.0.0.0 ]]; then
+                if [[ -f "$backup/network.nft" ]]; then cp -p "$backup/network.nft" "$CONFIG_DIR/network.nft"
+                else rm -f -- "$CONFIG_DIR/network.nft"; fi
+            fi
             if [[ -f "$backup/database.sqlite3" ]]; then
                 python3 "$SOURCE_DIR/scripts/data-admin.py" restore-database --env "$ENV_FILE" --backup "$backup" || true
             fi
@@ -639,6 +699,7 @@ activate_release() (
     chmod 700 "$backup"
     [[ ! -f "$ENV_FILE" ]] || cp -p -- "$ENV_FILE" "$backup/env"
     [[ ! -f "$INSTALL_CONF" ]] || cp -p -- "$INSTALL_CONF" "$backup/defaults"
+    if [[ "$APP_HOST" == 0.0.0.0 && -f "$CONFIG_DIR/network.nft" ]]; then cp -p "$CONFIG_DIR/network.nft" "$backup/network.nft"; fi
     for unit in "${SERVICES[@]}"; do [[ ! -f "$SYSTEMD_DIR/$unit.service" ]] || cp -p -- "$SYSTEMD_DIR/$unit.service" "$backup/"; done
     if [[ "$INSTALL_REDIS" == 1 ]]; then
         cp -p -- "${REDIS_CONFIG:-/etc/redis/redis.conf}" "$backup/redis.conf"
@@ -648,6 +709,7 @@ activate_release() (
     render_units "$WORK/units"
     replaced=1
     install -m 640 -g "$APP_GROUP" "$CANDIDATE" "$ENV_FILE"
+    if [[ "$APP_HOST" == 0.0.0.0 ]]; then install -m 600 "$WORK/network.nft" "$CONFIG_DIR/network.nft"; fi
     if [[ "$SAVE_DEFAULTS" == 1 ]]; then write_defaults "$INSTALL_CONF"; fi
     for unit in "${SERVICES[@]}"; do install -m 644 "$WORK/units/$unit.service" "$SYSTEMD_DIR/"; done
     ln -sfn "$RELEASE" "$APP_ROOT/current"
@@ -670,8 +732,13 @@ run_installation() {
         [[ "$INSTALL_REDIS" != 1 ]] || packages+=(redis-server)
         DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends --no-upgrade "${packages[@]}"
     fi
+    if [[ "$APP_HOST" == 0.0.0.0 ]] && ! command -v nft >/dev/null; then
+        apt-get update
+        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends nftables
+    fi
     prepare_layout
     check_service_ports
+    check_network_access
     if [[ "$ACTION" == repair || "$ACTION" == configure ]]; then prepare_repair
     else resolve_source; fi
     prepare_environment
@@ -688,13 +755,14 @@ main() {
         case "$1" in
             --dry-run) dry_run=1; shift ;;
             --yes) ASSUME_YES=1; shift ;;
+            --lan) APP_HOST=0.0.0.0; APP_ALLOWED_SUBNET=192.168.100.0/24; shift ;;
             --action) ACTION="${2:?Falta acción}"; shift 2 ;;
             --source-dir) SOURCE_DIR="${2:?Falta ruta}"; shift 2 ;;
             --root) APP_ROOT="${2:?Falta ruta}"; shift 2 ;;
             --port) APP_PORT="${2:?Falta puerto}"; shift 2 ;;
             --ref) APP_REF="${2:?Falta ref}"; shift 2 ;;
             --method) INSTALL_METHOD="${2:?Falta método}"; shift 2 ;;
-            --help|-h) printf '%s\n' 'Uso: bash install-tld.sh [--action install|update|repair|configure|cancel] [--dry-run] [--yes] [--source-dir RUTA] [--root RUTA] [--port PUERTO] [--ref latest|TAG|COMMIT] [--method auto|source|release]'; return ;;
+            --help|-h) printf '%s\n' 'Uso: bash install-tld.sh [--action install|update|repair|configure|cancel] [--lan: solo 192.168.100.0/24] [--dry-run] [--yes] [--source-dir RUTA] [--root RUTA] [--port PUERTO] [--ref latest|TAG|COMMIT] [--method auto|source|release]'; return ;;
             *) die "Opción desconocida: $1" ;;
         esac
     done

@@ -48,7 +48,7 @@ def test_saved_defaults_are_read_as_data_not_shell(tmp_path):
 
 @pytest.mark.parametrize('assignment', ['APP_ROOT=/', 'APP_PORT=70000',
     'PUBLIC_URL=http://example.test', 'APP_USER=root', 'APP_REF=--upload-pack=bad',
-    'APP_ROOT=/opt/../etc', 'INSTALL_METHOD=unknown'])
+    'APP_ROOT=/opt/../etc', 'INSTALL_METHOD=unknown', 'APP_ALLOWED_SUBNET=0.0.0.0/0'])
 def test_invalid_options_are_rejected(tmp_path, assignment):
     result = shell(f'collect_options\n{assignment}\nvalidate_options', tmp_path)
     assert result.returncode != 0
@@ -146,7 +146,8 @@ def test_candidate_native_values_are_explicit(tmp_path):
 
 
 @pytest.mark.parametrize('failure', ['backup', 'health'])
-def test_activation_failure_recovers_environment_units_and_services(tmp_path, failure):
+@pytest.mark.parametrize('lan', [False, True])
+def test_activation_failure_recovers_environment_units_and_services(tmp_path, failure, lan):
     root = tmp_path / 'app-root'
     (root / 'old').mkdir(parents=True)
     (root / 'new').mkdir()
@@ -157,6 +158,9 @@ def test_activation_failure_recovers_environment_units_and_services(tmp_path, fa
     units = tmp_path / 'units'
     units.mkdir()
     (units / 'tld-web.service').write_text('old web unit')
+    if lan:
+        (units / 'tld-web-network.service').write_text('old firewall unit')
+        (config / 'network.nft').write_text('old firewall configuration')
     candidate = tmp_path / 'candidate'
     candidate.write_text('AUTH_SECRET=new\n')
     log = tmp_path / 'commands'
@@ -167,6 +171,7 @@ NODE_BINARY=/usr/bin/node
 WORK="$APP_ROOT/work"; mkdir -p "$WORK"
 RELEASE="$APP_ROOT/new"
 CANDIDATE="$TEST_CANDIDATE"
+if [[ "$APP_HOST" == 0.0.0.0 ]]; then render_firewall "$WORK/network.nft"; fi
 systemctl() { echo "$*" >> "$COMMAND_LOG"; }
 data_admin() {
     if [[ "$1" == backup ]]; then
@@ -178,12 +183,17 @@ data_admin() {
 configure_redis() { :; }
 health_check() { [[ "$FAILURE" != health ]]; }
 activate_release
-''', tmp_path, TEST_CANDIDATE=candidate, COMMAND_LOG=log, FAILURE=failure, INSTALL_REDIS=0)
+''', tmp_path, TEST_CANDIDATE=candidate, COMMAND_LOG=log, FAILURE=failure, INSTALL_REDIS=0,
+        APP_HOST='0.0.0.0' if lan else '127.0.0.1')
     assert result.returncode != 0
     assert (config / 'tld-web.env').read_text() == 'AUTH_SECRET=original\n'
     assert (units / 'tld-web.service').read_text() == 'old web unit'
     assert (root / 'current').resolve() == root / 'old'
-    assert 'start tld-web-api tld-web-worker tld-web' in log.read_text()
+    expected = 'start ' + ('tld-web-network ' if lan else '') + 'tld-web-api tld-web-worker tld-web'
+    assert expected in log.read_text()
+    if lan:
+        assert (config / 'network.nft').read_text() == 'old firewall configuration'
+        assert (units / 'tld-web-network.service').read_text() == 'old firewall unit'
 
 
 def test_repair_does_not_fetch_or_build(tmp_path):
@@ -398,3 +408,45 @@ def test_piped_script_can_prompt_on_controlling_terminal(tmp_path):
     finally:
         os.close(master)
         os.close(terminal)
+
+
+def test_lan_flag_exposes_only_frontend_and_requires_firewall(tmp_path):
+    result = shell('main --lan --dry-run', tmp_path)
+    assert result.returncode == 0, result.stderr
+    assert 'APP_HOST=0.0.0.0' in result.stdout
+    assert 'APP_ALLOWED_SUBNET=192.168.100.0/24' in result.stdout
+
+
+def test_lan_units_require_persistent_firewall_before_web(tmp_path):
+    result = shell('''
+APP_HOST=0.0.0.0
+collect_options
+validate_options
+NODE_BINARY=/usr/bin/node
+render_units "$SYSTEMD_DIR"
+render_firewall "$CONFIG_DIR/network.nft"
+''', tmp_path)
+    assert result.returncode == 0, result.stderr
+    web = (tmp_path / 'units' / 'tld-web.service').read_text()
+    api = (tmp_path / 'units' / 'tld-web-api.service').read_text()
+    firewall = (tmp_path / 'units' / 'tld-web-network.service').read_text()
+    rules = (tmp_path / 'etc' / 'network.nft').read_text()
+    assert 'HOSTNAME=0.0.0.0 PORT=8080' in web
+    assert 'Requires=tld-web-network.service' in web
+    assert 'tld-web-network.service' in web.split('[Service]')[0]
+    assert '--host 127.0.0.1 --port 8000' in api
+    assert 'ExecStart=/usr/sbin/nft --file ' in firewall
+    assert 'ip saddr 192.168.100.0/24 tcp dport 8080 accept' in rules
+    assert 'tcp dport 8080 drop' in rules
+    assert 'flush ruleset' not in rules
+
+
+def test_firewall_failure_prevents_network_activation(tmp_path):
+    result = shell('''
+collect_options
+WORK="$APP_ROOT/work"; mkdir -p "$WORK"
+nft() { return 1; }
+check_network_access
+''', tmp_path, APP_HOST='0.0.0.0')
+    assert result.returncode != 0
+    assert 'firewall' in result.stderr.lower()

@@ -184,6 +184,25 @@ reutilizan la versión instalada sin descargar ni compilar. En modo no interacti
 instalación existente cancela si no se indica `--action`; `--yes` acepta defaults y requiere
 las credenciales OIDC ya configuradas.
 
+### Túnel en otra máquina de la LAN
+
+Si `cloudflared` está fuera del LXC, ejecuta el maestro actualizado dentro del LXC:
+
+```bash
+sudo AUTH_URL=https://tld.opencore.dpdns.org bash install-tld.sh --action repair --lan --yes
+```
+
+No recompila la aplicación. El frontend escucha en IPv4, puerto 8080, con una
+unidad nftables persistente que permite loopback y `192.168.100.0/24`, bloqueando
+el resto únicamente en ese puerto. La API mantiene `127.0.0.1:8000`. La web exige
+la unidad de firewall para arrancar; si el LXC no permite nftables, el cambio se
+detiene antes de exponerla. Las demás reglas de firewall se conservan.
+
+Para el LXC `192.168.100.254`, configura el destino del túnel como
+`http://192.168.100.254:8080` (HTTP). La máquina de `cloudflared` debe pertenecer a
+la subred permitida. Esta restricción protege el acceso directo al origen; los
+usuarios que accedan por el túnel público siguen pasando por Authentik.
+
 ## Producción con Docker Compose
 
 Esta vía incluye PostgreSQL, Authentik, Redis, API, worker, Next.js y Nginx. Solo Nginx

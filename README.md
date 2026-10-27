@@ -185,6 +185,22 @@ data backup. `repair` and `configure` reuse the installed release without downlo
 building. In non-interactive mode, an existing installation cancels unless `--action` is
 provided; `--yes` accepts defaults and requires OIDC credentials to be configured already.
 
+### Tunnel on another LAN machine
+
+Run the updated master inside the LXC:
+
+```bash
+sudo AUTH_URL=https://tld.opencore.dpdns.org bash install-tld.sh --action repair --lan --yes
+```
+
+This reuses the installed application. The frontend listens on IPv4 port8080;
+a persistent nftables unit permits loopback and `192.168.100.0/24` and drops other
+sources only on that port. The API stays on `127.0.0.1:8000`. The web unit requires
+the firewall; unavailable nftables support stops the change before exposure.
+Other firewall rules are preserved. For LXC `192.168.100.254`, set the tunnel
+destination to `http://192.168.100.254:8080`, with cloudflared on the allowed subnet.
+The restriction covers direct origin access; public tunnel visitors still use Authentik.
+
 ## Production with Docker Compose
 
 This path includes PostgreSQL, Authentik, Redis, the API, the worker, Next.js and Nginx. Only
