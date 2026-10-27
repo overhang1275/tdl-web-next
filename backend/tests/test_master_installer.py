@@ -195,6 +195,7 @@ prepare_layout() { :; }
 check_service_ports() { :; }
 ensure_oidc() { :; }
 prepare_candidate() { :; }
+prepare_environment() { :; }
 prepare_repair() { echo repaired; }
 activate_release() { :; }
 resolve_source() { exit 91; }
@@ -318,3 +319,82 @@ def test_layout_aliases_preserve_existing_app_directory(tmp_path):
     assert marker.read_text() == 'existing'
     assert (root / 'config').is_symlink()
     assert os.readlink(root / 'config') == str(tmp_path / 'etc')
+
+
+def test_first_run_creates_complete_env_before_requesting_authentik(tmp_path):
+    root = tmp_path / 'app-root'
+    root.mkdir()
+    result = shell('''
+collect_options
+APP_GROUP="$(id -gn)"
+WORK="$APP_ROOT/work"; mkdir "$WORK"
+prepare_environment
+ensure_oidc
+''', tmp_path, SOURCE_DIR=ROOT, ASSUME_YES=1)
+    assert result.returncode != 0
+    env = tmp_path / 'etc' / 'tld-web.env'
+    assert env.exists(), result.stderr
+    values = dict(line.split('=', 1) for line in env.read_text().splitlines())
+    assert values['AUTH_URL'] == 'http://localhost:8080'
+    assert values['COMMAND_TIMEOUT_SECONDS'] == '7200'
+    assert values['DOWNLOAD_BATCH_SIZE'] == '100'
+    assert len(values['AUTH_SECRET']) == 64
+    assert os.readlink(root / '.env') == str(env)
+    assert env.stat().st_mode & 0o777 == 0o640
+    assert (tmp_path / 'etc' / 'install.conf').exists()
+    assert values['AUTH_SECRET'] not in result.stdout + result.stderr
+    assert 'asistente' in result.stderr.lower()
+
+
+def test_preparing_environment_preserves_existing_bytes_and_secret(tmp_path):
+    config = tmp_path / 'etc'
+    config.mkdir()
+    env = config / 'tld-web.env'
+    original = 'AUTH_SECRET=do-not-change\nCUSTOM_SETTING=keep\n'
+    env.write_text(original)
+    result = shell('collect_options\nprepare_environment', tmp_path)
+    assert result.returncode == 0, result.stderr
+    assert env.read_text() == original
+
+
+def test_generated_configuration_does_not_cancel_next_install_attempt(tmp_path):
+    config = tmp_path / 'etc'
+    config.mkdir()
+    (config / 'tld-web.env').write_text('AUTH_SECRET=generated\n')
+    result = shell('id() { echo 0; }; run_installation() { echo "ACTION=$ACTION"; }; main --yes', tmp_path)
+    assert result.returncode == 0, result.stderr
+    assert 'ACTION=install' in result.stdout
+
+
+def test_installed_application_keeps_noninteractive_cancel_default(tmp_path):
+    config = tmp_path / 'etc'
+    config.mkdir()
+    (config / 'tld-web.env').write_text('AUTH_SECRET=generated\n')
+    root = tmp_path / 'app-root'
+    (root / 'release').mkdir(parents=True)
+    (root / 'current').symlink_to(root / 'release')
+    result = shell('run_installation() { exit 91; }; main --yes', tmp_path)
+    assert result.returncode == 0
+    assert 'Cancelado' in result.stdout
+
+
+def test_piped_script_can_prompt_on_controlling_terminal(tmp_path):
+    import fcntl
+    import pty
+    import termios
+
+    master, terminal = pty.openpty()
+
+    def attach_terminal():
+        os.setsid()
+        fcntl.ioctl(terminal, termios.TIOCSCTTY, 0)
+
+    try:
+        process = subprocess.Popen(['bash', '-c', f'source "{MASTER}"; init_input; prompt_default Puerto 8080'],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=terminal, preexec_fn=attach_terminal)
+        os.write(master, b'8181\n')
+        stdout, _ = process.communicate(input=b'unused script input', timeout=5)
+        assert stdout == b'8181'
+    finally:
+        os.close(master)
+        os.close(terminal)

@@ -33,10 +33,23 @@ pick_value() {
     printf '%s' "${value:-$fallback}"
 }
 
+init_input() {
+    INPUT_FD=0
+    if [[ -t 0 ]]; then
+        exec {INPUT_FD}<&0
+    elif { exec {INPUT_FD}</dev/tty; } 2>/dev/null; then
+        :
+    else
+        INPUT_FD=0
+    fi
+}
+
+can_prompt() { [[ -t "${INPUT_FD:-0}" && "${ASSUME_YES:-0}" != 1 ]]; }
+
 prompt_default() {
     local label=$1 default=$2 value=''
-    if [[ -t 0 && "${ASSUME_YES:-0}" != 1 ]]; then
-        read -r -p "$label [$default]: " value || true
+    if can_prompt; then
+        read -r -u "${INPUT_FD:-0}" -p "$label [$default]: " value || true
     fi
     printf '%s' "${value:-$default}"
 }
@@ -81,9 +94,9 @@ collect_options() {
     API_PORT="${API_PORT:-8000}"
     INSTALL_REDIS="$(yes_no "$(prompt_default '¿Instalar Redis localmente? S/n' "$(pick_value INSTALL_REDIS S)")")"
     REDIS_URL="$(pick_value REDIS_URL redis://127.0.0.1:6379/0)"
-    if [[ "$INSTALL_REDIS" == 0 && -t 0 && "${ASSUME_YES:-0}" != 1 ]]; then
+    if [[ "$INSTALL_REDIS" == 0 ]] && can_prompt; then
         local redis_input=''
-        read -r -s -p 'URL de Redis externo (Enter conserva el valor actual): ' redis_input || true
+        read -r -s -u "${INPUT_FD:-0}" -p 'URL de Redis externo (Enter conserva el valor actual): ' redis_input || true
         printf '\n' >&2
         REDIS_URL="${redis_input:-$REDIS_URL}"
     fi
@@ -164,6 +177,19 @@ write_environment() {
     python3 "${SOURCE_DIR:-$SCRIPT_DIR}/scripts/configure-env.py" --deployment native --domain localhost \
         --root "$APP_ROOT" --output "$destination" --legacy "$ENV_FILE" --native-options "$options"
     rm -f -- "$options"
+}
+
+prepare_environment() {
+    if [[ ! -e "$APP_ROOT/current" ]]; then NEW_ENV=1; fi
+    [[ ! -f "$ENV_FILE" ]] || return 0
+    mkdir -p -- "$(dirname "$ENV_FILE")"
+    write_environment "$ENV_FILE"
+    chgrp "$APP_GROUP" "$ENV_FILE"
+    chmod 640 "$ENV_FILE"
+    if [[ "$SAVE_DEFAULTS" == 1 ]]; then write_defaults "$INSTALL_CONF"; fi
+    link_layout_aliases
+    printf 'Configuración básica creada en %s (acceso: %s/.env).\n' "$ENV_FILE" "$APP_ROOT"
+    NEW_ENV=1
 }
 
 check_port() {
@@ -476,13 +502,18 @@ PY
 )"
         fi
         if [[ -z "$value" || "$value" == replace-* ]]; then
-            [[ -t 0 && "${ASSUME_YES:-0}" != 1 ]] || die "Configura $name en $ENV_FILE o en el entorno antes de continuar."
-            if [[ "$name" == AUTHENTIK_CLIENT_SECRET ]]; then read -r -s -p "$name: " value; printf '\n' >&2
-            else read -r -p "$name: " value; fi
+            can_prompt || die "Falta $name de tu proveedor externo. La configuración básica ya está preparada; vuelve a ejecutar el instalador desde una terminal para completar el asistente (o proporciona el valor por entorno)."
+            if [[ "$name" == AUTHENTIK_CLIENT_SECRET ]]; then read -r -s -u "${INPUT_FD:-0}" -p "$name: " value; printf '\n' >&2
+            else read -r -u "${INPUT_FD:-0}" -p "$name: " value; fi
         fi
         [[ -n "$value" && "$value" != *$'\n'* && "$value" != *$'\r'* ]] || die "Valor inválido: $name"
         printf -v "$name" '%s' "$value"; export "${name?}"
     done
+    if [[ "${NEW_ENV:-0}" == 1 ]]; then
+        write_environment "$ENV_FILE"
+        chgrp "$APP_GROUP" "$ENV_FILE"
+        chmod 640 "$ENV_FILE"
+    fi
     [[ "$AUTHENTIK_ISSUER" == https://* ]] || die 'El issuer de Authentik debe usar HTTPS.'
     fetch "${AUTHENTIK_ISSUER%/}/.well-known/openid-configuration" "$WORK/discovery.json"
     python3 - "$WORK/discovery.json" "$AUTHENTIK_ISSUER" <<'PY'
@@ -548,8 +579,9 @@ health_check() {
 
 link_layout_aliases() {
     local name target
-    for name in app config; do
+    for name in app config .env; do
         target="$APP_ROOT/current"; [[ "$name" != config ]] || target="$(dirname "$ENV_FILE")"
+        [[ "$name" != .env ]] || target="$ENV_FILE"
         if [[ ! -e "$APP_ROOT/$name" && ! -L "$APP_ROOT/$name" ]]; then ln -s "$target" "$APP_ROOT/$name"; fi
     done
 }
@@ -641,14 +673,17 @@ run_installation() {
     prepare_layout
     check_service_ports
     if [[ "$ACTION" == repair || "$ACTION" == configure ]]; then prepare_repair
-    else install_binaries; resolve_source; build_release; fi
+    else resolve_source; fi
+    prepare_environment
     ensure_oidc
+    if [[ "$ACTION" != repair && "$ACTION" != configure ]]; then install_binaries; build_release; fi
     prepare_candidate
     activate_release
 }
 
 main() {
     local dry_run=0
+    init_input
     while (($#)); do
         case "$1" in
             --dry-run) dry_run=1; shift ;;
@@ -665,7 +700,8 @@ main() {
     done
     discover_files
     local default_action=install
-    [[ ! -f "$ENV_FILE" ]] || default_action=cancel
+    local installed_root="${APP_ROOT:-$(env_read "$ENV_FILE" APP_ROOT)}"
+    [[ ! -f "$ENV_FILE" || ! -L "${installed_root:-/opt/tld-web}/current" ]] || default_action=cancel
     ACTION="${ACTION:-$(prompt_default 'Acción (install/update/repair/configure/cancel)' "$default_action") }"
     ACTION="${ACTION% }"
     case "$ACTION" in install|update|repair|configure) ;; cancel) printf 'Cancelado.\n'; return ;; *) die 'Acción inválida.' ;; esac

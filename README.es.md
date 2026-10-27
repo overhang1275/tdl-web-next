@@ -115,10 +115,13 @@ El instalador **no crea el LXC ni configura Cloudflare Tunnel**; tampoco instala
 curl -fsSL https://raw.githubusercontent.com/overhang1275/tdl-web-next/refs/heads/main/install-tld.sh | sudo bash
 ```
 
-La ejecución por pipe no es interactiva: usa los valores por defecto y exige las credenciales
-de Authentik en el entorno o en un `/etc/tld-web/tld-web.env` existente. Para el asistente
-interactivo, descarga el script y ejecútalo con `sudo bash install-tld.sh`; desde una copia
-local, añade `--source-dir "$PWD"`.
+El comando abre el asistente en la terminal disponible, incluso al ejecutarse por pipe.
+El instalador crea automáticamente la configuración básica y el secreto local, y pide
+los datos de Authentik que falten antes de compilar. No necesitas copiar ni editar `.env`.
+Sin terminal, genera igualmente el archivo y usa los valores proporcionados por entorno;
+si falta Authentik, indica cómo retomar el asistente. `--yes` acepta los valores por defecto.
+Una instalación ya activa cancela por defecto sin una acción explícita. Desde una copia
+local puedes usar `sudo bash install-tld.sh --source-dir "$PWD"`.
 
 El instalador permite instalar, actualizar, reparar, reconfigurar o cancelar. De forma
 interactiva, Enter acepta los valores mostrados. Por defecto usa `/opt/tld-web`, escucha en
@@ -150,11 +153,12 @@ Layout de la instalación:
 ```
 
 Los defaults sin secretos se guardan en `/etc/tld-web/install.conf` y el entorno sensible en
-`/etc/tld-web/tld-web.env`. Puedes preparar este último desde `.env.native.example` antes de
-ejecutar. Las instalaciones anteriores conservan su archivo en `/etc/telegram-downloader`,
+`/etc/tld-web/tld-web.env`, accesible también mediante `/opt/tld-web/.env`. Se genera con
+permisos restringidos y se conserva en los reintentos. La plantilla `.env.native.example`
+queda como referencia opcional. Las instalaciones anteriores conservan su archivo en `/etc/telegram-downloader`,
 usuario, rutas, unidades y Nginx existente.
 
-Servicios: `tld-web-api`, `tld-web-worker` y `tld-web`. Mantenimiento:
+Servicios: `tld-web-api`, `tld-web-worker` y `tld-web`. Mantenimiento desde una copia local:
 
 ```bash
 sudo bash install-tld.sh --action update --source-dir "$PWD"

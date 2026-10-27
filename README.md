@@ -116,10 +116,13 @@ Cloudflare Tunnel or install Docker**.
 curl -fsSL https://raw.githubusercontent.com/overhang1275/tdl-web-next/refs/heads/main/install-tld.sh | sudo bash
 ```
 
-The piped installer runs non-interactively: it uses the defaults and requires the Authentik
-credentials in the environment or in an existing `/etc/tld-web/tld-web.env`. For the
-interactive wizard, download the script and run `sudo bash install-tld.sh`; from a checkout,
-add `--source-dir "$PWD"`.
+The command opens the wizard on the available terminal, including when piped into Bash.
+It generates the basic configuration and local secret automatically, then asks for missing
+Authentik details before building. No manual `.env` copying or editing is required.
+Without a terminal it still creates the file and uses supplied environment values; missing
+Authentik details produce instructions to resume the wizard. `--yes` accepts defaults.
+An already installed application defaults to cancel unless an explicit action is supplied.
+From a checkout, use `sudo bash install-tld.sh --source-dir "$PWD"`.
 
 The installer supports install, update, repair, reconfigure and cancel. When run
 interactively, Enter accepts the displayed defaults. By default it uses `/opt/tld-web`,
@@ -152,11 +155,12 @@ Installation layout:
 ```
 
 Non-secret defaults are stored in `/etc/tld-web/install.conf` and the sensitive environment
-in `/etc/tld-web/tld-web.env`. You can prepare the latter from `.env.native.example` before
-running the installer. Previous installations keep their file in `/etc/telegram-downloader`,
+in `/etc/tld-web/tld-web.env`, also linked at `/opt/tld-web/.env`. It is generated with
+restricted permissions and preserved across retries. `.env.native.example` is an optional
+reference. Previous installations keep their file in `/etc/telegram-downloader`,
 along with their user, paths, units and existing Nginx configuration.
 
-Services: `tld-web-api`, `tld-web-worker` and `tld-web`. Maintenance:
+Services: `tld-web-api`, `tld-web-worker` and `tld-web`. Maintenance from a checkout:
 
 ```bash
 sudo bash install-tld.sh --action update --source-dir "$PWD"
