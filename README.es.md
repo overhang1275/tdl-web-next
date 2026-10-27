@@ -65,11 +65,9 @@ flowchart LR
 
 ## Seguridad
 
-Sin sesión, `/` y `/login` inician OIDC automáticamente en Authentik. `AUTH_URL`
-debe ser el origen de TDL; `AUTHENTIK_ISSUER` identifica al proveedor. Los destinos
-de retorno se limitan al origen de TDL. Cerrar sesión borra la sesión local y muestra
-una confirmación sin reentrada automática; la sesión del proveedor es independiente.
-`/health` comprueba la web sin iniciar autenticaciones.
+Sin sesión, `/` redirige a `/login` en el mismo dominio de TDL. El login muestra
+el botón «Continuar con Authentik»; el proveedor solo se abre al pulsarlo. `AUTH_URL`
+es la URL pública de TDL, mientras `AUTHENTIK_ISSUER` identifica al proveedor.
 
 - **Identidad:** Authentik emite JWT RS256 con PKCE. FastAPI valida firma, issuer, audiencia,
   expiración y, si está configurado, el grupo `tdl-admin`.

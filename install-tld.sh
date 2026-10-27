@@ -629,10 +629,8 @@ PY
 
 data_admin() { python3 "$SOURCE_DIR/scripts/data-admin.py" "$1" --env "$ENV_FILE" "${@:2}"; }
 health_check() {
-    local web_health=login
-    [[ ! -f "${SOURCE_DIR:-}/frontend/app/health/route.ts" ]] || web_health=health
     curl --fail --silent --retry 15 --retry-delay 2 --retry-connrefused "http://127.0.0.1:$API_PORT/health" >/dev/null
-    curl --fail --silent --retry 15 --retry-delay 2 --retry-connrefused "http://127.0.0.1:$APP_PORT/$web_health" >/dev/null
+    curl --fail --silent --retry 15 --retry-delay 2 --retry-connrefused "http://127.0.0.1:$APP_PORT/login" >/dev/null
 }
 
 link_layout_aliases() {

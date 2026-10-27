@@ -5,6 +5,7 @@ test.skip(!process.env.E2E_INTEGRATION, "Requires the isolated Docker stack with
 test("OIDC login, real API, Redis worker, download and persisted deletion", async ({ page, baseURL }) => {
   test.setTimeout(120_000);
   await page.goto("/login");
+  await page.getByRole("button", { name: /Continuar con Authentik/ }).click();
   await expect(page.getByRole("heading", { name: "Resumen" })).toBeVisible();
   const session = await (await page.request.get("/api/auth/session")).json();
   expect(session.user.name).toBe("Operador de pruebas");
