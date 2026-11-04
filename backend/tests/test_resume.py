@@ -8,7 +8,6 @@ from sqlalchemy.orm import sessionmaker
 
 from app import models, worker
 from app.config import settings
-from app.database import Base
 from app.models import DownloadJob, JobStatus
 from app.schemas import JobCreate
 from app.services import jobs
@@ -16,9 +15,8 @@ from app.services.tdl import TdlError
 
 
 @pytest.fixture
-def runtime(tmp_path, monkeypatch):
-    engine = create_engine(f"sqlite:///{tmp_path / 'db.sqlite'}")
-    Base.metadata.create_all(engine)
+def runtime(tmp_path, monkeypatch, test_engine):
+    engine = test_engine
     sessions = sessionmaker(bind=engine, expire_on_commit=False)
     for name in ('exports_dir', 'downloads_dir', 'logs_dir'):
         monkeypatch.setattr(settings, name, tmp_path / name)
@@ -36,7 +34,6 @@ def runtime(tmp_path, monkeypatch):
     monkeypatch.setattr(jobs, 'get_queue', lambda: queue)
     with sessions() as db:
         yield db, queue
-    engine.dispose()
 
 
 def make_job(db, messages):

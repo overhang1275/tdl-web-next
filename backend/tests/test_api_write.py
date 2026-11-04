@@ -4,13 +4,11 @@ from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from app import database
 from app.api.deps import get_current_user
 from app.config import settings
-from app.database import Base
 from app.main import app
 from app.models import DownloadFile, DownloadJob, JobStatus
 from app.schemas import UserRead
@@ -39,7 +37,7 @@ class FakeQueue:
 
 
 @pytest.fixture
-def api(tmp_path, monkeypatch):
+def api(tmp_path, monkeypatch, test_engine):
     for name, value in {
         "base_dir": tmp_path,
         "sessions_dir": tmp_path / "sessions",
@@ -49,8 +47,7 @@ def api(tmp_path, monkeypatch):
     }.items():
         monkeypatch.setattr(settings, name, value)
     settings.ensure_directories()
-    engine = create_engine(f"sqlite:///{tmp_path / 'write.sqlite'}")
-    Base.metadata.create_all(engine)
+    engine = test_engine
     sessions = sessionmaker(bind=engine, expire_on_commit=False)
     monkeypatch.setattr(database, "engine", engine)
     monkeypatch.setattr(database, "SessionLocal", sessions)

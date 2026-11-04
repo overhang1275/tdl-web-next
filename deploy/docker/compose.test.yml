@@ -3,7 +3,7 @@ name: tdl-console-test
 x-api-env: &api-env
   APP_ENV: production
   DATA_DIR: /data
-  DATABASE_URL: sqlite:////data/test.sqlite3
+  DATABASE_URL: postgresql+psycopg://tdl_test:tdl_test@postgres:5432/tdl_test
   REDIS_URL: redis://redis:6379/1
   TDL_BINARY: /app/scripts/fake-tdl.sh
   AUTHENTIK_ISSUER: http://oidc:9000/application/o/tdl-console/
@@ -13,6 +13,18 @@ x-api-env: &api-env
   TRUSTED_HOSTS: api,localhost,127.0.0.1
 
 services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: tdl_test
+      POSTGRES_PASSWORD: tdl_test
+      POSTGRES_DB: tdl_test
+    volumes: [test-postgres:/var/lib/postgresql/data]
+    healthcheck:
+      test: [CMD-SHELL, pg_isready -U tdl_test -d tdl_test]
+      interval: 2s
+      timeout: 2s
+      retries: 30
   redis:
     image: redis:7.4-alpine
     healthcheck:
@@ -40,6 +52,7 @@ services:
     environment: *api-env
     volumes: [test-data:/data]
     depends_on:
+      postgres: {condition: service_healthy}
       redis: {condition: service_healthy}
       oidc: {condition: service_healthy}
     healthcheck:
@@ -82,6 +95,12 @@ services:
       dockerfile: deploy/docker/Dockerfile.api
       target: tests
     profiles: [checks]
+    environment:
+      APP_ENV: test
+      DATABASE_URL: postgresql+psycopg://tdl_test:tdl_test@postgres:5432/tdl_test
+      TEST_DATABASE_URL: postgresql+psycopg://tdl_test:tdl_test@postgres:5432/tdl_test
+    depends_on:
+      postgres: {condition: service_healthy}
   frontend-tests:
     build:
       context: ../..
@@ -103,4 +122,5 @@ services:
       worker: {condition: service_started}
 
 volumes:
+  test-postgres:
   test-data:

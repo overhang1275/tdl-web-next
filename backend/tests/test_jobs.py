@@ -2,18 +2,12 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
-
-from app.database import Base
 from app.models import DownloadJob
 from app.services.jobs import count_jobs, list_jobs
 
 
-def test_list_jobs_limits_in_sql_order(tmp_path):
-    engine = create_engine(f"sqlite:///{tmp_path / 'jobs.sqlite3'}")
-    Base.metadata.create_all(engine)
-    session = sessionmaker(bind=engine)()
+def test_list_jobs_limits_in_sql_order(db_session):
+    session = db_session
     base = datetime(2024, 1, 1)
     for index in range(5):
         session.add(
