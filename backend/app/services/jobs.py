@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import uuid4
 
@@ -135,13 +135,13 @@ def enqueue_job(db: Session, job: DownloadJob, delay: int = 0, queue=None) -> bo
         DownloadJob.status.in_(ACTIVE_STATUSES),
         DownloadJob.cancel_requested.is_(False),
         DownloadJob.rq_job_id == job.rq_job_id,
-    ).values(rq_job_id=token, rq_enqueued_at=datetime.utcnow(), status=JobStatus.pending))
+    ).values(rq_job_id=token, rq_enqueued_at=datetime.now(UTC), status=JobStatus.pending))
     db.commit()
     db.refresh(job)
     if not claimed.rowcount:
         if job.cancel_requested and job.status in ACTIVE_STATUSES:
             job.status, job.stage = JobStatus.cancelled, JobStage.cancelled
-            job.finished_at = datetime.utcnow()
+            job.finished_at = datetime.now(UTC)
             db.commit()
         return False
     kwargs = {"job_id": token, "job_timeout": settings.command_timeout_seconds + 120}
@@ -428,7 +428,7 @@ def sync_pending_jobs_with_queue(db: Session, job_id: int | None = None) -> None
             rq_status = str(rq_job.get_status()).lower()
         except NoSuchJobError:
             # The SQL token is committed just before enqueue; allow that gap.
-            if job.rq_enqueued_at and (datetime.utcnow() - job.rq_enqueued_at).total_seconds() < 30:
+            if job.rq_enqueued_at and (datetime.now(UTC) - job.rq_enqueued_at).total_seconds() < 30:
                 continue
             error = "Trabajo ausente de la cola. Usa Reintentar pendientes para recuperar el avance guardado."
             rq_status = "missing"
@@ -443,7 +443,7 @@ def sync_pending_jobs_with_queue(db: Session, job_id: int | None = None) -> None
                 DownloadJob.id == job.id, DownloadJob.rq_job_id == token,
                 DownloadJob.status.in_(ACTIVE_STATUSES),
             ).values(stage=JobStage.failed, status=JobStatus.failed,
-                     error_message=error, finished_at=datetime.utcnow()),
+                     error_message=error, finished_at=datetime.now(UTC)),
                 execution_options={"synchronize_session": False})
             changed = changed or bool(result.rowcount)
     if changed:

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 
 from app.models import DownloadJob
 from app.services.jobs import count_jobs, list_jobs
@@ -8,7 +8,7 @@ from app.services.jobs import count_jobs, list_jobs
 
 def test_list_jobs_limits_in_sql_order(db_session):
     session = db_session
-    base = datetime(2024, 1, 1)
+    base = datetime(2024, 1, 1, tzinfo=UTC)
     for index in range(5):
         session.add(
             DownloadJob(

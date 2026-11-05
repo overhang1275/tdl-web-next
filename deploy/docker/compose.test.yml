@@ -43,6 +43,15 @@ services:
       interval: 2s
       timeout: 3s
       retries: 20
+  migrate:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.api
+      target: tests
+    command: [alembic, upgrade, head]
+    environment: *api-env
+    depends_on:
+      postgres: {condition: service_healthy}
   api:
     build:
       context: ../..
@@ -53,6 +62,7 @@ services:
     volumes: [test-data:/data]
     depends_on:
       postgres: {condition: service_healthy}
+      migrate: {condition: service_completed_successfully}
       redis: {condition: service_healthy}
       oidc: {condition: service_healthy}
     healthcheck:

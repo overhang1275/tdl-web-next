@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import enum
-from datetime import datetime
+from datetime import UTC, datetime
 
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     Date,
     DateTime,
@@ -65,14 +66,14 @@ class DownloadJob(Base):
             "uq_download_jobs_active_dedupe",
             "dedupe_key",
             unique=True,
-            sqlite_where=text("status IN ('pending','running')"),
+            postgresql_where=text("status IN ('pending','running')"),
         ),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
     files: Mapped[list[DownloadFile]] = relationship(cascade="all, delete-orphan")
     rq_job_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
-    rq_enqueued_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    rq_enqueued_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     chat_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     chat_title: Mapped[str | None] = mapped_column(String(255), nullable=True)
     hashtag: Mapped[str | None] = mapped_column(String(128), nullable=True)
@@ -92,8 +93,8 @@ class DownloadJob(Base):
     total_filtered_messages: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     total_downloaded_files: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     download_observed_files: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
-    download_observed_bytes: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
-    download_speed_bps: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    download_observed_bytes: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
+    download_speed_bps: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
     download_eta_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
     status: Mapped[JobStatus] = mapped_column(Enum(JobStatus), default=JobStatus.pending, nullable=False)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -102,9 +103,9 @@ class DownloadJob(Base):
     export_cursor: Mapped[int | None] = mapped_column(Integer, nullable=True)
     export_upper_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     operation_attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
-    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     dedupe_key: Mapped[str | None] = mapped_column(String(64), nullable=True)
     deletion_requested: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     deletion_error: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -124,8 +125,8 @@ class DownloadFile(Base):
     destination_root: Mapped[str] = mapped_column(Text)
     output_dir: Mapped[str] = mapped_column(Text)
     local_path: Mapped[str | None] = mapped_column(Text, nullable=True)
-    expected_size: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    size: Mapped[int] = mapped_column(Integer, default=0)
+    expected_size: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    size: Mapped[int] = mapped_column(BigInteger, default=0)
     status: Mapped[str] = mapped_column(String(16), default="pending", index=True)
     attempts: Mapped[int] = mapped_column(Integer, default=0)
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -147,4 +148,4 @@ class DownloadTemplate(Base):
     refresh_export: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     export_only: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     output_subfolder: Mapped[str | None] = mapped_column(String(128), nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False)

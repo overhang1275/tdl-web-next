@@ -5,6 +5,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from app.api.errors import install as install_error_handlers
+from app.api.v1.health import health
 from app.api.v1.router import api_router
 from app.config import settings
 from app.database import init_db
@@ -35,9 +36,7 @@ install_error_handlers(app)
 app.include_router(api_router, prefix="/api/v1")
 
 
-@app.get("/health", include_in_schema=False)
-def health() -> dict[str, str]:
-    return {"status": "ok"}
+app.add_api_route("/health", health, include_in_schema=False)
 
 
 @app.get("/", include_in_schema=False)

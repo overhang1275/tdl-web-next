@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 
 from app.config import settings
@@ -25,18 +25,18 @@ def job_log_path(job_id: int) -> Path:
 
 def append_job_log(job_id: int, message: str) -> None:
     settings.ensure_directories()
-    timestamp = datetime.utcnow().isoformat(timespec="seconds")
+    timestamp = datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
     path = job_log_path(job_id)
     with path.open("a", encoding="utf-8") as handle:
-        handle.write(f"[{timestamp}Z] {message.rstrip()}\n")
+        handle.write(f"[{timestamp}] {message.rstrip()}\n")
 
 
 def append_deleted_job_log(job_id: int, message: str) -> None:
     settings.ensure_directories()
-    timestamp = datetime.utcnow().isoformat(timespec="seconds")
+    timestamp = datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
     path = safe_child(settings.logs_dir, "deleted-jobs.log")
     with path.open("a", encoding="utf-8") as handle:
-        handle.write(f"[{timestamp}Z] Job #{job_id}: {message.rstrip()}\n")
+        handle.write(f"[{timestamp}] Job #{job_id}: {message.rstrip()}\n")
 
 
 def read_job_log(job_id: int, tail_bytes: int = 50_000) -> str:

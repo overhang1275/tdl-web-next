@@ -2,20 +2,20 @@ from __future__ import annotations
 
 import os
 from contextlib import contextmanager
+from pathlib import Path
 from uuid import uuid4
 
 import pytest
+from alembic import command
+from alembic.config import Config
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import ArgumentError
 from sqlalchemy.orm import Session
 
-from app import models  # noqa: F401
-from app.database import Base
-
 
 @contextmanager
-def isolated_test_engine():
+def isolated_test_engine(*, migrate=True):
     raw_url = os.environ.get("TEST_DATABASE_URL", "")
     try:
         url = make_url(raw_url)
@@ -36,8 +36,11 @@ def isolated_test_engine():
         engine = create_engine(
             url, connect_args={"options": f"-csearch_path={schema}"}, pool_pre_ping=True
         )
-        # Only test metadata is bootstrapped here; migrations are exercised separately.
-        Base.metadata.create_all(engine)
+        if migrate:
+            config = Config(str(Path(__file__).resolve().parents[1] / "alembic.ini"))
+            with engine.begin() as connection:
+                config.attributes["connection"] = connection
+                command.upgrade(config, "head")
         yield engine
     finally:
         if engine is not None:

@@ -29,14 +29,29 @@ def test_config_preserves_oidc_issuer_exactly(monkeypatch):
     assert config.authentik_jwks_url == f"{issuer}jwks/"
 
 
-def test_docker_refuses_unmounted_database_path(monkeypatch, tmp_path):
+@pytest.mark.parametrize("url", [None, "", "sqlite:///:memory:", "mysql://host/db", "not-a-url", "postgresql://host", "postgresql+psycopg2://host/db"])
+def test_config_requires_postgresql(monkeypatch, url):
+    if url is None:
+        monkeypatch.delenv("DATABASE_URL", raising=False)
+    else:
+        monkeypatch.setenv("DATABASE_URL", url)
+    with pytest.raises(RuntimeError, match="DATABASE_URL.*PostgreSQL"):
+        Settings().validate()
+
+
+@pytest.mark.parametrize("scheme", ["postgresql", "postgresql+psycopg"])
+def test_config_accepts_postgresql_and_preserves_production_oidc(monkeypatch, scheme):
     monkeypatch.setenv("APP_ENV", "production")
-    monkeypatch.setenv("DEPLOYMENT_MODE", "docker")
-    monkeypatch.setenv("DATABASE_DIR", str(tmp_path / "mounted"))
-    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{tmp_path / 'outside' / 'app.sqlite'}")
+    monkeypatch.setenv("DATABASE_URL", f"{scheme}://user:secret@host/tdl")
     monkeypatch.setenv("AUTHENTIK_ISSUER", ISSUER)
     monkeypatch.setenv("AUTHENTIK_AUDIENCE", AUDIENCE)
-    with pytest.raises(RuntimeError, match="DATABASE_DIR"):
+    config = Settings()
+    config.validate()
+    assert config.database_url == "postgresql+psycopg://user:secret@host/tdl"
+    monkeypatch.delenv("AUTHENTIK_ISSUER")
+    monkeypatch.delenv("AUTHENTIK_AUDIENCE")
+    monkeypatch.delenv("AUTHENTIK_JWKS_URL", raising=False)
+    with pytest.raises(RuntimeError, match="AUTHENTIK"):
         Settings().validate()
 
 
@@ -109,7 +124,10 @@ def authentik_settings(monkeypatch, jwks_server):
 
 
 @pytest.fixture
-def api_client(monkeypatch):
+def api_client(monkeypatch, test_engine):
+    from app import database
+
+    monkeypatch.setattr(database, "engine", test_engine)
     from app.services.status import status_service
 
     monkeypatch.setattr("app.main.init_db", lambda: None)
@@ -245,3 +263,29 @@ def test_me_returns_validated_identity(api_client, rsa_key):
     assert body["username"] == "admin"
     assert body["email"] == "admin@example.com"
     assert body["groups"] == [GROUP]
+
+
+@pytest.mark.parametrize("path", ["/health", "/api/v1/health"])
+def test_health_rejects_old_schema_without_exposing_details(api_client, test_engine, path):
+    from sqlalchemy import text
+
+    with test_engine.begin() as connection:
+        connection.execute(text("UPDATE alembic_version SET version_num = 'old_revision'"))
+    response = api_client.get(path)
+    assert response.status_code == 503
+    assert response.json() == {"detail": "Database is not ready"}
+
+
+@pytest.mark.parametrize("path", ["/health", "/api/v1/health"])
+def test_health_rejects_unavailable_database_without_exposing_credentials(api_client, monkeypatch, path):
+    from sqlalchemy.exc import OperationalError
+
+    from app import database
+
+    def unavailable():
+        raise OperationalError("postgresql://user:SECRET@host/db", {}, Exception("SECRET"))
+
+    monkeypatch.setattr(database.engine, "connect", unavailable)
+    response = api_client.get(path)
+    assert response.status_code == 503
+    assert "SECRET" not in response.text

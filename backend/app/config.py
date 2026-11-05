@@ -3,6 +3,9 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+from sqlalchemy.engine import make_url
+from sqlalchemy.exc import ArgumentError
+
 
 def load_env_file(path: Path = Path(".env"), *, override: bool = False) -> None:
     if not path.exists():
@@ -60,9 +63,16 @@ class Settings:
         self.exports_dir = Path(os.getenv("EXPORTS_DIR", self.base_dir / "exports")).resolve()
         self.downloads_dir = Path(os.getenv("DOWNLOADS_DIR", self.base_dir / "downloads")).resolve()
         self.logs_dir = Path(os.getenv("LOGS_DIR", self.base_dir / "logs")).resolve()
-        self.database_url = os.getenv(
-            "DATABASE_URL", f"sqlite:///{self.base_dir / 'telegram_downloader.sqlite3'}"
-        )
+        try:
+            database_url = make_url(os.getenv("DATABASE_URL", ""))
+            if database_url.drivername not in {"postgresql", "postgresql+psycopg"} or not database_url.database:
+                raise ValueError
+        except (ArgumentError, ValueError):
+            raise RuntimeError(
+                "DATABASE_URL must name a PostgreSQL database: "
+                "postgresql+psycopg://user:password@host/database. SQLite is no longer supported."
+            ) from None
+        self.database_url = database_url.set(drivername="postgresql+psycopg").render_as_string(hide_password=False)
         self.redis_url = os.getenv("REDIS_URL", "redis://127.0.0.1:6379/0")
         self.tdl_binary = os.getenv("TDL_BINARY", "tdl")
         self.tdl_namespace = os.getenv("TDL_NAMESPACE", "default")
@@ -84,11 +94,6 @@ class Settings:
         self.enable_docs = _bool("ENABLE_DOCS", self.environment != "production")
 
     def validate(self) -> None:
-        if os.getenv("DEPLOYMENT_MODE") == "docker" and self.database_url.startswith("sqlite:///"):
-            database_dir = Path(self.database_url.removeprefix("sqlite:///")).resolve().parent
-            mounted_dir = Path(os.getenv("DATABASE_DIR", str(self.base_dir))).resolve()
-            if database_dir != mounted_dir:
-                raise RuntimeError("DATABASE_DIR must match the SQLite directory mounted by Docker")
         if self.environment != "production":
             return
         if not self.authentik_issuer or not self.authentik_audience or not self.authentik_jwks_url:

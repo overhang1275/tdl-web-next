@@ -3,7 +3,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from sqlalchemy import create_engine, select
+from sqlalchemy import select
 from sqlalchemy.orm import sessionmaker
 
 from app import models, worker
@@ -434,25 +434,6 @@ def test_failed_continuation_enqueue_keeps_progress_and_can_retry(runtime, monke
         run_next(queue)
     db.expire_all()
     assert db.get(DownloadJob, job.id).total_downloaded_files == 2
-
-
-def test_sqlite_migration_preserves_existing_jobs(tmp_path, monkeypatch):
-    from sqlalchemy import inspect, text
-
-    from app import database
-    engine = create_engine(f"sqlite:///{tmp_path / 'legacy.sqlite'}")
-    monkeypatch.setattr(database, 'engine', engine)
-    monkeypatch.setattr(settings, 'database_url', f"sqlite:///{tmp_path / 'legacy.sqlite'}")
-    with engine.begin() as connection:
-        connection.execute(text('CREATE TABLE download_jobs (id INTEGER PRIMARY KEY, chat_id TEXT, export_json_path TEXT)'))
-        connection.execute(text("INSERT INTO download_jobs VALUES (7, '123', NULL)"))
-    database.migrate_sqlite()
-    database.migrate_sqlite()  # Restart must be idempotent.
-    columns = {column['name'] for column in inspect(engine).get_columns('download_jobs')}
-    assert {'transfer_initialized', 'total_failed_files', 'export_cursor', 'export_upper_id', 'rq_enqueued_at'} <= columns
-    with engine.connect() as connection:
-        assert connection.execute(text('SELECT id, chat_id, transfer_initialized FROM download_jobs')).one() == (7, '123', 0)
-    engine.dispose()
 
 
 def test_terminal_transition_honors_late_cancellation(runtime):
