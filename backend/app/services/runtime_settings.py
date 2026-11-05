@@ -21,6 +21,8 @@ from app.schemas import SettingsUpdate
 FIELDS = ("downloads_dir", "command_timeout_seconds", "download_batch_size",
           "download_idle_timeout_seconds", "export_batch_size")
 BUSY = {"queued", "moving", "failed"}
+# Private TDL namespace: ASCII "TDLSTORE", shared by every storage writer.
+_STORAGE_LOCK_KEY = 0x54444C53544F5245
 
 
 def current_values() -> dict:
@@ -46,19 +48,24 @@ def operation(db: Session) -> dict:
 
 
 def _lock(db: Session) -> None:
-    # Called before any mutation; serialize job creation and configuration changes in SQLite.
-    db.rollback()
-    if db.bind.dialect.name == "sqlite":
-        db.execute(text("BEGIN IMMEDIATE"))
+    db.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": _STORAGE_LOCK_KEY})
+    row = db.get(RuntimeSettings, 1)
+    # get_db may have cached settings before waiting; preserve nested callers' edits.
+    if row is not None and not db.is_modified(row):
+        db.refresh(row)
     load_runtime(db)
+
+
+def require_storage_available(db: Session) -> None:
+    _lock(db)
+    row = db.get(RuntimeSettings, 1)
+    if row and row.operation_status in BUSY:
+        raise ApiError("storage_moving", "Hay un traslado pendiente. Revisa Configuración.", 409)
 
 
 def guard_storage_write(request: Request, db: Session = Depends(get_db)) -> None:
     if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
-        _lock(db)
-        row = db.get(RuntimeSettings, 1)
-        if row and row.operation_status in BUSY:
-            raise ApiError("storage_moving", "Hay un traslado pendiente. Revisa Configuración.", 409)
+        require_storage_available(db)
 
 
 def _require_idle(db: Session) -> None:
@@ -122,6 +129,7 @@ def _enqueue(db: Session, row: RuntimeSettings) -> None:
         queue.enqueue("app.services.runtime_settings.run_settings_move", row.operation_id,
                       job_timeout=86400)
     except Exception as exc:
+        _lock(db)
         row.operation_status = "failed"
         row.operation_error = "No se pudo encolar el traslado. Revisa Redis y reintenta."
         db.commit()
@@ -266,6 +274,7 @@ def run_settings_move(operation_id: str) -> None:
         except BlockingIOError:
             return
         with database.SessionLocal() as db:
+            _lock(db)
             row = db.get(RuntimeSettings, 1)
             if not row or row.operation_id != operation_id or row.operation_status == "completed":
                 return
@@ -277,7 +286,7 @@ def run_settings_move(operation_id: str) -> None:
                 row.operation_status = "moving"
                 row.operation_error = None
                 db.commit()
-                load_runtime(db)
+                _lock(db)
                 if not pending["committed"]:
                     owned = (target / marker).is_file()
                     validate_destination(str(target), source, owned_marker=marker if owned else None)
@@ -294,7 +303,7 @@ def run_settings_move(operation_id: str) -> None:
                     pending["committed"] = True
                     row.pending_json = json.dumps(pending)
                     db.commit()
-                    load_runtime(db)
+                    _lock(db)
                 # The new files and DB paths are durable before removing any old file.
                 if source.exists():
                     children = sorted(source.rglob("*"), key=lambda p: len(p.parts), reverse=True)
@@ -316,6 +325,7 @@ def run_settings_move(operation_id: str) -> None:
                 db.commit()
             except Exception as exc:
                 db.rollback()
+                _lock(db)
                 row = db.get(RuntimeSettings, 1)
                 row.operation_status = "failed"
                 row.operation_error = str(exc)[:1000]

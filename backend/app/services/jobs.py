@@ -24,6 +24,7 @@ from app.services.dedupe import key_for_payload
 from app.services.files import job_download_root
 from app.services.logs import append_deleted_job_log, append_job_log
 from app.services.paths import chat_path_key, safe_child
+from app.services.runtime_settings import require_storage_available
 
 
 class QueueUnavailableError(RuntimeError):
@@ -66,6 +67,7 @@ def create_job(
     enqueue: bool = True,
     idempotency_key: str | None = None,
 ) -> DownloadJob:
+    require_storage_available(db)
     queue = ensure_queue_available() if enqueue else None
     dedupe_key = key_for_payload(payload, idempotency_key) if enqueue else None
     existing = None
@@ -196,6 +198,8 @@ def cancel_job(db: Session, job: DownloadJob) -> DownloadJob:
 
 
 def retry_job(db: Session, job: DownloadJob, mode: str = "pending") -> DownloadJob:
+    require_storage_available(db)
+    db.refresh(job)
     if mode not in {"pending", "failed"}:
         raise ValueError("mode must be pending or failed")
     if job.status in ACTIVE_STATUSES:
@@ -251,6 +255,8 @@ def retry_job(db: Session, job: DownloadJob, mode: str = "pending") -> DownloadJ
 
 
 def wipe_delete_job(db: Session, job: DownloadJob) -> None:
+    require_storage_available(db)
+    db.refresh(job)
     if not shutil.which("wipe"):
         raise DeleteJobError("wipe no está instalado.")
 

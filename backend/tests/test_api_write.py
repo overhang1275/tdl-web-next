@@ -174,3 +174,19 @@ def test_reset_keeps_session_by_default(api):
     assert response.status_code == 200, response.text
     with sessions() as db:
         assert db.query(DownloadJob).count() == 0
+
+
+@pytest.mark.parametrize('terminal_status', [JobStatus.completed, JobStatus.failed, JobStatus.cancelled])
+def test_completed_job_can_repeat_same_idempotency_key(api, terminal_status):
+    client, sessions, _ = api
+    headers = {**WRITE_HEADERS, 'Idempotency-Key': 'same-key'}
+    first = client.post('/api/v1/jobs', headers=headers, json=create_payload())
+    assert first.status_code == 201, first.text
+    with sessions() as db:
+        job = db.get(DownloadJob, first.json()['id'])
+        job.status = terminal_status
+        db.commit()
+    second = client.post('/api/v1/jobs', headers=headers, json=create_payload())
+    assert second.status_code == 201, second.text
+    assert second.json()['id'] != first.json()['id']
+    assert client.post('/api/v1/jobs', headers=headers, json=create_payload()).status_code == 409
