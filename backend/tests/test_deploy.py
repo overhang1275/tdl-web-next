@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import importlib.util
-import sqlite3
 from pathlib import Path
 
 import pytest
+from sqlalchemy import create_engine, text
 
 SCRIPTS = Path(__file__).resolve().parents[2] / 'scripts'
 
@@ -43,36 +43,40 @@ def test_env_round_trip_preserves_quoted_secret(tmp_path):
     assert config.read_env(output)['CUSTOM_SECRET'] == expected
 
 
-def test_backup_refuses_active_jobs_and_preserves_database(tmp_path):
+def test_backup_refuses_active_jobs_and_preserves_database(tmp_path, admin_databases):
     config = load('configure-env')
     admin = load('data-admin')
     env = tmp_path / '.env'
     config.configure(env, 'example.test', tmp_path / 'missing', tmp_path)
-    values = config.read_env(env)
-    db_path = admin.database_path(values)
-    db_path.parent.mkdir(parents=True)
-    with sqlite3.connect(db_path) as db:
-        db.execute('CREATE TABLE download_jobs (id INTEGER, status TEXT)')
-        db.execute("INSERT INTO download_jobs VALUES (1, 'running')")
+    with env.open('a') as stream:
+        stream.write(f"DATABASE_URL={admin_databases[0]}\n")
+    engine = create_engine(admin_databases[0])
+    with engine.begin() as db:
+        db.execute(text('CREATE TABLE download_jobs (id INTEGER, status TEXT)'))
+        db.execute(text("INSERT INTO download_jobs VALUES (1, 'running')"))
     with pytest.raises(RuntimeError, match='activos'):
         admin.backup(env)
-    with sqlite3.connect(db_path) as db:
-        db.execute("UPDATE download_jobs SET status='completed'")
+    with engine.begin() as db:
+        db.execute(text("UPDATE download_jobs SET status='completed'"))
+    engine.dispose()
     destination = admin.backup(env)
-    with sqlite3.connect(destination / 'database.sqlite3') as db:
-        assert db.execute('SELECT status FROM download_jobs').fetchone()[0] == 'completed'
-    assert db_path.exists()
+    assert (destination / 'database.dump').read_bytes().startswith(b'PGDMP')
     assert (destination / '.env').read_text() == env.read_text()
+    engine = create_engine(admin_databases[0])
+    with engine.connect() as db:
+        assert db.execute(text('SELECT status FROM download_jobs')).scalar_one() == 'completed'
+    engine.dispose()
 
 
-def test_native_update_refuses_download_folder_migration(tmp_path):
+def test_native_update_refuses_download_folder_migration(admin_databases):
     admin = load('data-admin')
-    path = tmp_path / 'state.sqlite3'
-    with sqlite3.connect(path) as db:
-        db.execute('CREATE TABLE runtime_settings (id INTEGER, operation_status TEXT)')
-        db.execute("INSERT INTO runtime_settings VALUES (1, 'moving')")
+    engine = create_engine(admin_databases[0])
+    with engine.begin() as db:
+        db.execute(text('CREATE TABLE runtime_settings (id INTEGER, operation_status TEXT)'))
+        db.execute(text("INSERT INTO runtime_settings VALUES (1, 'moving')"))
+    engine.dispose()
     with pytest.raises(RuntimeError, match='traslado'):
-        admin.require_idle({'DATABASE_URL': f'sqlite:///{path}'})
+        admin.require_idle({'DATABASE_URL': admin_databases[0]})
 
 
 def test_native_configuration_uses_external_oidc_and_no_container_defaults(tmp_path, monkeypatch):
@@ -95,30 +99,39 @@ def test_native_configuration_uses_external_oidc_and_no_container_defaults(tmp_p
     assert 'AUTHENTIK_BOOTSTRAP_PASSWORD' not in values
 
 
-def test_native_backup_uses_protected_destination_and_can_restore_database(tmp_path):
+def test_native_backup_uses_protected_destination_and_can_restore_database(tmp_path, admin_databases):
     config = load('configure-env')
     admin = load('data-admin')
     env = tmp_path / 'app.env'
     config.configure(env, 'example.test', tmp_path / 'missing', tmp_path)
-    db_path = admin.database_path(config.read_env(env))
-    db_path.parent.mkdir()
-    with sqlite3.connect(db_path) as db:
-        db.execute('CREATE TABLE marker (value TEXT)')
-        db.execute("INSERT INTO marker VALUES ('before')")
+    with env.open('a') as stream:
+        stream.write(f"DATABASE_URL={admin_databases[0]}\n")
+    engine = create_engine(admin_databases[0])
+    with engine.begin() as db:
+        db.execute(text('CREATE TABLE marker (value TEXT)'))
+        db.execute(text("INSERT INTO marker VALUES ('before')"))
+    engine.dispose()
     snapshot = admin.backup(env, tmp_path / 'protected-backups')
     assert snapshot.parent == tmp_path / 'protected-backups'
-    with sqlite3.connect(db_path) as db:
-        db.execute("UPDATE marker SET value='after'")
-    admin.restore_database(env, snapshot)
-    with sqlite3.connect(db_path) as db:
-        assert db.execute('SELECT value FROM marker').fetchone()[0] == 'before'
+    engine = create_engine(admin_databases[0])
+    with engine.begin() as db:
+        db.execute(text("UPDATE marker SET value='after'"))
+    engine.dispose()
+    target = tmp_path / 'target.env'
+    target.write_text(env.read_text().replace(admin_databases[0], admin_databases[1]))
+    admin.restore_database(target, snapshot, services_stopped=True)
+    engine = create_engine(admin_databases[1])
+    with engine.connect() as db:
+        assert db.execute(text('SELECT value FROM marker')).scalar_one() == 'before'
+    engine.dispose()
 
 
-def test_native_backup_rejects_pending_deletion(tmp_path):
+def test_native_backup_rejects_pending_deletion(admin_databases):
     admin = load('data-admin')
-    path = tmp_path / 'state.sqlite3'
-    with sqlite3.connect(path) as db:
-        db.execute('CREATE TABLE download_jobs (status TEXT, deletion_requested INTEGER)')
-        db.execute("INSERT INTO download_jobs VALUES ('completed', 1)")
+    engine = create_engine(admin_databases[0])
+    with engine.begin() as db:
+        db.execute(text('CREATE TABLE download_jobs (status TEXT, deletion_requested BOOLEAN)'))
+        db.execute(text("INSERT INTO download_jobs VALUES ('completed', true)"))
+    engine.dispose()
     with pytest.raises(RuntimeError, match='borrados'):
-        admin.require_idle({'DATABASE_URL': f'sqlite:///{path}'})
+        admin.require_idle({'DATABASE_URL': admin_databases[0]})

@@ -63,3 +63,25 @@ def test_engine():
 def db_session(test_engine):
     with Session(test_engine, expire_on_commit=False) as session:
         yield session
+
+
+@pytest.fixture
+def admin_databases(request):
+    """Only create/drop names generated here; never clean the supplied database."""
+    url = make_url(os.environ["TEST_DATABASE_URL"]).set(drivername="postgresql+psycopg")
+    control = create_engine(url, isolation_level="AUTOCOMMIT")
+    names = []
+    try:
+        for index in range(2):
+            name = f"tdl_backup_test_{uuid4().hex}"
+            if index == 1 and getattr(request, "param", None) == "equals":
+                name += "=literal"
+            with control.connect() as connection:
+                connection.execute(text(f'CREATE DATABASE "{name}"'))
+            names.append(name)
+        yield tuple(url.set(database=name).render_as_string(hide_password=False) for name in names)
+    finally:
+        with control.connect() as connection:
+            for name in names:
+                connection.execute(text(f'DROP DATABASE "{name}" WITH (FORCE)'))
+        control.dispose()
