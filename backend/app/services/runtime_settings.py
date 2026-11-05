@@ -10,6 +10,7 @@ from uuid import uuid4
 
 from fastapi import Depends, Request
 from sqlalchemy import or_, select, text
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from app.api.errors import ApiError
@@ -48,7 +49,17 @@ def operation(db: Session) -> dict:
 
 
 def _lock(db: Session) -> None:
-    db.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": _STORAGE_LOCK_KEY})
+    previous_timeout = db.scalar(text("SHOW lock_timeout"))
+    # Bound queued writers; the timeout limits acquisition, not the protected copy.
+    db.execute(text("SET LOCAL lock_timeout = '250ms'"))
+    try:
+        db.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": _STORAGE_LOCK_KEY})
+    except OperationalError as exc:
+        if getattr(exc.orig, "sqlstate", None) != "55P03":
+            raise
+        db.rollback()
+        raise ApiError("storage_busy", "El almacenamiento está ocupado. Reintenta en unos segundos.", 409) from exc
+    db.execute(text("SELECT set_config('lock_timeout', :timeout, true)"), {"timeout": previous_timeout})
     row = db.get(RuntimeSettings, 1)
     # get_db may have cached settings before waiting; preserve nested callers' edits.
     if row is not None and not db.is_modified(row):

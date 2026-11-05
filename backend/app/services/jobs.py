@@ -96,6 +96,13 @@ def create_job(
     )
     db.add(job)
     try:
+        db.flush()
+        chat_key = chat_path_key(job.chat_id)
+        export_dir = safe_child(settings.exports_dir, chat_key)
+        download_dir = safe_child(settings.downloads_dir, chat_key, job.output_subfolder)
+        job.export_json_path = str(export_dir / "export.json")
+        job.filtered_json_path = str(export_dir / f"filtered-job-{job.id}.json")
+        job.download_path = str(download_dir)
         db.commit()
     except IntegrityError as exc:
         db.rollback()
@@ -108,14 +115,6 @@ def create_job(
         if existing is not None:
             raise DuplicateJobError(existing) from exc
         raise
-    db.refresh(job)
-    chat_key = chat_path_key(job.chat_id)
-    export_dir = safe_child(settings.exports_dir, chat_key)
-    download_dir = safe_child(settings.downloads_dir, chat_key, job.output_subfolder)
-    job.export_json_path = str(export_dir / "export.json")
-    job.filtered_json_path = str(export_dir / f"filtered-job-{job.id}.json")
-    job.download_path = str(download_dir)
-    db.commit()
     db.refresh(job)
     if enqueue:
         try:
@@ -218,7 +217,6 @@ def retry_job(db: Session, job: DownloadJob, mode: str = "pending") -> DownloadJ
         DownloadJob.id == job.id,
         DownloadJob.status.in_((JobStatus.failed, JobStatus.cancelled)),
     ).values(status=JobStatus.pending))
-    db.commit()
     db.refresh(job)
     if not claimed.rowcount:
         return job
@@ -237,7 +235,10 @@ def retry_job(db: Session, job: DownloadJob, mode: str = "pending") -> DownloadJ
             reset_pending_files(db, job)
     except Exception as exc:
         db.rollback()
-        job.status, job.stage = JobStatus.failed, JobStage.failed
+        require_storage_available(db)
+        db.refresh(job)
+        if job.status != JobStatus.cancelled:
+            job.status, job.stage = JobStatus.failed, JobStage.failed
         job.error_message = str(exc)
         db.commit()
         raise
