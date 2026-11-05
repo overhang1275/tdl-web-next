@@ -307,3 +307,116 @@ def test_restore_treats_validated_database_name_as_literal(admin_env, admin_data
         assert connection.execute(text("SELECT count(*) FROM alembic_version")).scalar_one() == 1
         assert connection.execute(text("SELECT current_database()")).scalar_one().endswith("=literal")
     target.dispose()
+
+
+@pytest.mark.parametrize("url", [
+    "postgresql+psycopg://tdl_test:tdl_test@/tdl_test",
+    "postgresql+psycopg://postgres:5432/tdl_test",
+    "postgresql+psycopg://tdl_test@postgres:5432/tdl_test",
+])
+def test_admin_refuses_implicit_connection_defaults_before_connecting(monkeypatch, url):
+    admin = load("data-admin")
+
+    def unexpected_connection(*args, **kwargs):
+        pytest.fail("Invalid connection settings reached the engine")
+
+    monkeypatch.setattr(admin, "create_engine", unexpected_connection)
+    with pytest.raises(ValueError, match="DATABASE_URL"):
+        admin.require_idle({"DATABASE_URL": url})
+
+
+@pytest.mark.parametrize("variable", [
+    "PGHOSTADDR", "PGHOST", "PGPORT", "PGSERVICE", "PGSERVICEFILE",
+    "PGDATABASE", "PGUSER", "PGPASSWORD", "PGSSLMODE", "PGOPTIONS",
+    "PGLOADBALANCEHOSTS", "PGTARGETSESSIONATTRS",
+])
+def test_admin_refuses_inherited_libpq_overrides_before_connecting(monkeypatch, variable):
+    admin = load("data-admin")
+    monkeypatch.setenv(variable, "untrusted-override")
+
+    def unexpected_connection(*args, **kwargs):
+        pytest.fail("Inherited libpq settings reached the engine")
+
+    monkeypatch.setattr(admin, "create_engine", unexpected_connection)
+    values = {"DATABASE_URL": "postgresql+psycopg://tdl_test:tdl_test@postgres:5432/tdl_test"}
+    with pytest.raises(ValueError, match="PostgreSQL"):
+        admin.require_idle(values)
+    with pytest.raises(ValueError, match="PostgreSQL"):
+        admin.pg_environment(values)
+
+
+@pytest.mark.parametrize("query", [
+    "host=other", "port=5433", "service=other", "dbname=other",
+    "sslmode=require&sslmode=disable",
+])
+def test_admin_validates_query_parameters_before_connecting(monkeypatch, query):
+    admin = load("data-admin")
+
+    def unexpected_connection(*args, **kwargs):
+        pytest.fail("Unsupported query parameters reached the engine")
+
+    monkeypatch.setattr(admin, "create_engine", unexpected_connection)
+    values = {"DATABASE_URL": f"postgresql+psycopg://tdl_test:tdl_test@postgres:5432/tdl_test?{query}"}
+    with pytest.raises(ValueError, match="PostgreSQL"):
+        admin.require_idle(values)
+
+
+@pytest.mark.parametrize("schema", ["pgdata", "pgx"])
+def test_restore_refuses_existing_schema_with_pg_prefix(admin_env, admin_databases, tmp_path, schema):
+    admin = load("data-admin")
+    engine = migrate(admin_databases[0])
+    engine.dispose()
+    snapshot = admin.backup(admin_env, tmp_path / "backups")
+    target = create_engine(admin_databases[1])
+    with target.begin() as connection:
+        connection.execute(text(f"CREATE SCHEMA {schema}"))
+        connection.execute(text(f"CREATE TABLE {schema}.marker (value text)"))
+        connection.execute(text(f"INSERT INTO {schema}.marker VALUES ('keep')"))
+    target.dispose()
+    with pytest.raises(RuntimeError, match="vac"):
+        admin.restore_database(target_env(admin_env, admin_databases), snapshot, services_stopped=True)
+    target = create_engine(admin_databases[1])
+    with target.connect() as connection:
+        assert connection.execute(text(f"SELECT value FROM {schema}.marker")).scalar_one() == "keep"
+        assert connection.execute(text("SELECT count(*) FROM pg_tables WHERE schemaname='public'")).scalar_one() == 0
+    target.dispose()
+
+
+def test_pg_client_receives_channel_binding_under_libpq_variable(monkeypatch):
+    admin = load("data-admin")
+    run = subprocess.run
+    environments = []
+
+    def record(args, **kwargs):
+        environments.append(kwargs["env"])
+        return run(args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", record)
+    values = {"DATABASE_URL": "postgresql+psycopg://tdl_test:tdl_test@postgres:5432/tdl_test?channel_binding=require"}
+    assert "PostgreSQL" in admin.pg_run("pg_dump", ["--version"], values)
+    assert environments[0].get("PGCHANNELBINDING") == "require"
+    assert "PGCHANNEL_BINDING" not in environments[0]
+
+
+def test_default_port_is_explicit_for_checks_and_client(monkeypatch):
+    admin = load("data-admin")
+    engine_urls, environments = [], []
+    create, run = admin.create_engine, subprocess.run
+
+    def record_engine(url):
+        engine_urls.append(url)
+        return create(url)
+
+    def record_client(args, **kwargs):
+        environments.append(kwargs["env"])
+        return run(args, **kwargs)
+
+    monkeypatch.setattr(admin, "create_engine", record_engine)
+    monkeypatch.setattr(subprocess, "run", record_client)
+    monkeypatch.setenv("PG_PASS", "legacy-authentik-secret")
+    values = {"DATABASE_URL": "postgresql+psycopg://tdl_test:tdl_test@postgres/tdl_test"}
+    admin.require_idle(values)
+    admin.pg_run("pg_dump", ["--version"], values)
+    assert engine_urls[0].port == 5432
+    assert environments[0]["PGPORT"] == "5432"
+    assert "PG_PASS" not in environments[0]

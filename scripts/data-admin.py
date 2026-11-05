@@ -22,13 +22,24 @@ config = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(config)
 
 KEY_FILES = {"JWT_PRIVATE_KEY_FILE": "jwt-private.pem", "JWT_PUBLIC_KEY_FILE": "jwt-public.pem"}
+PG_PARAMETERS = {
+    "sslmode": "PGSSLMODE", "sslrootcert": "PGSSLROOTCERT", "sslcert": "PGSSLCERT",
+    "sslkey": "PGSSLKEY", "channel_binding": "PGCHANNELBINDING",
+    "connect_timeout": "PGCONNECT_TIMEOUT",
+}
 
 
 def database_url(values):
     url = make_url(values["DATABASE_URL"])
-    if url.get_backend_name() != "postgresql" or not url.database:
-        raise ValueError("DATABASE_URL debe nombrar explícitamente una base PostgreSQL")
-    return url.set(drivername="postgresql+psycopg")
+    if (url.get_backend_name() != "postgresql" or not url.database
+            or not url.host or not url.username or not url.password):
+        raise ValueError("DATABASE_URL debe especificar host, usuario, contraseña y base PostgreSQL")
+    # Refuse ambient libpq defaults rather than inspect one server and transfer to another.
+    if any(name.startswith("PG") and name != "PG_PASS" for name in os.environ):
+        raise ValueError("Elimine variables PostgreSQL PG* heredadas; use solo DATABASE_URL")
+    if any(key not in PG_PARAMETERS or not isinstance(value, str) for key, value in url.query.items()):
+        raise ValueError("Parámetro PostgreSQL no admitido para respaldo")
+    return url.set(drivername="postgresql+psycopg", port=url.port or 5432)
 
 
 def require_idle(values: dict[str, str]) -> None:
@@ -56,13 +67,11 @@ def require_idle(values: dict[str, str]) -> None:
 def pg_environment(values):
     url = database_url(values)
     env = {name: os.environ[name] for name in ("PATH", "SYSTEMROOT", "LANG") if name in os.environ}
-    env.update(PGHOST=url.host or "localhost", PGPORT=str(url.port or 5432),
-               PGDATABASE=url.database, PGUSER=url.username or "", PGPASSWORD=url.password or "",
+    env.update(PGHOST=url.host, PGPORT=str(url.port),
+               PGDATABASE=url.database, PGUSER=url.username, PGPASSWORD=url.password,
                PGCONNECT_TIMEOUT="10")
     for key, value in url.query.items():
-        if key not in ("sslmode", "sslrootcert", "sslcert", "sslkey", "channel_binding", "connect_timeout"):
-            raise ValueError("Parámetro PostgreSQL no admitido para respaldo")
-        env["PG" + key.upper()] = value
+        env[PG_PARAMETERS[key]] = value
     return env
 
 
@@ -192,7 +201,7 @@ def restore_database(env_file: Path, directory: Path, *, services_stopped: bool 
             if db.execute(text("SELECT count(*) FROM pg_stat_activity WHERE datname=current_database() AND pid<>pg_backend_pid()")).scalar_one():
                 raise RuntimeError("Hay conexiones activas al destino; detenga todos los servicios")
             if db.execute(text("""SELECT EXISTS (
-                SELECT 1 FROM pg_namespace WHERE nspname NOT LIKE 'pg_%' AND nspname NOT IN ('public','information_schema')
+                SELECT 1 FROM pg_namespace WHERE left(nspname, 3) <> 'pg_' AND nspname NOT IN ('public','information_schema')
                 UNION ALL SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public'
                 UNION ALL SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='public'
                 UNION ALL SELECT 1 FROM pg_type t JOIN pg_namespace n ON n.oid=t.typnamespace WHERE n.nspname='public'
