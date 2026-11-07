@@ -75,6 +75,9 @@ class Settings:
         self.database_url = database_url.set(drivername="postgresql+psycopg").render_as_string(hide_password=False)
         self.redis_url = os.getenv("REDIS_URL", "redis://127.0.0.1:6379/0")
         self.auth_rate_limit_prefix = "tdl:auth:login"
+        self.auth_rotation_prefix = "tdl:auth:rotation"
+        self.jwt_private_key_file = Path(os.getenv("JWT_PRIVATE_KEY_FILE", self.base_dir / "keys" / "jwt-private.pem")).resolve()
+        self.jwt_public_key_file = Path(os.getenv("JWT_PUBLIC_KEY_FILE", self.base_dir / "keys" / "jwt-public.pem")).resolve()
         self.tdl_binary = os.getenv("TDL_BINARY", "tdl")
         self.tdl_namespace = os.getenv("TDL_NAMESPACE", "default")
         self.command_timeout_seconds = int(os.getenv("COMMAND_TIMEOUT_SECONDS", "7200"))

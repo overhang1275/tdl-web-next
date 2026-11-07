@@ -14,6 +14,7 @@ from fastapi.testclient import TestClient
 from app.config import Settings, settings
 from app.main import app
 from app.services import auth
+from test_sessions import session_env
 
 ISSUER = "https://auth.test/application/o/tdl-console"
 AUDIENCE = "tdl-console"
@@ -126,8 +127,10 @@ def authentik_settings(monkeypatch, jwks_server):
 @pytest.fixture
 def api_client(monkeypatch, test_engine):
     from app import database
+    from sqlalchemy.orm import sessionmaker
 
     monkeypatch.setattr(database, "engine", test_engine)
+    monkeypatch.setattr(database, "SessionLocal", sessionmaker(bind=test_engine, expire_on_commit=False))
     from app.services.status import status_service
 
     monkeypatch.setattr("app.main.init_db", lambda: None)
@@ -164,8 +167,8 @@ def _token(rsa_key, *, groups=(GROUP,), audience=AUDIENCE, issuer=ISSUER, expire
         "email": "admin@example.com",
         "name": "Admin",
         "groups": list(groups),
-        "iat": now,
-        "exp": now + timedelta(seconds=expires_in),
+        "iat": int(now.timestamp()),
+        "exp": int((now + timedelta(seconds=expires_in)).timestamp()),
     }
     return jwt.encode(
         claims,
@@ -177,6 +180,18 @@ def _token(rsa_key, *, groups=(GROUP,), audience=AUDIENCE, issuer=ISSUER, expire
 
 def _auth(token: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"}
+
+
+@pytest.fixture
+def native_pair(db_session, session_env):
+    from app.models import User
+    sessions, *_ = session_env
+    user = User(username="admin", display_name="Admin")
+    db_session.add(user)
+    db_session.flush()
+    pair = sessions.issue_session(db_session, user)
+    db_session.commit()
+    return pair
 
 
 def test_health_is_public(api_client):
@@ -204,40 +219,59 @@ def test_status_requires_bearer(api_client):
     assert response.json()["error"]["code"] == "unauthorized"
 
 
-def test_valid_authentik_token_is_accepted(api_client, rsa_key):
+def test_valid_authentik_token_is_not_accepted_by_api(api_client, rsa_key, session_env):
     response = api_client.get("/api/v1/status", headers=_auth(_token(rsa_key)))
+    assert response.status_code == 401
+
+
+def test_native_session_is_accepted(api_client, native_pair):
+    response = api_client.get("/api/v1/status", headers=_auth(native_pair.access_token))
     assert response.status_code == 200
     assert response.json()["authentik_configured"] is True
 
 
-def test_missing_group_is_forbidden(api_client, rsa_key):
-    response = api_client.get("/api/v1/status", headers=_auth(_token(rsa_key, groups=())))
-    assert response.status_code == 403
-    assert response.json()["error"]["code"] == "forbidden"
-
-
-def test_expired_token_is_rejected(api_client, rsa_key):
-    response = api_client.get(
-        "/api/v1/status", headers=_auth(_token(rsa_key, expires_in=-10))
-    )
+@pytest.mark.parametrize("mutation,code", [("issuer", "invalid_issuer"), ("audience", "invalid_audience"), ("expired", "token_expired"), ("algorithm", "invalid_session")])
+def test_native_api_rejects_invalid_jwt(api_client, native_pair, session_env, mutation, code):
+    _, clock, key, _ = session_env
+    claims = jwt.decode(native_pair.access_token, options={"verify_signature": False})
+    if mutation == "issuer": claims["iss"] = "other"
+    if mutation == "audience": claims["aud"] = "other"
+    if mutation == "expired": claims["exp"] = int(clock[0].timestamp())
+    token = jwt.encode(claims, "an-untrusted-key" * 4 if mutation == "algorithm" else key, algorithm="HS256" if mutation == "algorithm" else "RS256")
+    response = api_client.get("/api/v1/status", headers=_auth(token))
     assert response.status_code == 401
-    assert response.json()["error"]["code"] == "token_expired"
+    assert response.json()["error"]["code"] == code
 
 
-def test_wrong_audience_is_rejected(api_client, rsa_key):
-    response = api_client.get(
-        "/api/v1/status", headers=_auth(_token(rsa_key, audience="other"))
-    )
-    assert response.status_code == 401
-    assert response.json()["error"]["code"] == "invalid_audience"
+def test_missing_oidc_group_is_forbidden(rsa_key):
+    with pytest.raises(auth.AuthError) as error:
+        auth.verify_authentik_token(_token(rsa_key, groups=()))
+    assert error.value.status_code == 403
+    assert error.value.code == "forbidden"
 
 
-def test_wrong_issuer_is_rejected(api_client, rsa_key):
-    response = api_client.get(
-        "/api/v1/status", headers=_auth(_token(rsa_key, issuer="https://other.test/"))
-    )
-    assert response.status_code == 401
-    assert response.json()["error"]["code"] == "invalid_issuer"
+def test_expired_oidc_token_is_rejected(rsa_key):
+    with pytest.raises(auth.AuthError) as error:
+        auth.verify_authentik_token(_token(rsa_key, expires_in=-10))
+    assert error.value.code == "token_expired"
+
+
+def test_wrong_oidc_audience_is_rejected(rsa_key):
+    with pytest.raises(auth.AuthError) as error:
+        auth.verify_authentik_token(_token(rsa_key, audience="other"))
+    assert error.value.code == "invalid_audience"
+
+
+def test_wrong_oidc_issuer_is_rejected(rsa_key):
+    with pytest.raises(auth.AuthError) as error:
+        auth.verify_authentik_token(_token(rsa_key, issuer="https://other.test/"))
+    assert error.value.code == "invalid_issuer"
+
+
+def test_valid_oidc_identity_still_verified(rsa_key):
+    claims = auth.verify_authentik_token(_token(rsa_key))
+    assert claims["sub"] == "user-123"
+    assert claims["groups"] == [GROUP]
 
 
 def test_write_without_csrf_header_is_rejected(api_client):
@@ -256,13 +290,14 @@ def test_cross_origin_write_is_rejected(api_client):
     assert response.json()["error"]["code"] == "cross_origin_blocked"
 
 
-def test_me_returns_validated_identity(api_client, rsa_key):
-    response = api_client.get("/api/v1/auth/me", headers=_auth(_token(rsa_key)))
+def test_me_returns_validated_identity(api_client, native_pair):
+    response = api_client.get("/api/v1/auth/me", headers=_auth(native_pair.access_token))
     assert response.status_code == 200
     body = response.json()
     assert body["username"] == "admin"
-    assert body["email"] == "admin@example.com"
-    assert body["groups"] == [GROUP]
+    assert body["id"] == str(native_pair.user.id)
+    assert body["name"] == "Admin"
+    assert body["groups"] == []
 
 
 @pytest.mark.parametrize("path", ["/health", "/api/v1/health"])
