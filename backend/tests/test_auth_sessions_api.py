@@ -102,12 +102,12 @@ def test_login_origin_cannot_be_overridden(client):
     assert PASSWORD not in response.text
 
 
-def test_missing_csrf_and_no_public_registration_or_exchange(client):
+def test_missing_csrf_and_no_public_registration(client):
     client.headers.pop("X-Requested-With")
     assert client.post("/api/v1/auth/token", json={"username": "admin", "password": PASSWORD}).status_code == 403
     client.headers["X-Requested-With"] = "tdl-web"
-    for path in ("register", "exchange"):
-        assert client.post(f"/api/v1/auth/{path}", json={}).status_code == 404
+    assert client.post("/api/v1/auth/register", json={}).status_code == 404
+    assert client.post("/api/v1/auth/exchange", json={}).status_code == 422
 
 
 def test_redis_write_failure_is_transient_and_rolls_back_api_transaction(client, session_env, test_engine, monkeypatch):

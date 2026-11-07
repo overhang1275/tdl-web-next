@@ -23,7 +23,10 @@ _jwks_url: str | None = None
 
 
 def configured() -> bool:
-    return bool(settings.authentik_issuer and settings.authentik_audience)
+    return settings.authentik_enabled and all((
+        settings.authentik_issuer, settings.authentik_audience,
+        settings.authentik_jwks_url, settings.authentik_admin_group,
+    ))
 
 
 def _client() -> PyJWKClient:
@@ -44,6 +47,8 @@ def _client() -> PyJWKClient:
 def verify_authentik_token(token: str) -> dict:
     if not configured():
         raise AuthError("auth_not_configured", "Authentik no está configurado.", 503)
+    if not isinstance(token, str) or not token or len(token) > 16384:
+        raise AuthError("invalid_token", "Token inválido.")
     try:
         signing_key = _client().get_signing_key_from_jwt(token).key
         payload = jwt.decode(
@@ -62,8 +67,13 @@ def verify_authentik_token(token: str) -> dict:
         raise AuthError("invalid_issuer", "Token inválido.") from exc
     except (PyJWKClientError, jwt.PyJWTError) as exc:
         raise AuthError("invalid_token", "Token inválido.") from exc
-    if settings.authentik_admin_group:
-        groups = payload.get("groups") or []
-        if settings.authentik_admin_group not in groups:
-            raise AuthError("forbidden", "No tienes acceso a esta aplicación.", 403)
+    if not isinstance(payload["sub"], str) or not 1 <= len(payload["sub"]) <= 255 or "\x00" in payload["sub"]:
+        raise AuthError("invalid_token", "Token inválido.")
+    groups = payload.get("groups")
+    if (
+        not isinstance(groups, list)
+        or any(not isinstance(group, str) for group in groups)
+        or settings.authentik_admin_group not in groups
+    ):
+        raise AuthError("forbidden", "No tienes acceso a esta aplicación.", 403)
     return payload

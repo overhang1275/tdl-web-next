@@ -3,7 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import threading
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import jwt
@@ -46,6 +46,8 @@ def test_config_accepts_postgresql_and_preserves_production_oidc(monkeypatch, sc
     monkeypatch.setenv("DATABASE_URL", f"{scheme}://user:secret@host/tdl")
     monkeypatch.setenv("AUTHENTIK_ISSUER", ISSUER)
     monkeypatch.setenv("AUTHENTIK_AUDIENCE", AUDIENCE)
+    monkeypatch.setenv("AUTHENTIK_ENABLED", "true")
+    monkeypatch.setenv("AUTHENTIK_ADMIN_GROUP", GROUP)
     config = Settings()
     config.validate()
     assert config.database_url == "postgresql+psycopg://user:secret@host/tdl"
@@ -115,6 +117,7 @@ def jwks_server(rsa_key):
 
 @pytest.fixture(autouse=True)
 def authentik_settings(monkeypatch, jwks_server):
+    monkeypatch.setattr(settings, "authentik_enabled", True)
     monkeypatch.setattr(settings, "environment", "test")
     monkeypatch.setattr(settings, "authentik_issuer", ISSUER)
     monkeypatch.setattr(settings, "authentik_audience", AUDIENCE)
@@ -158,7 +161,8 @@ def api_client(monkeypatch, test_engine):
 
 
 def _token(rsa_key, *, groups=(GROUP,), audience=AUDIENCE, issuer=ISSUER, expires_in=300):
-    now = datetime.now(UTC)
+    # Share session_env's controlled JWT clock instead of wall-clock fixture delays.
+    now = jwt.api_jwt.datetime.now(UTC)
     claims = {
         "iss": issuer,
         "aud": audience,

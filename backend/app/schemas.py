@@ -98,6 +98,12 @@ class RefreshRequest(BaseModel):
     refresh_token: str = Field(min_length=1, max_length=4096, repr=False)
 
 
+class ExchangeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    access_token: str = Field(min_length=1, max_length=16384, repr=False)
+
+
 class StatusRead(BaseModel):
     environment: str
     version: str

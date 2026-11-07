@@ -8,9 +8,10 @@ from sqlalchemy.orm import Session
 from app.api.deps import get_current_user
 from app.api.errors import ApiError
 from app.database import get_db
-from app.schemas import LocalLoginRequest, RefreshRequest, TokenPair, UserRead
+from app.schemas import ExchangeRequest, LocalLoginRequest, RefreshRequest, TokenPair, UserRead
 from app.services.accounts import verify_credentials
 from app.services.auth import AuthError
+from app.services.oidc import exchange_authentik
 from app.services.sessions import (
     RefreshReplay,
     issue_session,
@@ -62,6 +63,12 @@ def token(body: LocalLoginRequest, response: Response, db: Session = Depends(get
 def refresh(body: RefreshRequest, response: Response, db: Session = Depends(get_db)) -> TokenPair:
     response.headers["Cache-Control"] = "no-store"
     return _transaction(db, lambda: rotate_session(db, body.refresh_token))
+
+
+@router.post("/exchange", response_model=TokenPair)
+def exchange(body: ExchangeRequest, response: Response, db: Session = Depends(get_db)) -> TokenPair:
+    response.headers["Cache-Control"] = "no-store"
+    return _transaction(db, lambda: exchange_authentik(db, body.access_token))
 
 
 @router.post("/logout", status_code=204)

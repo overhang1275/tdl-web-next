@@ -46,6 +46,7 @@ class Settings:
     tdl_binary: str
     tdl_namespace: str
     command_timeout_seconds: int
+    authentik_enabled: bool
     authentik_issuer: str
     authentik_audience: str
     authentik_jwks_url: str
@@ -86,6 +87,10 @@ class Settings:
             1, int(os.getenv("DOWNLOAD_IDLE_TIMEOUT_SECONDS", "600"))
         )
         self.export_batch_size = max(1, int(os.getenv("EXPORT_BATCH_SIZE", "5000")))
+        authentik_enabled = os.getenv("AUTHENTIK_ENABLED", "false").strip().lower()
+        if authentik_enabled not in {"true", "false"}:
+            raise RuntimeError("AUTHENTIK_ENABLED must be true or false")
+        self.authentik_enabled = authentik_enabled == "true"
         self.authentik_issuer = os.getenv("AUTHENTIK_ISSUER", "").strip()
         self.authentik_audience = os.getenv("AUTHENTIK_AUDIENCE", "").strip()
         self.authentik_jwks_url = os.getenv("AUTHENTIK_JWKS_URL", "").strip()
@@ -98,13 +103,15 @@ class Settings:
         self.enable_docs = _bool("ENABLE_DOCS", self.environment != "production")
 
     def validate(self) -> None:
-        if self.environment != "production":
+        if not self.authentik_enabled:
             return
-        if not self.authentik_issuer or not self.authentik_audience or not self.authentik_jwks_url:
+        if not all((self.authentik_issuer, self.authentik_audience, self.authentik_jwks_url, self.authentik_admin_group)):
             raise RuntimeError(
-                "AUTHENTIK_ISSUER, AUTHENTIK_AUDIENCE and AUTHENTIK_JWKS_URL are required "
-                "in production"
+                "AUTHENTIK_ISSUER, AUTHENTIK_AUDIENCE, AUTHENTIK_JWKS_URL and "
+                "AUTHENTIK_ADMIN_GROUP are required when AUTHENTIK_ENABLED=true"
             )
+        if len(self.authentik_issuer) > 2048:
+            raise RuntimeError("AUTHENTIK_ISSUER must be at most 2048 characters")
 
     def ensure_directories(self) -> None:
         for path in (
