@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import date, datetime
 from typing import Literal
+from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -108,6 +109,16 @@ class ErrorResponse(BaseModel):
 
 class ORMModel(BaseModel):
     model_config = ConfigDict(from_attributes=True)
+
+
+class LocalUserRead(ORMModel):
+    id: UUID
+    username: str
+    display_name: str | None
+    active: bool
+    must_change_password: bool
+    created_at: datetime
+    updated_at: datetime
 
 
 class JobRead(BaseModel):

@@ -84,9 +84,10 @@ def test_migrations_from_empty_and_second_upgrade_are_safe():
             connection.execute(text("INSERT INTO runtime_settings (id, values_json, operation_status) VALUES (7, '{}', 'idle')"))
             command.upgrade(config, "head")
             assert connection.scalar(text("SELECT id FROM runtime_settings")) == 7
-            assert connection.scalar(text("SELECT version_num FROM alembic_version")) == "0001_application"
+            assert connection.scalar(text("SELECT version_num FROM alembic_version")) == "0002_identity"
             assert set(inspect(connection).get_table_names()) == {
-                "alembic_version", "download_jobs", "download_files", "download_templates", "runtime_settings"
+                "alembic_version", "download_jobs", "download_files", "download_templates", "runtime_settings",
+                "users", "external_identities", "auth_sessions", "audit_events",
             }
             command.check(config)
             command.downgrade(config, "base")
@@ -96,7 +97,7 @@ def test_migrations_from_empty_and_second_upgrade_are_safe():
             command.check(config)
 
 
-@pytest.mark.parametrize("revision", [None, "old_revision", "future_revision"])
+@pytest.mark.parametrize("revision", [None, "0001_application", "old_revision", "future_revision"])
 def test_startup_rejects_old_schema(monkeypatch, revision):
     from conftest import isolated_test_engine
 

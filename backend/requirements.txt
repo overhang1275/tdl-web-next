@@ -7,3 +7,4 @@ pydantic==2.13.4
 redis==5.2.1
 rq==2.0.0
 PyJWT[crypto]==2.15.1
+argon2-cffi==25.1.0
