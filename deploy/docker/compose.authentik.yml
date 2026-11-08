@@ -1,0 +1,67 @@
+# Optional hosted provider: add -f deploy/docker/compose.authentik.yml.
+x-authentik-env: &authentik-env
+  AUTHENTIK_POSTGRESQL__HOST: postgres
+  AUTHENTIK_POSTGRESQL__NAME: authentik
+  AUTHENTIK_POSTGRESQL__USER: authentik
+  AUTHENTIK_POSTGRESQL__PASSWORD: ${PG_PASS:?Set PG_PASS}
+  AUTHENTIK_SECRET_KEY: ${AUTHENTIK_SECRET_KEY:?Set AUTHENTIK_SECRET_KEY}
+  AUTHENTIK_BOOTSTRAP_PASSWORD: ${AUTHENTIK_BOOTSTRAP_PASSWORD:?Set AUTHENTIK_BOOTSTRAP_PASSWORD}
+  AUTHENTIK_BOOTSTRAP_EMAIL: ${AUTHENTIK_BOOTSTRAP_EMAIL:-admin@example.test}
+  AUTHENTIK_CLIENT_ID: ${AUTHENTIK_CLIENT_ID:?Set AUTHENTIK_CLIENT_ID}
+  AUTHENTIK_CLIENT_SECRET: ${AUTHENTIK_CLIENT_SECRET:?Set AUTHENTIK_CLIENT_SECRET}
+  AUTH_URL: ${AUTH_URL:?Set AUTH_URL}
+  AUTHENTIK_ERROR_REPORTING__ENABLED: 'false'
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: authentik
+      POSTGRES_USER: authentik
+      POSTGRES_PASSWORD: ${PG_PASS:?Set PG_PASS}
+    volumes: [postgres-data:/var/lib/postgresql/data]
+    networks: [services]
+    healthcheck:
+      test: [CMD-SHELL, 'pg_isready -U authentik -d authentik']
+      interval: 10s
+      timeout: 5s
+      retries: 20
+    mem_limit: 768m
+  authentik-server:
+    image: ghcr.io/goauthentik/server:2026.8.5
+    command: server
+    restart: unless-stopped
+    environment: *authentik-env
+    volumes: [authentik-data:/data]
+    networks: [services, edge]
+    depends_on:
+      postgres: {condition: service_healthy}
+    healthcheck:
+      test: [CMD, ak, healthcheck]
+      interval: 15s
+      timeout: 10s
+      start_period: 90s
+      retries: 20
+    mem_limit: 1536m
+    shm_size: 256mb
+  authentik-worker:
+    image: ghcr.io/goauthentik/server:2026.8.5
+    command: worker
+    restart: unless-stopped
+    environment: *authentik-env
+    volumes:
+      - authentik-data:/data
+      - ../authentik:/blueprints/custom:ro
+    networks: [services, edge]
+    depends_on:
+      authentik-server: {condition: service_healthy}
+    mem_limit: 1536m
+    shm_size: 256mb
+  nginx:
+    volumes:
+      - ../nginx/tdl-authentik.conf.template:/etc/nginx/templates/authentik.conf.template:ro
+
+volumes:
+  postgres-data:
+  authentik-data:

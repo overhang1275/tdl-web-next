@@ -14,7 +14,7 @@ def main() -> None:
     init_db()
     reconcile_deletions()
     connection = Redis.from_url(settings.redis_url)
-    worker = Worker([Queue("telegram-downloads", connection=connection)], connection=connection)
+    worker = Worker([Queue(settings.rq_queue_name, connection=connection)], connection=connection)
     worker.work(with_scheduler=True)
 
 

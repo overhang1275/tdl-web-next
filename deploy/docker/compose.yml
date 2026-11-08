@@ -21,18 +21,21 @@ x-api: &api
     DOWNLOADS_DIR: ${DOWNLOADS_DIR:-/opt/tld-web/data/downloads}
     DOWNLOADS_ALLOWED_ROOTS: ${DOWNLOADS_ALLOWED_ROOTS:-}
     LOGS_DIR: ${LOGS_DIR:-/opt/tld-web/data/logs}
-    DATABASE_URL: ${DATABASE_URL:-sqlite:////opt/tld-web/data/telegram_downloader.sqlite3}
-    DATABASE_DIR: ${DATABASE_DIR:-${DATA_DIR:-/opt/tld-web/data}}
+    DATABASE_URL: postgresql+psycopg://tdl:${TDL_POSTGRES_PASSWORD:?Set TDL_POSTGRES_PASSWORD}@tdl-postgres:5432/tdl
     REDIS_URL: redis://redis:6379/1
+    RQ_QUEUE_NAME: ${RQ_QUEUE_NAME:?Set RQ_QUEUE_NAME}
+    JWT_PRIVATE_KEY_FILE: /run/tdl/jwt-private.pem
+    JWT_PUBLIC_KEY_FILE: /run/tdl/jwt-public.pem
     TDL_BINARY: /usr/local/bin/tdl
     TDL_NAMESPACE: ${TDL_NAMESPACE:-default}
     COMMAND_TIMEOUT_SECONDS: ${COMMAND_TIMEOUT_SECONDS:-7200}
     DOWNLOAD_BATCH_SIZE: ${DOWNLOAD_BATCH_SIZE:-100}
     DOWNLOAD_IDLE_TIMEOUT_SECONDS: ${DOWNLOAD_IDLE_TIMEOUT_SECONDS:-600}
     EXPORT_BATCH_SIZE: ${EXPORT_BATCH_SIZE:-5000}
-    AUTHENTIK_ISSUER: ${AUTHENTIK_ISSUER:?Set AUTHENTIK_ISSUER}
-    AUTHENTIK_AUDIENCE: ${AUTHENTIK_CLIENT_ID:?Set AUTHENTIK_CLIENT_ID}
-    AUTHENTIK_JWKS_URL: ${AUTHENTIK_JWKS_URL:?Set AUTHENTIK_JWKS_URL}
+    AUTHENTIK_ENABLED: ${AUTHENTIK_ENABLED:-false}
+    AUTHENTIK_ISSUER: ${AUTHENTIK_ISSUER:-}
+    AUTHENTIK_AUDIENCE: ${AUTHENTIK_CLIENT_ID:-}
+    AUTHENTIK_JWKS_URL: ${AUTHENTIK_JWKS_URL:-}
     AUTHENTIK_ADMIN_GROUP: tdl-admin
     TRUSTED_HOSTS: api,localhost,127.0.0.1
     SSL_CERT_FILE: /etc/tdl/fullchain.pem
@@ -42,36 +45,27 @@ x-api: &api
     - ${TDL_SESSIONS_DIR:-/opt/tld-web/data/sessions}:${TDL_SESSIONS_DIR:-/opt/tld-web/data/sessions}
     - ${EXPORTS_DIR:-/opt/tld-web/data/exports}:${EXPORTS_DIR:-/opt/tld-web/data/exports}
     - ${LOGS_DIR:-/opt/tld-web/data/logs}:${LOGS_DIR:-/opt/tld-web/data/logs}
-    - ${DATABASE_DIR:-${DATA_DIR:-/opt/tld-web/data}}:${DATABASE_DIR:-${DATA_DIR:-/opt/tld-web/data}}
+    - ${JWT_PRIVATE_KEY_FILE:?Set JWT_PRIVATE_KEY_FILE}:/run/tdl/jwt-private.pem:ro
+    - ${JWT_PUBLIC_KEY_FILE:?Set JWT_PUBLIC_KEY_FILE}:/run/tdl/jwt-public.pem:ro
     - ${TLS_DIR:-/etc/telegram-downloader/certs}/fullchain.pem:/etc/tdl/fullchain.pem:ro
   networks: [services, edge]
   mem_limit: 1g
 
-x-authentik-env: &authentik-env
-  AUTHENTIK_POSTGRESQL__HOST: postgres
-  AUTHENTIK_POSTGRESQL__NAME: authentik
-  AUTHENTIK_POSTGRESQL__USER: authentik
-  AUTHENTIK_POSTGRESQL__PASSWORD: ${PG_PASS:?Set PG_PASS}
-  AUTHENTIK_SECRET_KEY: ${AUTHENTIK_SECRET_KEY:?Set AUTHENTIK_SECRET_KEY}
-  AUTHENTIK_BOOTSTRAP_PASSWORD: ${AUTHENTIK_BOOTSTRAP_PASSWORD:?Set AUTHENTIK_BOOTSTRAP_PASSWORD}
-  AUTHENTIK_BOOTSTRAP_EMAIL: ${AUTHENTIK_BOOTSTRAP_EMAIL:-admin@example.test}
-  AUTHENTIK_CLIENT_ID: ${AUTHENTIK_CLIENT_ID:?Set AUTHENTIK_CLIENT_ID}
-  AUTHENTIK_CLIENT_SECRET: ${AUTHENTIK_CLIENT_SECRET:?Set AUTHENTIK_CLIENT_SECRET}
-  AUTH_URL: ${AUTH_URL:?Set AUTH_URL}
-  AUTHENTIK_ERROR_REPORTING__ENABLED: 'false'
-
 services:
-  postgres:
-    image: postgres:16-alpine
+  tdl-postgres:
+    image: postgres:16.15-alpine
     restart: unless-stopped
     environment:
-      POSTGRES_DB: authentik
-      POSTGRES_USER: authentik
-      POSTGRES_PASSWORD: ${PG_PASS:?Set PG_PASS}
-    volumes: [postgres-data:/var/lib/postgresql/data]
+      POSTGRES_DB: postgres
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${TDL_POSTGRES_ADMIN_PASSWORD:?Set TDL_POSTGRES_ADMIN_PASSWORD}
+      TDL_POSTGRES_PASSWORD: ${TDL_POSTGRES_PASSWORD:?Set TDL_POSTGRES_PASSWORD}
+    volumes:
+      - tdl-postgres-data:/var/lib/postgresql/data
+      - ./init-tdl-postgres.sh:/docker-entrypoint-initdb.d/10-tdl.sh:ro
     networks: [services]
     healthcheck:
-      test: [CMD-SHELL, 'pg_isready -U authentik -d authentik']
+      test: [CMD-SHELL, 'pg_isready -U tdl -d tdl']
       interval: 10s
       timeout: 5s
       retries: 20
@@ -88,40 +82,29 @@ services:
       timeout: 5s
       retries: 10
     mem_limit: 256m
-  authentik-server:
-    image: ghcr.io/goauthentik/server:2026.8.5
-    command: server
-    restart: unless-stopped
-    environment: *authentik-env
-    volumes: [authentik-data:/data]
-    networks: [services, edge]
+  migrate:
+    <<: *api
+    command: [alembic, upgrade, head]
+    restart: "no"
+    volumes: []
     depends_on:
-      postgres: {condition: service_healthy}
-    healthcheck:
-      test: [CMD, ak, healthcheck]
-      interval: 15s
-      timeout: 10s
-      start_period: 90s
-      retries: 20
-    mem_limit: 1536m
-    shm_size: 256mb
-  authentik-worker:
-    image: ghcr.io/goauthentik/server:2026.8.5
-    command: worker
-    restart: unless-stopped
-    environment: *authentik-env
+      tdl-postgres: {condition: service_healthy}
+    healthcheck: {disable: true}
+  bootstrap:
+    <<: *api
+    user: "0:0"
+    command: [python, -m, app.admin, create-admin, --username, "${ADMIN_USERNAME:-admin}", --password-file, /run/tdl/admin-password, --docker-maintenance]
+    restart: "no"
     volumes:
-      - authentik-data:/data
-      - ../authentik:/blueprints/custom:ro
-    networks: [services, edge]
+      - ${ADMIN_PASSWORD_FILE:?Set ADMIN_PASSWORD_FILE}:/run/tdl/admin-password:ro
     depends_on:
-      authentik-server: {condition: service_healthy}
-    mem_limit: 1536m
-    shm_size: 256mb
+      migrate: {condition: service_completed_successfully}
+    healthcheck: {disable: true}
   api:
     <<: *api
     depends_on:
       redis: {condition: service_healthy}
+      migrate: {condition: service_completed_successfully}
     mem_limit: 512m
   worker:
     <<: *api
@@ -140,9 +123,10 @@ services:
     environment:
       AUTH_SECRET: ${AUTH_SECRET:?Set AUTH_SECRET}
       AUTH_URL: ${AUTH_URL:?Set AUTH_URL}
-      AUTHENTIK_ISSUER: ${AUTHENTIK_ISSUER:?Set AUTHENTIK_ISSUER}
-      AUTHENTIK_CLIENT_ID: ${AUTHENTIK_CLIENT_ID:?Set AUTHENTIK_CLIENT_ID}
-      AUTHENTIK_CLIENT_SECRET: ${AUTHENTIK_CLIENT_SECRET:?Set AUTHENTIK_CLIENT_SECRET}
+      AUTHENTIK_ENABLED: ${AUTHENTIK_ENABLED:-false}
+      AUTHENTIK_ISSUER: ${AUTHENTIK_ISSUER:-}
+      AUTHENTIK_CLIENT_ID: ${AUTHENTIK_CLIENT_ID:-}
+      AUTHENTIK_CLIENT_SECRET: ${AUTHENTIK_CLIENT_SECRET:-}
       AUTHENTIK_ADMIN_GROUP: tdl-admin
       API_INTERNAL_URL: http://api:8000
       NODE_EXTRA_CA_CERTS: /etc/tdl/fullchain.pem
@@ -151,6 +135,7 @@ services:
     networks: [services, edge]
     depends_on:
       api: {condition: service_healthy}
+      bootstrap: {condition: service_completed_successfully}
     mem_limit: 512m
   nginx:
     image: nginx:1.28-alpine
@@ -170,7 +155,6 @@ services:
         aliases: ['app.${DOMAIN}', 'auth.${DOMAIN}']
     depends_on:
       web: {condition: service_healthy}
-      authentik-server: {condition: service_healthy}
     healthcheck:
       test: [CMD, nginx, -t]
       interval: 15s
@@ -179,9 +163,8 @@ services:
     mem_limit: 128m
 
 volumes:
-  postgres-data:
+  tdl-postgres-data:
   redis-data:
-  authentik-data:
 networks:
   services: {internal: true}
   edge:

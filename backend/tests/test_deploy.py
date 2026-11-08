@@ -7,6 +7,68 @@ import pytest
 from sqlalchemy import create_engine, text
 
 SCRIPTS = Path(__file__).resolve().parents[2] / 'scripts'
+DEPLOY = SCRIPTS.parent / 'deploy'
+
+
+def test_compose_without_authentik_needs_no_oidc_secrets():
+    basic = (DEPLOY / 'docker/compose.yml').read_text()
+    assert 'AUTHENTIK_ENABLED: ${AUTHENTIK_ENABLED:-false}' in basic
+    assert '${AUTHENTIK_ISSUER:?' not in basic
+    assert '${AUTHENTIK_CLIENT_SECRET:?' not in basic
+    assert '${PG_PASS' not in basic
+    assert 'authentik-server:' not in basic
+    assert 'authentik-server' not in (DEPLOY / 'nginx/tdl-web.conf.template').read_text()
+
+
+def test_tdl_postgres_does_not_reuse_authentik_volume():
+    basic = (DEPLOY / 'docker/compose.yml').read_text()
+    hosted = (DEPLOY / 'docker/compose.authentik.yml').read_text()
+    assert '- tdl-postgres-data:/var/lib/postgresql/data' in basic
+    assert 'volumes: [postgres-data:/var/lib/postgresql/data]' in hosted
+    assert 'POSTGRES_USER: postgres' in basic
+    assert 'POSTGRES_USER: authentik' in hosted
+
+
+def test_postgres_initializer_limits_application_role():
+    initializer = (DEPLOY / 'docker/init-tdl-postgres.sh').read_text()
+    assert "<<'SQL'" in initializer
+    assert r'\getenv tdl_password TDL_POSTGRES_PASSWORD' in initializer
+    assert "PASSWORD :'tdl_password'" in initializer
+    assert 'NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION' in initializer
+    assert 'CREATE DATABASE tdl OWNER tdl' in initializer
+
+
+def test_api_waits_for_migration():
+    basic = (DEPLOY / 'docker/compose.yml').read_text()
+    api = basic.split('\n  api:\n')[1].split('\n  worker:')[0]
+    web = basic.split('\n  web:\n')[1].split('\n  nginx:')[0]
+    assert 'migrate: {condition: service_completed_successfully}' in api
+    assert 'bootstrap: {condition: service_completed_successfully}' in web
+    bootstrap = basic.split('\n  bootstrap:\n')[1].split('\n  api:')[0]
+    assert 'user: "0:0"' in bootstrap
+    assert '--docker-maintenance' in bootstrap
+    assert '--password-file' in bootstrap
+    assert 'jwt-private.pem' not in web
+
+
+def test_postgres_port_not_published():
+    basic = (DEPLOY / 'docker/compose.yml').read_text()
+    postgres = basic.split('\n  tdl-postgres:\n')[1].split('\n  redis:')[0]
+    assert 'ports:' not in postgres
+    assert 'networks: [services]' in postgres
+
+
+def test_compose_shares_explicit_installation_queue():
+    basic = (DEPLOY / 'docker/compose.yml').read_text()
+    assert 'RQ_QUEUE_NAME: ${RQ_QUEUE_NAME:?Set RQ_QUEUE_NAME}' in basic
+    assert 'telegram-downloads' not in basic
+    assert basic.split('\n  worker:\n')[1].split('\n  web:')[0].count('<<: *api') == 1
+
+
+def test_backend_test_runner_has_an_explicit_queue():
+    compose = (DEPLOY / 'docker/compose.test.yml').read_text()
+    runner = compose.split('\n  backend-tests:\n')[1].split('\n  frontend-tests:')[0]
+    assert 'RQ_QUEUE_NAME: ${RQ_QUEUE_NAME:?Set isolated RQ_QUEUE_NAME}' in runner
 
 
 def load(name):

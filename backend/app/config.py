@@ -74,6 +74,11 @@ class Settings:
                 "postgresql+psycopg://user:password@host/database. SQLite is no longer supported."
             ) from None
         self.database_url = database_url.set(drivername="postgresql+psycopg").render_as_string(hide_password=False)
+        self.rq_queue_name = os.getenv(
+            "RQ_QUEUE_NAME", "" if self.environment == "production" else "telegram-downloads"
+        ).strip()
+        if not self.rq_queue_name:
+            raise RuntimeError("RQ_QUEUE_NAME must not be empty")
         self.redis_url = os.getenv("REDIS_URL", "redis://127.0.0.1:6379/0")
         self.auth_rate_limit_prefix = "tdl:auth:login"
         self.auth_rotation_prefix = "tdl:auth:rotation"

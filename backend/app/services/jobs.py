@@ -49,7 +49,7 @@ ACTIVE_STATUSES = (JobStatus.pending, JobStatus.running)
 
 
 def get_queue() -> Queue:
-    return Queue("telegram-downloads", connection=Redis.from_url(settings.redis_url))
+    return Queue(settings.rq_queue_name, connection=Redis.from_url(settings.redis_url))
 
 
 def ensure_queue_available() -> Queue:
