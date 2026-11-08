@@ -10,6 +10,12 @@ SCRIPTS = Path(__file__).resolve().parents[2] / 'scripts'
 DEPLOY = SCRIPTS.parent / 'deploy'
 
 
+@pytest.fixture(autouse=True)
+def isolated_deployment_environment(monkeypatch):
+    # The test runner database is not the installer target being generated.
+    monkeypatch.delenv('DATABASE_URL', raising=False)
+
+
 def test_compose_without_authentik_needs_no_oidc_secrets():
     basic = (DEPLOY / 'docker/compose.yml').read_text()
     assert 'AUTHENTIK_ENABLED: ${AUTHENTIK_ENABLED:-false}' in basic
@@ -90,7 +96,7 @@ def test_env_keeps_existing_paths_and_secrets(tmp_path, monkeypatch):
     assert config.read_env(output) == first
     assert first['DATA_DIR'] == str(data)
     assert first['DOWNLOADS_DIR'] == '/mnt/telegram'
-    assert first['AUTHENTIK_ISSUER'].endswith('/tdl-console/')
+    assert first['AUTHENTIK_ENABLED'] == 'false'
     assert len(first['AUTH_SECRET']) == 64
 
 
@@ -143,6 +149,7 @@ def test_native_update_refuses_download_folder_migration(admin_databases):
 
 def test_native_configuration_uses_external_oidc_and_no_container_defaults(tmp_path, monkeypatch):
     config = load('configure-env')
+    monkeypatch.setenv('AUTHENTIK_ENABLED', 'true')
     monkeypatch.setenv('AUTHENTIK_ISSUER', 'https://identity.example.test/application/o/tdl/')
     monkeypatch.setenv('AUTHENTIK_CLIENT_ID', 'external-client')
     monkeypatch.setenv('AUTHENTIK_CLIENT_SECRET', 'external-secret')
@@ -161,11 +168,190 @@ def test_native_configuration_uses_external_oidc_and_no_container_defaults(tmp_p
     assert 'AUTHENTIK_BOOTSTRAP_PASSWORD' not in values
 
 
+def test_basic_configuration_generates_private_stable_local_auth(tmp_path):
+    import os
+    import stat
+
+    from cryptography.hazmat.primitives import serialization
+
+    config = load('configure-env')
+    env = tmp_path / 'config' / 'app.env'
+    config.configure(env, 'tdl.example.test', tmp_path / 'missing', tmp_path, 'native')
+    first = config.read_env(env)
+    assert first['AUTH_URL'] == 'https://tdl.example.test'
+    assert first['AUTHENTIK_ENABLED'] == 'false'
+    assert first['DATABASE_URL'].startswith('postgresql+psycopg://')
+    assert first['TDL_POSTGRES_PASSWORD'] != first['TDL_POSTGRES_ADMIN_PASSWORD']
+    assert first['RQ_QUEUE_NAME'].startswith('tdl-')
+    private = Path(first['JWT_PRIVATE_KEY_FILE'])
+    public = Path(first['JWT_PUBLIC_KEY_FILE'])
+    assert private == tmp_path / 'data' / 'keys' / 'jwt-private.pem'
+    password = Path(first['ADMIN_PASSWORD_FILE'])
+    original = [path.read_bytes() for path in (private, public, password)]
+    key = serialization.load_pem_private_key(original[0], password=None)
+    assert key.key_size >= 2048
+    assert key.public_key().public_numbers() == serialization.load_pem_public_key(original[1]).public_numbers()
+    assert stat.S_IMODE(env.stat().st_mode) == 0o600
+    assert stat.S_IMODE(password.stat().st_mode) == 0o600
+    assert stat.S_IMODE(private.stat().st_mode) == 0o600
+    if os.geteuid() == 0:
+        assert env.stat().st_uid == password.stat().st_uid == 0
+        assert private.stat().st_uid == int(first['APP_UID'])
+        # The native mutable data root belongs to the API after installation.
+        os.chown(tmp_path / 'data', int(first['APP_UID']), int(first['APP_GID']))
+        (tmp_path / 'data').chmod(0o750)
+    config.configure(env, 'tdl.example.test', env, tmp_path, 'native')
+    assert config.read_env(env) == first
+    assert all(path.read_bytes() == before for path, before in zip((private, public, password), original, strict=True))
+
+
+def test_legacy_requires_explicit_fresh(tmp_path):
+    config = load('configure-env')
+    legacy = tmp_path / 'legacy.env'
+    sqlite = tmp_path / 'old.sqlite3'
+    sqlite.write_bytes(b'legacy fixture')
+    legacy.write_text(f'DATABASE_URL=sqlite:///{sqlite}\nAUTHENTIK_CLIENT_SECRET=ignored-legacy\n')
+    output = tmp_path / 'new.env'
+    with pytest.raises(ValueError, match='--fresh'):
+        config.configure(output, 'example.test', legacy, tmp_path, 'native')
+    assert not output.exists()
+    assert not (tmp_path / 'data' / 'keys').exists()
+
+
+def test_legacy_sqlite_file_without_database_url_also_requires_fresh(tmp_path):
+    config = load('configure-env')
+    data = tmp_path / 'data'
+    data.mkdir()
+    sqlite = data / 'telegram_downloader.sqlite3'
+    sqlite.write_bytes(b'legacy SQLite fixture')
+    with pytest.raises(ValueError, match='--fresh'):
+        config.configure(tmp_path / 'app.env', 'example.test', tmp_path / 'missing', tmp_path, 'native')
+    assert sqlite.read_bytes() == b'legacy SQLite fixture'
+
+
+def test_fresh_assigns_new_queue_without_deleting_old_resources(tmp_path):
+    config = load('configure-env')
+    env = tmp_path / 'app.env'
+    data = tmp_path / 'data'
+    data.mkdir()
+    markers = [data / name for name in ('old.sqlite3', 'telegram.session', 'media.bin')]
+    for path in markers:
+        path.write_bytes(b'keep old resources')
+    env.write_text(f'DATA_DIR={data}\nDATABASE_URL=sqlite:///{markers[0]}\nRQ_QUEUE_NAME=legacy-queue\n')
+    config.configure(env, 'example.test', env, tmp_path, 'native', {'FRESH': True})
+    first = config.read_env(env)
+    config.configure(env, 'example.test', env, tmp_path, 'native', {'FRESH': True})
+    second = config.read_env(env)
+    assert first['RQ_QUEUE_NAME'] != second['RQ_QUEUE_NAME'] != 'legacy-queue'
+    assert first['DATABASE_URL'] != second['DATABASE_URL']
+    assert all(path.read_bytes() == b'keep old resources' for path in markers)
+    assert second['AUTHENTIK_ENABLED'] == 'false'
+    docker = tmp_path / 'docker.env'
+    config.configure(docker, 'example.test', tmp_path / 'missing', tmp_path, native_options={'FRESH': True})
+    assert config.read_env(docker)['COMPOSE_PROJECT_NAME'].startswith('tdl-')
+
+
+def test_fresh_rejects_same_database_even_with_different_password(tmp_path):
+    config = load('configure-env')
+    env = tmp_path / 'app.env'
+    env.write_text('DATABASE_URL=postgresql+psycopg://old:before@localhost:5432/existing\n')
+    with pytest.raises(ValueError, match='DATABASE_URL'):
+        config.configure(env, 'example.test', env, tmp_path, 'native',
+                         {'FRESH': True, 'DATABASE_URL': 'postgresql://new:after@LOCALHOST/existing'})
+
+
+def test_optional_provider_is_explicit_and_incomplete_error_does_not_leak(tmp_path, monkeypatch):
+    config = load('configure-env')
+    legacy = tmp_path / 'legacy.env'
+    legacy.write_text('AUTHENTIK_ISSUER=malformed\nAUTHENTIK_CLIENT_SECRET=private-fixture\n')
+    output = tmp_path / 'app.env'
+    config.configure(output, 'example.test', legacy, tmp_path, 'native')
+    assert 'AUTHENTIK_CLIENT_SECRET' not in config.read_env(output)
+    monkeypatch.setenv('AUTHENTIK_ENABLED', 'true')
+    with pytest.raises(ValueError) as error:
+        config.configure(output, 'example.test', output, tmp_path, 'native')
+    assert 'AUTHENTIK_ISSUER' in str(error.value)
+    assert 'private-fixture' not in str(error.value)
+
+
+def test_configuration_rejects_symlink_secret_paths(tmp_path):
+    config = load('configure-env')
+    target = tmp_path / 'target'
+    target.write_text('preserve')
+    linked = tmp_path / 'linked'
+    linked.symlink_to(target)
+    with pytest.raises(ValueError, match='symlink'):
+        config.configure(tmp_path / 'env', 'example.test', tmp_path / 'missing', tmp_path,
+                         'native', {'JWT_PRIVATE_KEY_FILE': str(linked)})
+    assert target.read_text() == 'preserve'
+
+
+def test_missing_private_key_never_silently_rotates_existing_public_key(tmp_path):
+    config = load('configure-env')
+    public = tmp_path / 'keys' / 'jwt-public.pem'
+    public.parent.mkdir()
+    public.write_bytes(b'preserve public key')
+    with pytest.raises(ValueError, match='private key missing'):
+        config.configure(tmp_path / 'app.env', 'example.test', tmp_path / 'missing', tmp_path)
+    assert public.read_bytes() == b'preserve public key'
+
+
+def test_configure_cli_names_missing_provider_fields_without_secret_output(tmp_path):
+    import os
+    import subprocess
+    import sys
+
+    result = subprocess.run([sys.executable, str(SCRIPTS / 'configure-env.py'), '--output', str(tmp_path / 'app.env'),
+                             '--root', str(tmp_path), '--legacy', str(tmp_path / 'missing')],
+                            capture_output=True, text=True, env={**os.environ, 'AUTHENTIK_ENABLED': 'true',
+                            'AUTHENTIK_CLIENT_SECRET': 'never-echo-provider-secret'})
+    assert result.returncode != 0
+    assert 'AUTHENTIK_ISSUER' in result.stderr and 'AUTHENTIK_CLIENT_ID' in result.stderr
+    assert 'never-echo-provider-secret' not in result.stdout + result.stderr
+    assert not (tmp_path / 'keys').exists()
+
+
+def test_weak_existing_signing_key_is_rejected(tmp_path):
+    import subprocess
+
+    config = load('configure-env')
+    private = tmp_path / 'weak.pem'
+    subprocess.run(['openssl', 'genpkey', '-algorithm', 'RSA', '-pkeyopt', 'rsa_keygen_bits:1024',
+                    '-out', str(private)], capture_output=True, check=True)
+    with pytest.raises(ValueError, match='2048'):
+        config.configure(tmp_path / 'app.env', 'example.test', tmp_path / 'missing', tmp_path,
+                         native_options={'JWT_PRIVATE_KEY_FILE': str(private)})
+
+
+def test_key_write_rejects_parent_swapped_to_symlink_after_preflight(tmp_path, monkeypatch):
+    config = load('configure-env')
+    parent = tmp_path / 'keys'
+    parent.mkdir()
+    victim = tmp_path / 'victim'
+    victim.mkdir()
+    target = victim / 'key.pem'
+    target.write_bytes(b'preserve unrelated file')
+    key = parent / 'key.pem'
+    check = config.checked_path
+
+    def swap_after_check(raw):
+        checked = check(raw)
+        parent.rename(tmp_path / 'original-keys')
+        parent.symlink_to(victim, target_is_directory=True)
+        return checked
+
+    monkeypatch.setattr(config, 'checked_path', swap_after_check)
+    with pytest.raises(OSError):
+        config.write_private(key, b'new signing material', 10001, 10001)
+    assert target.read_bytes() == b'preserve unrelated file'
+
+
 def test_native_backup_uses_protected_destination_and_can_restore_database(tmp_path, admin_databases):
     config = load('configure-env')
     admin = load('data-admin')
     env = tmp_path / 'app.env'
     config.configure(env, 'example.test', tmp_path / 'missing', tmp_path)
+    (tmp_path / 'data').mkdir()
     with env.open('a') as stream:
         stream.write(f"DATABASE_URL={admin_databases[0]}\n")
     engine = create_engine(admin_databases[0])

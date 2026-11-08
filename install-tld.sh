@@ -29,6 +29,7 @@ pick_value() {
     local name=$1 fallback=$2 value
     if [[ -v "$name" ]]; then printf '%s' "${!name}"; return; fi
     value="$(env_read "$ENV_FILE" "$name")"
+    [[ -n "$value" || -z "${LEGACY_ENV_FILE:-}" ]] || value="$(env_read "$LEGACY_ENV_FILE" "$name")"
     [[ -n "$value" ]] || value="$(env_read "$INSTALL_CONF" "$name")"
     printf '%s' "${value:-$fallback}"
 }
@@ -65,7 +66,7 @@ discover_files() {
     if [[ ! -v ENV_FILE ]]; then
         ENV_FILE="$CONFIG_DIR/tld-web.env"
         if [[ ! -f "$ENV_FILE" && "$CONFIG_DIR" == /etc/tld-web && -f /etc/telegram-downloader/telegram-downloader.env ]]; then
-            ENV_FILE=/etc/telegram-downloader/telegram-downloader.env
+            LEGACY_ENV_FILE=/etc/telegram-downloader/telegram-downloader.env
         fi
     fi
 }
@@ -126,9 +127,10 @@ collect_options() {
     SERVICES=("$SERVICE_API" "$SERVICE_WORKER" "$SERVICE_WEB")
     if [[ "$APP_HOST" == 0.0.0.0 ]]; then SERVICES=("$SERVICE_NETWORK" "${SERVICES[@]}"); fi
     BACKUPS_DIR="$APP_ROOT/backups"
+    ADMIN_USERNAME="$(pick_value ADMIN_USERNAME admin)"
     export APP_ROOT APP_HOST APP_PORT API_PORT APP_USER INSTALL_REDIS CREATE_USER PUBLIC_URL
     export AUTH_URL APP_REF INSTALL_METHOD SOURCE_REPO SERVICE_WEB SERVICE_API SERVICE_WORKER BACKUPS_DIR REDIS_URL
-    export APP_ALLOWED_SUBNET SERVICE_NETWORK
+    export APP_ALLOWED_SUBNET SERVICE_NETWORK ADMIN_USERNAME
 }
 
 valid_path() { [[ "$1" =~ ^/[A-Za-z0-9_./-]+$ && "$1" != / && "$1" != *'/../'* && "$1" != */.. && "$1" != *'/./'* ]]; }
@@ -153,7 +155,7 @@ validate_options() {
     [[ "$REDIS_URL" =~ ^rediss?://[^[:space:]]+$ ]] || die 'REDIS_URL inválida.'
     for service in "${SERVICES[@]}"; do [[ "$service" =~ ^[a-zA-Z0-9_.@-]+$ ]] || die 'Nombre de servicio inválido.'; done
     local directory
-    for directory in "$APP_ROOT" "$CONFIG_DIR" "$SYSTEMD_DIR"; do
+    for directory in "$APP_ROOT" "$CONFIG_DIR" "$SYSTEMD_DIR" "$ENV_FILE"; do
         while [[ "$directory" != / ]]; do
             [[ ! -L "$directory" ]] || die 'Las rutas de instalación no pueden contener enlaces simbólicos.'
             directory="${directory%/*}"; directory="${directory:-/}"
@@ -169,7 +171,13 @@ print_summary() {
 
 options_json() {
     export CONFIG_DIR NODE_BINARY="${NODE_BINARY:-}" RESOLVED_VERSION="${RESOLVED_VERSION:-local}" RESOLVED_METHOD="${RESOLVED_METHOD:-source}"
-    python3 -c 'import json,os; names="APP_ROOT APP_HOST APP_ALLOWED_SUBNET APP_PORT API_PORT APP_USER INSTALL_REDIS PUBLIC_URL AUTH_URL REDIS_URL CONFIG_DIR BACKUPS_DIR SERVICE_WEB SERVICE_API SERVICE_WORKER SERVICE_NETWORK NODE_BINARY RESOLVED_VERSION RESOLVED_METHOD".split(); result={k:os.environ.get(k, "") for k in names}; result.update({"TDL_BINARY":os.environ["TDL_BINARY"]} if os.environ.get("TDL_BINARY") else {}); print(json.dumps(result))'
+    if [[ "${FRESH:-0}" == 1 && -z "${FRESH_INSTALLATION_ID:-}" ]]; then FRESH_INSTALLATION_ID="$(python3 -c 'from uuid import uuid4; print(uuid4())')"; fi
+    export FRESH="${FRESH:-0}" FRESH_INSTALLATION_ID="${FRESH_INSTALLATION_ID:-}"
+    export PROMPT_ADMIN_PASSWORD=false
+    if can_prompt; then PROMPT_ADMIN_PASSWORD=true; fi
+    if id "$APP_USER" >/dev/null 2>&1; then APP_UID="$(id -u "$APP_USER")"; APP_GID="$(id -g "$APP_USER")"; fi
+    export APP_UID="${APP_UID:-10001}" APP_GID="${APP_GID:-10001}"
+    python3 -c 'import json,os; names="APP_ROOT APP_HOST APP_ALLOWED_SUBNET APP_PORT API_PORT APP_USER APP_UID APP_GID INSTALL_REDIS PUBLIC_URL AUTH_URL REDIS_URL CONFIG_DIR BACKUPS_DIR SERVICE_WEB SERVICE_API SERVICE_WORKER SERVICE_NETWORK NODE_BINARY RESOLVED_VERSION RESOLVED_METHOD ADMIN_USERNAME".split(); result={k:os.environ.get(k, "") for k in names}; result.update({k:os.environ[k] for k in "TDL_BINARY DATABASE_URL AUTHENTIK_ENABLED ADMIN_PASSWORD_FILE FRESH FRESH_INSTALLATION_ID".split() if os.environ.get(k)}); result["PROMPT_ADMIN_PASSWORD"]=os.environ["PROMPT_ADMIN_PASSWORD"]=="true"; print(json.dumps(result))'
 }
 
 write_defaults() {
@@ -182,12 +190,14 @@ write_defaults() {
 }
 
 write_environment() {
-    local destination=$1 options
+    local destination=$1 options legacy=$ENV_FILE status=0
+    [[ -f "$ENV_FILE" ]] || legacy="${LEGACY_ENV_FILE:-$ENV_FILE}"
     options="$(mktemp)"
     options_json > "$options"
     python3 "${SOURCE_DIR:-$SCRIPT_DIR}/scripts/configure-env.py" --deployment native --domain localhost \
-        --root "$APP_ROOT" --output "$destination" --legacy "$ENV_FILE" --native-options "$options"
+        --root "$APP_ROOT" --output "$destination" --legacy "$legacy" --native-options "$options" || status=$?
     rm -f -- "$options"
+    return "$status"
 }
 
 prepare_environment() {
@@ -195,11 +205,11 @@ prepare_environment() {
     [[ ! -f "$ENV_FILE" ]] || return 0
     mkdir -p -- "$(dirname "$ENV_FILE")"
     write_environment "$ENV_FILE"
-    chgrp "$APP_GROUP" "$ENV_FILE"
-    chmod 640 "$ENV_FILE"
+    chown root:root "$ENV_FILE"
+    chmod 600 "$ENV_FILE"
     if [[ "$SAVE_DEFAULTS" == 1 ]]; then write_defaults "$INSTALL_CONF"; fi
     link_layout_aliases
-    printf 'Configuración básica creada en %s (acceso: %s/.env).\n' "$ENV_FILE" "$APP_ROOT"
+    printf 'Configuración básica privada creada en %s.\n' "$ENV_FILE"
     NEW_ENV=1
 }
 
@@ -544,39 +554,18 @@ prepare_repair() {
 }
 
 ensure_oidc() {
-    local name value
-    for name in AUTHENTIK_ISSUER AUTHENTIK_CLIENT_ID AUTHENTIK_CLIENT_SECRET; do
-        value="${!name:-}"
-        if [[ -z "$value" && -f "$ENV_FILE" ]]; then
-            value="$(python3 - "$ENV_FILE" "$name" "${SOURCE_DIR:-$SCRIPT_DIR}" <<'PY'
-import importlib.util,sys
-from pathlib import Path
-spec=importlib.util.spec_from_file_location('config',Path(sys.argv[3])/'scripts/configure-env.py')
-module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
-print(module.read_env(Path(sys.argv[1])).get(sys.argv[2],''),end='')
-PY
-)"
-        fi
-        if [[ -z "$value" || "$value" == replace-* ]]; then
-            can_prompt || die "Falta $name de tu proveedor externo. La configuración básica ya está preparada; vuelve a ejecutar el instalador desde una terminal para completar el asistente (o proporciona el valor por entorno)."
-            if [[ "$name" == AUTHENTIK_CLIENT_SECRET ]]; then read -r -s -u "${INPUT_FD:-0}" -p "$name: " value; printf '\n' >&2
-            else read -r -u "${INPUT_FD:-0}" -p "$name: " value; fi
-        fi
-        [[ -n "$value" && "$value" != *$'\n'* && "$value" != *$'\r'* ]] || die "Valor inválido: $name"
-        printf -v "$name" '%s' "$value"; export "${name?}"
-    done
-    if [[ "${NEW_ENV:-0}" == 1 ]]; then
-        write_environment "$ENV_FILE"
-        chgrp "$APP_GROUP" "$ENV_FILE"
-        chmod 640 "$ENV_FILE"
-    fi
-    [[ "$AUTHENTIK_ISSUER" == https://* ]] || die 'El issuer de Authentik debe usar HTTPS.'
-    fetch "${AUTHENTIK_ISSUER%/}/.well-known/openid-configuration" "$WORK/discovery.json"
-    python3 - "$WORK/discovery.json" "$AUTHENTIK_ISSUER" <<'PY'
-import json,sys
-if json.load(open(sys.argv[1])).get('issuer') != sys.argv[2]:
-    raise SystemExit('AUTHENTIK_ISSUER debe coincidir exactamente con el issuer de discovery.')
-PY
+    AUTHENTIK_ENABLED="$(pick_value AUTHENTIK_ENABLED false)"
+    export AUTHENTIK_ENABLED
+    # The generator validates enabled fields locally; provider outages cannot block local login.
+}
+
+bootstrap_admin() {
+    local username password_file
+    username="$(env_read "$ENV_FILE" ADMIN_USERNAME)"
+    password_file="$(env_read "$ENV_FILE" ADMIN_PASSWORD_FILE)"
+    PYTHONPATH="$RELEASE/backend" "$RELEASE/venv/bin/python" -m app.admin create-admin \
+        --username "$username" --password-file "$password_file" --env-file "$ENV_FILE"
+    printf 'Contraseña inicial protegida: %s\nConsultar como root: sudo cat -- %q\nDebe cambiarse al entrar.\n' "$password_file" "$password_file"
 }
 
 prepare_candidate() {
@@ -591,7 +580,6 @@ spec=importlib.util.spec_from_file_location('config', Path(sys.argv[1])/'configu
 config=importlib.util.module_from_spec(spec); spec.loader.exec_module(config)
 values=config.read_env(Path(sys.argv[2])); uid=pwd.getpwnam(sys.argv[3]).pw_uid; gid=grp.getgrnam(sys.argv[4]).gr_gid
 paths=[values[k] for k in ('DATA_DIR','TDL_SESSIONS_DIR','EXPORTS_DIR','DOWNLOADS_DIR','LOGS_DIR','TMP_DIR')]
-paths.append(str(Path(values['DATABASE_URL'].removeprefix('sqlite:///')).parent))
 for raw in paths:
     path=Path(raw)
     if not path.is_absolute() or path == Path('/'):
@@ -609,11 +597,10 @@ spec=importlib.util.spec_from_file_location('config',Path(sys.argv[1])/'configur
 config=importlib.util.module_from_spec(spec);spec.loader.exec_module(config)
 values=config.read_env(Path(sys.argv[2])); root=Path(sys.argv[3]).resolve(); configdir=Path(sys.argv[4]).resolve()
 keys=['DATA_DIR','TDL_SESSIONS_DIR','EXPORTS_DIR','DOWNLOADS_DIR','LOGS_DIR','TMP_DIR']
+if values.get('DATABASE_URL', '').startswith('sqlite:'):
+    raise SystemExit('La base de datos SQLite heredada requiere --fresh; no se modificará.')
 if values.get('DATABASE_URL'):
-    if not values['DATABASE_URL'].startswith('sqlite:///'):
-        raise SystemExit('Ruta de datos DATABASE_URL debe usar SQLite.')
-    values['DATABASE_PARENT']=str(Path(values['DATABASE_URL'].removeprefix('sqlite:///')).parent)
-    keys.append('DATABASE_PARENT')
+    config.database_identity(values['DATABASE_URL'])
 for key in keys:
     if not values.get(key):
         continue
@@ -708,12 +695,13 @@ activate_release() (
     fi
     render_units "$WORK/units"
     replaced=1
-    install -m 640 -g "$APP_GROUP" "$CANDIDATE" "$ENV_FILE"
+    install -m 600 -o root -g root "$CANDIDATE" "$ENV_FILE"
     if [[ "$APP_HOST" == 0.0.0.0 ]]; then install -m 600 "$WORK/network.nft" "$CONFIG_DIR/network.nft"; fi
     if [[ "$SAVE_DEFAULTS" == 1 ]]; then write_defaults "$INSTALL_CONF"; fi
     for unit in "${SERVICES[@]}"; do install -m 644 "$WORK/units/$unit.service" "$SYSTEMD_DIR/"; done
     ln -sfn "$RELEASE" "$APP_ROOT/current"
     if [[ "$INSTALL_REDIS" == 1 ]]; then redis_touched=1; configure_redis; fi
+    bootstrap_admin
     systemctl daemon-reload
     systemctl enable "${SERVICES[@]}"
     systemctl restart "${SERVICES[@]}"
@@ -728,7 +716,7 @@ run_installation() {
     preflight
     if [[ "$ACTION" != repair && "$ACTION" != configure ]]; then
         apt-get update
-        local -a packages=(ca-certificates curl git rsync python3 python3-venv python3-pip build-essential wipe xz-utils)
+        local -a packages=(ca-certificates curl git rsync python3 python3-venv python3-pip build-essential wipe xz-utils openssl)
         [[ "$INSTALL_REDIS" != 1 ]] || packages+=(redis-server)
         DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends --no-upgrade "${packages[@]}"
     fi
@@ -755,6 +743,9 @@ main() {
         case "$1" in
             --dry-run) dry_run=1; shift ;;
             --yes) ASSUME_YES=1; shift ;;
+            --fresh) FRESH=1; shift ;;
+            --admin-username) ADMIN_USERNAME="${2:?Falta usuario}"; shift 2 ;;
+            --admin-password-file) ADMIN_PASSWORD_FILE="${2:?Falta archivo}"; export ADMIN_PASSWORD_FILE; shift 2 ;;
             --lan) APP_HOST=0.0.0.0; APP_ALLOWED_SUBNET=192.168.100.0/24; shift ;;
             --action) ACTION="${2:?Falta acción}"; shift 2 ;;
             --source-dir) SOURCE_DIR="${2:?Falta ruta}"; shift 2 ;;
@@ -762,7 +753,7 @@ main() {
             --port) APP_PORT="${2:?Falta puerto}"; shift 2 ;;
             --ref) APP_REF="${2:?Falta ref}"; shift 2 ;;
             --method) INSTALL_METHOD="${2:?Falta método}"; shift 2 ;;
-            --help|-h) printf '%s\n' 'Uso: bash install-tld.sh [--action install|update|repair|configure|cancel] [--lan: solo 192.168.100.0/24] [--dry-run] [--yes] [--source-dir RUTA] [--root RUTA] [--port PUERTO] [--ref latest|TAG|COMMIT] [--method auto|source|release]'; return ;;
+            --help|-h) printf '%s\n' 'Uso: bash install-tld.sh [--action install|update|repair|configure|cancel] [--lan: solo 192.168.100.0/24] [--dry-run] [--yes] [--fresh] [--admin-username USUARIO] [--admin-password-file ARCHIVO] [--source-dir RUTA] [--root RUTA] [--port PUERTO] [--ref latest|TAG|COMMIT] [--method auto|source|release]'; return ;;
             *) die "Opción desconocida: $1" ;;
         esac
     done
