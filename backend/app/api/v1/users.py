@@ -16,7 +16,12 @@ from app.schemas import (
     UserRead,
     UserUpdate,
 )
-from app.services.accounts import create_local_user, reset_password, update_user
+from app.services.accounts import (
+    create_local_user,
+    lock_administration,
+    reset_password,
+    update_user,
+)
 from app.services.audit import audit
 from app.services.sessions import revoke_all_sessions
 
@@ -55,6 +60,8 @@ def patch_user(user_id: UUID, body: UserUpdate, db: Session = Depends(get_db), a
 @router.post("/{user_id}/reset-password", status_code=204)
 def reset_user_password(user_id: UUID, body: PasswordReset, db: Session = Depends(get_db), actor: UserRead = Depends(get_current_user)):
     def reset():
+        # Audit's actor FK also locks a User: serialize before either user lock.
+        lock_administration(db)
         reset_password(db, user_id, body.password)
         audit(db, actor.id, "user.reset_password", user_id, "success")
     _transaction(db, reset, failure_action="user.reset_password", actor_id=actor.id, target_id=user_id)
@@ -63,6 +70,7 @@ def reset_user_password(user_id: UUID, body: PasswordReset, db: Session = Depend
 @router.post("/{user_id}/revoke-sessions", status_code=204)
 def revoke_user_sessions(user_id: UUID, db: Session = Depends(get_db), actor: UserRead = Depends(get_current_user)):
     def revoke():
+        lock_administration(db)
         revoke_all_sessions(db, user_id)
         audit(db, actor.id, "user.revoke_sessions", user_id, "success")
     _transaction(db, revoke, failure_action="user.revoke_sessions", actor_id=actor.id, target_id=user_id)

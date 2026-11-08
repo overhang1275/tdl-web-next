@@ -15,11 +15,15 @@ def audit(db: Session, actor_id: UUID | None, action: str, target_id: UUID | int
 
 @contextmanager
 def audited_operation(db: Session, actor_id: UUID | None, action: str, target_id=None, *, outcome="success"):
-    """For legacy services that commit internally; record their observed result.
+    """Durable intent before legacy effects, followed by their observed result.
 
-    Enter without committing, so storage guards remain held until the service's
-    own commit. Account mutations instead audit inside their atomic transaction.
+    A separate connection commits only safe intent metadata, preserving the
+    caller's storage guards and pending writes. Do not wrap account mutations:
+    those hold User locks and audit atomically inside their own transaction.
     """
+    with Session(db.get_bind().engine) as intent:
+        audit(intent, actor_id, action, target_id, "started")
+        intent.commit()
     result = {"outcome": outcome}
     try:
         yield result

@@ -71,11 +71,15 @@ def lock_user(db: Session, user_id: UUID) -> User:
     return user
 
 
+def lock_administration(db: Session) -> None:
+    # ASCII TDLADMIN: serialize counts BEFORE taking any User/Session lock.
+    db.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": 0x54444C41444D494E})
+
+
 def update_user(db: Session, user_id: UUID, **changes) -> User:
     from app.services.sessions import revoke_all_sessions
 
-    # ASCII TDLADMIN: serialize counts BEFORE taking any User/Session lock.
-    db.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": 0x54444C41444D494E})
+    lock_administration(db)
     user = lock_user(db, user_id)
     if changes.get("active") is False and user.active and user.password_hash is not None:
         count = db.scalar(select(func.count()).select_from(User).where(User.active.is_(True), User.password_hash.is_not(None)))

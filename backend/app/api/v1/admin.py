@@ -27,5 +27,6 @@ def reset(
         )
     with audited_operation(db, _.id, "application.reset") as event:
         result = reset_application_state(db, keep_session=payload.keep_session)
-        event["outcome"] = "success" if result.get("redis_cleared") else "partial"
+        complete = result.get("redis_cleared") and result.get("filesystem_cleared")
+        event["outcome"] = "success" if complete else "partial"
     return result

@@ -1,5 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor
-from threading import Barrier
+from threading import Barrier, BrokenBarrierError
 from uuid import UUID
 
 import pytest
@@ -238,3 +238,151 @@ def test_real_settings_delete_and_application_reset_preserve_audit(api):
     with sessions() as db:
         events = {(e.action, e.outcome) for e in db.scalars(select(AuditEvent))}
     assert {("settings.update", "success"), ("job.delete", "accepted"), ("application.reset", "success")} <= events
+
+
+@pytest.mark.parametrize("operations", [("reset", "reset"), ("reset", "revoke"), ("revoke", "revoke"), ("update", "reset")])
+def test_reciprocal_admin_mutations_do_not_deadlock_actor_audit_fk(db_session, test_engine, accounts, monkeypatch, operations):
+    from app.api.v1 import users as routes
+    from app.schemas import PasswordReset, UserRead, UserUpdate
+
+    people = [accounts.create_local_user(db_session, name, PASSWORD) for name in ("alice", "bob")]
+    db_session.commit()
+    ids = [user.id for user in people]
+    start, locked = Barrier(2), Barrier(2)
+
+    def synchronized(function):
+        def mutate(*args, **kwargs):
+            result = function(*args, **kwargs)
+            try:
+                locked.wait(timeout=1)
+            except BrokenBarrierError:
+                pass  # A serialized peer cannot own its target until this commits.
+            return result
+        return mutate
+
+    for name in ("reset_password", "revoke_all_sessions", "update_user"):
+        monkeypatch.setattr(routes, name, synchronized(getattr(routes, name)))
+
+    def operate(index):
+        with Session(test_engine) as db:
+            start.wait(timeout=5)
+            actor = UserRead(id=ids[index], username=people[index].username)
+            target = ids[1 - index]
+            if operations[index] == "reset":
+                routes.reset_user_password(target, PasswordReset(password=TEMP), db, actor)
+            elif operations[index] == "revoke":
+                routes.revoke_user_sessions(target, db, actor)
+            else:
+                routes.patch_user(target, UserUpdate(display_name="Changed"), db, actor)
+
+    with ThreadPoolExecutor(2) as pool:
+        futures = [pool.submit(operate, index) for index in (0, 1)]
+        for future in futures:
+            future.result(timeout=15)
+    with Session(test_engine) as db:
+        assert len(list(db.scalars(select(AuditEvent).where(AuditEvent.outcome == "success")))) == 2
+
+
+@pytest.mark.parametrize("operation", ["settings", "delete", "reset", "telegram"])
+def test_legacy_action_keeps_durable_intent_if_final_audit_fails(api, monkeypatch, operation):
+    from sqlalchemy.exc import SQLAlchemyError
+    from test_api_write import WRITE_HEADERS, create_payload
+    from test_runtime_settings import values
+
+    from app.api.v1 import telegram
+    from app.config import settings
+    from app.models import DownloadJob, RuntimeSettings
+    from app.services import audit as audit_service
+
+    client, sessions, _ = api
+    original = audit_service.audit
+    expected_action = {"settings": "settings.update", "delete": "job.delete", "reset": "application.reset", "telegram": "telegram.input"}[operation]
+
+    def failing_final(db, actor_id, action, target_id, outcome):
+        if action == expected_action and outcome != "started":
+            raise SQLAlchemyError("final audit unavailable")
+        return original(db, actor_id, action, target_id, outcome)
+
+    monkeypatch.setattr(audit_service, "audit", failing_final)
+    if operation == "settings":
+        monkeypatch.setattr(settings, "download_batch_size", settings.download_batch_size)
+        payload = {**values(settings.downloads_dir), "download_batch_size": 777}
+    elif operation == "delete":
+        job = client.post("/api/v1/jobs", headers=WRITE_HEADERS, json=create_payload()).json()
+    elif operation == "telegram":
+        monkeypatch.setattr(telegram.interactive_login_service, "send", lambda value: None)
+
+    def action():
+        if operation == "settings":
+            return client.put("/api/v1/settings", headers=WRITE_HEADERS, json=payload)
+        if operation == "delete":
+            return client.request("DELETE", f"/api/v1/jobs/{job['id']}", headers=WRITE_HEADERS, json={"confirm": True})
+        if operation == "reset":
+            return client.post("/api/v1/admin/reset", headers=WRITE_HEADERS, json={"confirmation": "REINICIAR", "keep_session": True})
+        return client.post("/api/v1/telegram/login/input", headers=WRITE_HEADERS, json={"value": "private-code"})
+
+    with pytest.raises(SQLAlchemyError, match="final audit unavailable"):
+        action()
+    with sessions() as db:
+        events = list(db.scalars(select(AuditEvent).where(AuditEvent.action == expected_action)))
+        assert [event.outcome for event in events] == ["started"]
+        if operation == "settings":
+            assert '777' in db.get(RuntimeSettings, 1).values_json
+        elif operation == "delete":
+            assert db.get(DownloadJob, job["id"]).deletion_requested
+
+
+def test_audit_intent_preserves_storage_lock_and_uncommitted_writes(test_engine):
+    from sqlalchemy import text
+
+    from app.models import DownloadTemplate
+    from app.services.audit import audited_operation
+    from app.services.runtime_settings import _STORAGE_LOCK_KEY, require_storage_available
+
+    with Session(test_engine, autoflush=False) as db:
+        require_storage_available(db)
+        pending = DownloadTemplate(name="Pending")
+        db.add(pending)
+        with audited_operation(db, None, "settings.update"):
+            with Session(test_engine) as other:
+                assert other.scalar(text("SELECT pg_try_advisory_xact_lock(:key)"), {"key": _STORAGE_LOCK_KEY}) is False
+                assert other.scalar(select(DownloadTemplate)) is None
+                assert other.scalar(select(AuditEvent).where(AuditEvent.outcome == "started")) is not None
+        assert pending.id is not None
+
+
+def test_reset_reports_filesystem_failure_even_when_redis_clears(api, monkeypatch):
+    from test_api_write import WRITE_HEADERS
+
+    from app.config import settings
+
+    client, sessions, _ = api
+    blocked = settings.downloads_dir / "blocked"
+    blocked.mkdir()
+    def cannot_remove(*args, **kwargs):
+        if not kwargs.get("ignore_errors"):
+            raise PermissionError("cannot remove")
+    monkeypatch.setattr("app.services.admin.shutil.rmtree", cannot_remove)
+    response = client.post("/api/v1/admin/reset", headers=WRITE_HEADERS, json={"confirmation": "REINICIAR", "keep_session": True})
+    assert response.status_code == 200
+    assert response.json()["redis_cleared"] and not response.json()["filesystem_cleared"]
+    assert blocked.exists()
+    with sessions() as db:
+        assert db.scalar(select(AuditEvent).where(AuditEvent.action == "application.reset", AuditEvent.outcome == "partial")) is not None
+
+
+def test_production_engine_hides_bound_secret_on_real_sql_error(caplog):
+    import logging
+
+    from sqlalchemy import text
+    from sqlalchemy.exc import DBAPIError
+
+    from app.database import engine
+
+    marker = "fake-secret-sql-parameter-marker"
+    with engine.connect() as connection:
+        with pytest.raises(DBAPIError) as error:
+            connection.execute(text("SELECT :secret, 1 / 0"), {"secret": marker})
+    logging.getLogger(__name__).error("Database operation failed", exc_info=(type(error.value), error.value, error.value.__traceback__))
+    assert engine.hide_parameters
+    assert marker not in str(error.value) and marker not in caplog.text
