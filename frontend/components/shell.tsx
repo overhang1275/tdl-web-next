@@ -4,7 +4,6 @@ import { useQuery } from "@tanstack/react-query";
 import {
   Download,
   LayoutDashboard,
-  LogOut,
   MessagesSquare,
   Moon,
   ScrollText,
@@ -13,7 +12,7 @@ import {
   Sun,
   UserRound,
 } from "lucide-react";
-import { signOut } from "next-auth/react";
+import { LogoutButton } from "@/components/auth-forms";
 import { useTheme } from "next-themes";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
@@ -115,16 +114,11 @@ function UserMenu({ user }: { user: { name?: string | null; email?: string | nul
           </div>
         </div>
         <p className="mt-2 text-[11px] text-muted-foreground">
-          {user.groups?.length ? user.groups.join(", ") : "Sesión de Authentik"}
+          {user.groups?.length ? user.groups.join(", ") : "Administrador de TDL Console"}
         </p>
-        <button
-          type="button"
-          onClick={() => signOut({ callbackUrl: "/login" })}
-          className="mt-3 flex w-full items-center gap-2 rounded-lg px-2 py-2 text-sm text-destructive hover:bg-destructive/10"
-        >
-          <LogOut className="h-4 w-4" />
-          Cerrar sesión
-        </button>
+        <Link href="/users" className="mt-3 block rounded-lg px-2 py-2 text-sm hover:bg-muted">Usuarios</Link>
+        <Link href="/change-password" className="block rounded-lg px-2 py-2 text-sm hover:bg-muted">Cambiar contraseña</Link>
+        <LogoutButton />
       </div>
     </details>
   );

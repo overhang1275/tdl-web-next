@@ -28,10 +28,17 @@ test("proxy HTTPS requests keep the public TDL host", async ({ request }) => {
   expect(location.searchParams.get("callbackUrl")).toBe("https://tld.example.test/");
 });
 
-test("login page renders the Authentik handoff", async ({ page }) => {
+test("login page renders local credentials and the optional Authentik handoff", async ({ page }) => {
   await page.goto("/login");
   await expect(page.getByRole("heading", { name: "Inicia sesión" })).toBeVisible();
-  await expect(page.getByRole("button", { name: /Continuar con Authentik/ })).toBeVisible();
+  await expect(page.getByLabel("Usuario", { exact: true })).toHaveAttribute("autocomplete", "username");
+  await expect(page.getByLabel("Contraseña", { exact: true })).toHaveAttribute("autocomplete", "current-password");
+  await expect(page.getByRole("button", { name: /Continuar con Authentik/ })).toHaveCount(process.env.AUTHENTIK_ENABLED === "true" ? 1 : 0);
+  await page.getByLabel("Usuario", { exact: true }).focus();
+  await page.keyboard.press("Tab");
+  await expect(page.getByLabel("Contraseña", { exact: true })).toBeFocused();
+  await page.keyboard.press("Tab");
+  await expect(page.getByRole("button", { name: "Iniciar sesión", exact: true })).toBeFocused();
   await page.setViewportSize({ width: 1280, height: 800 });
   await page.screenshot({ path: path.join(screenshots, "login-1280.png"), fullPage: true });
   await page.setViewportSize({ width: 390, height: 844 });
@@ -42,7 +49,7 @@ test("private routes return to login", async ({ page }) => {
   for (const route of ["/", "/downloads", "/chats", "/settings"]) {
     await page.goto(route);
     await expect(page).toHaveURL(/\/login/);
-    await expect(page.getByRole("button", { name: /Continuar con Authentik/ })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Iniciar sesión", exact: true })).toBeVisible();
   }
   const response = await page.request.get("/api/v1/jobs");
   expect(response.status()).toBe(401);

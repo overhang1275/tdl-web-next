@@ -1,7 +1,11 @@
 name: tdl-console-test
 
 x-api-env: &api-env
-  APP_ENV: production
+  APP_ENV: test
+  PYTHONPATH: /app/backend
+  E2E_INTEGRATION: '1'
+  E2E_LOCAL_PASSWORD: ${E2E_LOCAL_PASSWORD:-Isolated-only-password-2026}
+  AUTHENTIK_ENABLED: ${AUTHENTIK_ENABLED:-false}
   DATA_DIR: /data
   DATABASE_URL: postgresql+psycopg://tdl_test:tdl_test@postgres:5432/tdl_test
   REDIS_URL: redis://redis:6379/1
@@ -48,8 +52,9 @@ services:
       context: ../..
       dockerfile: deploy/docker/Dockerfile.api
       target: tests
-    command: [alembic, upgrade, head]
+    command: [sh, -c, "alembic upgrade head && python /app/scripts/bootstrap-test-auth.py"]
     environment: *api-env
+    volumes: [test-data:/data]
     depends_on:
       postgres: {condition: service_healthy}
   api:
@@ -64,7 +69,6 @@ services:
       postgres: {condition: service_healthy}
       migrate: {condition: service_completed_successfully}
       redis: {condition: service_healthy}
-      oidc: {condition: service_healthy}
     healthcheck:
       test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
       interval: 2s
@@ -88,6 +92,7 @@ services:
     environment:
       AUTH_SECRET: playwright-test-secret-at-least-32-characters
       AUTH_URL: http://web:3000
+      AUTHENTIK_ENABLED: ${AUTHENTIK_ENABLED:-false}
       AUTHENTIK_ISSUER: http://oidc:9000/application/o/tdl-console/
       AUTHENTIK_CLIENT_ID: tdl-console
       AUTHENTIK_CLIENT_SECRET: test-client-secret
@@ -127,11 +132,25 @@ services:
     environment:
       PLAYWRIGHT_BASE_URL: http://web:3000
       E2E_INTEGRATION: '1'
+      E2E_LOCAL_PASSWORD: ${E2E_LOCAL_PASSWORD:-Isolated-only-password-2026}
+      AUTHENTIK_ENABLED: ${AUTHENTIK_ENABLED:-false}
     volumes:
       - ../../docs/design-audit:/app/docs/design-audit
     depends_on:
       web: {condition: service_healthy}
       worker: {condition: service_started}
+      auth-control: {condition: service_started}
+
+  auth-control:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.api
+      target: tests
+    command: [uvicorn, test_auth_control:app, --app-dir, /app/scripts, --host, 0.0.0.0, --port, '9001']
+    profiles: [checks]
+    environment: *api-env
+    depends_on:
+      migrate: {condition: service_completed_successfully}
 
 volumes:
   test-postgres:

@@ -133,7 +133,7 @@ def update_transfer_totals(db: Session, job: DownloadJob, *, commit: bool = True
     )).one()
     job.total_downloaded_files = files
     job.download_observed_files = files
-    job.download_observed_bytes = size
+    job.download_observed_bytes = int(size)
     job.total_failed_files = db.scalar(select(func.count()).select_from(DownloadFile).where(
         DownloadFile.job_id == job.id, DownloadFile.status == "failed",
     )) or 0

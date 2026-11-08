@@ -2,13 +2,18 @@ import { expect, test } from "@playwright/test";
 
 test.skip(!process.env.E2E_INTEGRATION, "Requires the isolated Docker stack with OIDC and fake tdl.");
 
-test("OIDC login, real API, Redis worker, download and persisted deletion", async ({ page, baseURL }) => {
+test("login, real API, Redis worker, download and persisted deletion", async ({ page, baseURL }) => {
   test.setTimeout(120_000);
   await page.goto("/login");
-  await page.getByRole("button", { name: /Continuar con Authentik/ }).click();
+  if (process.env.AUTHENTIK_ENABLED === "true") await page.getByRole("button", { name: /Continuar con Authentik/ }).click();
+  else {
+    await page.getByLabel("Usuario", { exact: true }).fill("local-admin");
+    await page.getByLabel("Contraseña", { exact: true }).fill(process.env.E2E_LOCAL_PASSWORD!);
+    await page.getByRole("button", { name: "Iniciar sesión", exact: true }).click();
+  }
   await expect(page.getByRole("heading", { name: "Resumen" })).toBeVisible();
   const session = await (await page.request.get("/api/auth/session")).json();
-  expect(session.user.name).toBe("Operador de pruebas");
+  expect(session.user.name).toBe(process.env.AUTHENTIK_ENABLED === "true" ? "Operador de pruebas" : "Administrador local de pruebas");
   expect(JSON.stringify(session)).not.toMatch(/accessToken|refreshToken|access_token|refresh_token/);
   expect((await page.context().cookies()).filter((cookie) => cookie.name.includes("session-token")).every((cookie) => cookie.httpOnly)).toBe(true);
   await page.goto("/downloads/new");
@@ -22,19 +27,26 @@ test("OIDC login, real API, Redis worker, download and persisted deletion", asyn
   await expect.poll(async () => (await (await page.request.get(`/api/v1/jobs/${job.id}`)).json()).status, { timeout: 60_000 }).toBe("completed");
   const files = await (await page.request.get(`/api/v1/jobs/${job.id}/files`)).json();
   expect(files.total).toBe(3);
+  await page.reload();
+  await expect(page.getByRole("heading", { name: "Archivos", exact: true })).toBeVisible();
+  await expect(page.getByRole("link", { name: "Descargar", exact: true })).toHaveCount(3);
   const downloaded = await page.request.get(files.items[0].download_url);
   expect(await downloaded.text()).toBe("complete");
   expect(downloaded.headers()["x-content-type-options"]).toBe("nosniff");
+  const ranged = await page.request.get(files.items[0].download_url, { headers: { range: "bytes=0-2" } });
+  expect(ranged.status()).toBe(206);
+  expect(await ranged.text()).toBe("com");
   await page.goto("/settings");
   await page.getByLabel("Archivos por lote de descarga").fill("25");
   await page.getByRole("button", { name: "Guardar ajustes", exact: true }).click();
   await expect(page.getByText("Ajustes guardados", { exact: true })).toBeVisible();
-  await page.getByLabel("Carpeta de descargas").fill("/data/relocated-downloads");
+  const relocated = `/data/relocated-downloads-${Date.now()}`;
+  await page.getByLabel("Carpeta de descargas").fill(relocated);
   await page.getByRole("button", { name: "Guardar ajustes", exact: true }).click();
   await expect(page.getByRole("dialog")).toContainText("Trasladar archivos existentes");
   await page.getByRole("button", { name: "Guardar y trasladar", exact: true }).click();
   await expect(page.getByText("Traslado completado", { exact: true })).toBeVisible({ timeout: 60_000 });
-  await expect(page.getByLabel("Carpeta de descargas")).toHaveValue("/data/relocated-downloads");
+  await expect(page.getByLabel("Carpeta de descargas")).toHaveValue(relocated);
   const afterMove = await (await page.request.get(`/api/v1/jobs/${job.id}/files`)).json();
   expect(afterMove.total).toBe(3);
   expect(await (await page.request.get(afterMove.items[0].download_url)).text()).toBe("complete");
@@ -45,5 +57,11 @@ test("OIDC login, real API, Redis worker, download and persisted deletion", asyn
   await expect.poll(async () => (await page.request.get(`/api/v1/jobs/${job.id}`)).status(), { timeout: 60_000 }).toBe(404);
   const forged = await page.request.post("/api/v1/jobs", { headers: { origin: "https://evil.test", "x-requested-with": "tdl-web" }, data: {} });
   expect(forged.status()).toBe(403);
+  const queued = await page.request.post("/api/v1/jobs", { headers: { "x-requested-with": "tdl-web" }, data: { chat_id: "456", output_subfolder: "cancel-test", skip_same: false, refresh_export: true } });
+  expect(queued.status()).toBe(201);
+  const canceled = await queued.json();
+  expect((await page.request.post(`/api/v1/jobs/${canceled.id}/cancel`, { headers: { "x-requested-with": "tdl-web" } })).status()).toBe(200);
+  await expect.poll(async () => (await (await page.request.get(`/api/v1/jobs/${canceled.id}`)).json()).status).toBe("cancelled");
+  expect((await page.request.delete(`/api/v1/jobs/${canceled.id}`, { headers: { "x-requested-with": "tdl-web" }, data: { confirm: true } })).status()).toBe(202);
   expect(baseURL).toBe("http://web:3000");
 });

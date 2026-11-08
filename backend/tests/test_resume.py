@@ -59,6 +59,21 @@ def successful_download(self, source, destination, **kwargs):
     return ''
 
 
+def test_postgres_aggregate_bytes_remain_exact_for_worker_speed(runtime):
+    from app.services.transfers import update_transfer_totals
+
+    db, _ = runtime
+    job = make_job(db, [])
+    size = 9_007_199_254_740_993
+    db.add(models.DownloadFile(job_id=job.id, chat_id='123', message_id='large',
+        file_name='large.bin', message_json='{}', destination_root='/tmp',
+        output_dir='large', size=size, status='completed'))
+    update_transfer_totals(db, job, commit=False)
+    assert job.download_observed_bytes == 9_007_199_254_740_993
+    # The worker divides bytes by monotonic (float) elapsed seconds before commit.
+    assert int(job.download_observed_bytes / 2.0) == 4_503_599_627_370_496
+
+
 def test_interruption_records_only_final_files_and_retry_keeps_same_job(runtime, monkeypatch):
     db, queue = runtime
     job = make_job(db, [{'id': 1, 'file': 'a.mp4'}, {'id': 2, 'file': 'b.mp4'}])

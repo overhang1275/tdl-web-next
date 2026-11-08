@@ -1,7 +1,7 @@
-import NextAuth, { type NextAuthRequest } from "next-auth";
+import type { NextAuthRequest } from "next-auth";
 import type { NextRequest } from "next/server";
 
-import { getAuthConfig } from "@/auth";
+import { withSession } from "@/lib/auth-session";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -14,31 +14,17 @@ function error(code: string, message: string, status: number) {
 
 // Auth.js refreshes the JWT and writes its encrypted cookie; this session is server-only.
 async function proxy(request: NextRequest, context: { params: Promise<{ path: string[] }> }) {
-  const config = getAuthConfig();
-  const { auth: apiAuth } = NextAuth({
-    ...config,
-    callbacks: {
-      ...config.callbacks,
-      authorized: () => true,
-      session: async ({ session, token }) => ({ ...session, accessToken: token.accessToken, error: token.error }),
-    },
-  });
-  return (await apiAuth(forward)(request, context)) ?? error("auth_failed", "Inicia sesión para continuar.", 401);
+  const { path } = await context.params;
+  if (path.some((part) => !part || /[%/\\]/.test(part) || part === "." || part === "..") ||
+      (path[0]?.toLowerCase() === "auth" && path[1] !== "me")) {
+    return error("not_found", "Ruta no disponible.", 404);
+  }
+  return withSession(request, (req) => forward(req, context));
 }
 
 async function forward(request: NextAuthRequest, context: { params: Promise<{ path: string[] }> }) {
   if (!request.auth?.accessToken || request.auth.error) {
     return error("unauthorized", "Inicia sesión para continuar.", 401);
-  }
-  const origin = request.headers.get("origin");
-  if (origin) {
-    try {
-      if (new URL(origin).origin !== new URL(process.env.AUTH_URL ?? request.url).origin) {
-        return error("cross_origin_blocked", "Origen no permitido.", 403);
-      }
-    } catch {
-      return error("cross_origin_blocked", "Origen no permitido.", 403);
-    }
   }
   const method = request.method.toUpperCase();
   if (!["GET", "HEAD"].includes(method)) {
