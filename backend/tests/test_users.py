@@ -386,3 +386,70 @@ def test_production_engine_hides_bound_secret_on_real_sql_error(caplog):
     logging.getLogger(__name__).error("Database operation failed", exc_info=(type(error.value), error.value, error.value.__traceback__))
     assert engine.hide_parameters
     assert marker not in str(error.value) and marker not in caplog.text
+
+
+def test_audit_intent_progresses_when_outer_occupies_entire_request_pool(test_engine):
+    from sqlalchemy import create_engine, text
+    from sqlalchemy.exc import TimeoutError
+
+    from app.models import DownloadTemplate
+    from app.services.audit import audited_operation
+    from app.services.runtime_settings import _STORAGE_LOCK_KEY, require_storage_available
+
+    with test_engine.connect() as connection:
+        schema = connection.scalar(text("SELECT current_schema()"))
+    request_engine = create_engine(test_engine.url, connect_args={"options": f"-csearch_path={schema}"},
+                                   pool_size=1, max_overflow=0, pool_timeout=0.1,
+                                   hide_parameters=True)
+    try:
+        with Session(request_engine, autoflush=False) as db:
+            require_storage_available(db)  # Hold the pool's sole connection/guard.
+            pending = DownloadTemplate(name="Uncommitted at audit intent")
+            db.add(pending)
+            with audited_operation(db, None, "settings.update"):
+                assert request_engine.pool.checkedout() == 1
+                with pytest.raises(TimeoutError):
+                    request_engine.connect()
+                with Session(test_engine) as observer:
+                    assert observer.scalar(select(AuditEvent).where(AuditEvent.outcome == "started")) is not None
+                    assert observer.scalar(select(DownloadTemplate)) is None
+                    assert observer.scalar(text("SELECT pg_try_advisory_xact_lock(:key)"), {"key": _STORAGE_LOCK_KEY}) is False
+            assert pending.id is not None
+        with Session(test_engine) as observer:
+            assert observer.scalar(select(DownloadTemplate)).name == pending.name
+            assert {event.outcome for event in observer.scalars(select(AuditEvent))} == {"started", "success"}
+        assert request_engine.pool.checkedout() == 0
+    finally:
+        request_engine.dispose()
+
+
+def test_short_lived_intent_engine_is_disposed_if_intent_write_fails(test_engine, monkeypatch):
+    from sqlalchemy import event, text
+    from sqlalchemy.engine import Engine
+    from sqlalchemy.exc import SQLAlchemyError
+
+    from app.services import audit as audit_service
+
+    disposed = []
+    opened = []
+    listener = disposed.append
+    event.listen(Engine, "engine_disposed", listener)
+
+    def fail_intent(db, *args, **kwargs):
+        db.execute(text("SELECT 1"))
+        opened.append(db.connection().connection.driver_connection)
+        raise SQLAlchemyError("intent failed")
+
+    monkeypatch.setattr(audit_service, "audit", fail_intent)
+    try:
+        with Session(test_engine) as db:
+            db.execute(text("SELECT 1"))
+            with pytest.raises(SQLAlchemyError, match="intent failed"):
+                with audit_service.audited_operation(db, None, "settings.update"):
+                    pytest.fail("No effect may run without durable intent")
+            assert test_engine.pool.checkedout() == 1
+        assert len(disposed) == 1 and disposed[0] is not test_engine
+        assert disposed[0].pool.checkedout() == 0
+        assert opened[0].closed
+    finally:
+        event.remove(Engine, "engine_disposed", listener)
