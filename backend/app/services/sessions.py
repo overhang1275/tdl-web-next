@@ -27,6 +27,7 @@ from sqlalchemy.orm import Session
 from app.config import settings
 from app.models import AuthSession, User
 from app.schemas import TokenPair, UserRead
+from app.services.audit import audit
 from app.services.auth import AuthError
 
 ISSUER = "tdl-console"
@@ -187,6 +188,8 @@ def rotate_session(db: Session, refresh_token: str) -> TokenPair:
     user, row = _lock_session(db, UUID(claims["sid"]), UUID(claims["sub"]))
     now = _now()  # Read after waiting for locks, never extend from request arrival.
     _check_active(user, row, now)
+    if user.must_change_password:
+        raise AuthError("password_change_required", "Cambia la contraseña para continuar.", 403)
     if claims["fid"] != str(row.family_id):
         raise _invalid()
     digest = _hash(refresh_token)
@@ -229,15 +232,17 @@ def rotate_session(db: Session, refresh_token: str) -> TokenPair:
         raise _unavailable()
     db.execute(update(AuthSession).where(AuthSession.user_id == user.id, AuthSession.family_id == row.family_id,
                                         AuthSession.revoked_at.is_(None)).values(revoked_at=now))
+    audit(db, user.id, "session.replay", row.id, "revoked")
     db.flush()
     raise RefreshReplay()
 
 
 def revoke_session(db: Session, session_id: UUID) -> None:
-    _, row = _lock_session(db, session_id)
+    user, row = _lock_session(db, session_id)
     if row.revoked_at is None:
         row.revoked_at = _now()
         db.flush()
+    audit(db, user.id, "session.revoke", row.id, "success")
 
 
 def revoke_refresh_session(db: Session, refresh_token: str) -> None:
@@ -247,13 +252,14 @@ def revoke_refresh_session(db: Session, refresh_token: str) -> None:
     An unconfirmed future/current-hash token is not accepted as logout proof.
     """
     claims = _decode(refresh_token, refresh=True)
-    _, row = _lock_session(db, UUID(claims["sid"]), UUID(claims["sub"]))
+    user, row = _lock_session(db, UUID(claims["sid"]), UUID(claims["sub"]))
     if (claims["fid"] != str(row.family_id) or claims["gen"] > row.generation
             or (claims["gen"] == row.generation and not secrets.compare_digest(_hash(refresh_token), row.refresh_token_hash))):
         raise _invalid()
     if row.revoked_at is None:
         row.revoked_at = _now()
         db.flush()
+    audit(db, user.id, "session.revoke", row.id, "success")
 
 
 def revoke_all_sessions(db: Session, user_id: UUID) -> None:

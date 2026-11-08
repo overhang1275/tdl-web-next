@@ -10,11 +10,11 @@ import jwt
 import pytest
 from cryptography.hazmat.primitives.asymmetric import rsa
 from fastapi.testclient import TestClient
+from test_sessions import session_env as session_env
 
 from app.config import Settings, settings
 from app.main import app
 from app.services import auth
-from test_sessions import session_env
 
 ISSUER = "https://auth.test/application/o/tdl-console"
 AUDIENCE = "tdl-console"
@@ -129,8 +129,9 @@ def authentik_settings(monkeypatch, jwks_server):
 
 @pytest.fixture
 def api_client(monkeypatch, test_engine):
-    from app import database
     from sqlalchemy.orm import sessionmaker
+
+    from app import database
 
     monkeypatch.setattr(database, "engine", test_engine)
     monkeypatch.setattr(database, "SessionLocal", sessionmaker(bind=test_engine, expire_on_commit=False))
@@ -238,9 +239,12 @@ def test_native_session_is_accepted(api_client, native_pair):
 def test_native_api_rejects_invalid_jwt(api_client, native_pair, session_env, mutation, code):
     _, clock, key, _ = session_env
     claims = jwt.decode(native_pair.access_token, options={"verify_signature": False})
-    if mutation == "issuer": claims["iss"] = "other"
-    if mutation == "audience": claims["aud"] = "other"
-    if mutation == "expired": claims["exp"] = int(clock[0].timestamp())
+    if mutation == "issuer":
+        claims["iss"] = "other"
+    if mutation == "audience":
+        claims["aud"] = "other"
+    if mutation == "expired":
+        claims["exp"] = int(clock[0].timestamp())
     token = jwt.encode(claims, "an-untrusted-key" * 4 if mutation == "algorithm" else key, algorithm="HS256" if mutation == "algorithm" else "RS256")
     response = api_client.get("/api/v1/status", headers=_auth(token))
     assert response.status_code == 401

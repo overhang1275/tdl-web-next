@@ -4,12 +4,13 @@ import hashlib
 import re
 import secrets
 from threading import BoundedSemaphore
+from uuid import UUID
 
 from argon2 import PasswordHasher, profiles
 from argon2.exceptions import InvalidHashError, VerificationError
 from redis import Redis
 from redis.exceptions import RedisError
-from sqlalchemy import select
+from sqlalchemy import func, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -61,6 +62,54 @@ def create_local_user(db: Session, username: str, password: str, *, must_change_
             raise
         raise AuthError("username_unavailable", "El nombre de usuario no está disponible.", 409) from None
     return user
+
+
+def lock_user(db: Session, user_id: UUID) -> User:
+    user = db.scalar(select(User).where(User.id == user_id).with_for_update().execution_options(populate_existing=True))
+    if user is None:
+        raise AuthError("user_not_found", "La cuenta no existe.", 404)
+    return user
+
+
+def update_user(db: Session, user_id: UUID, **changes) -> User:
+    from app.services.sessions import revoke_all_sessions
+
+    # ASCII TDLADMIN: serialize counts BEFORE taking any User/Session lock.
+    db.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": 0x54444C41444D494E})
+    user = lock_user(db, user_id)
+    if changes.get("active") is False and user.active and user.password_hash is not None:
+        count = db.scalar(select(func.count()).select_from(User).where(User.active.is_(True), User.password_hash.is_not(None)))
+        if count <= 1:
+            raise AuthError("last_local_admin", "Debe quedar un administrador local activo.", 409)
+    for name, value in changes.items():
+        if name not in {"active", "display_name"}:
+            raise ValueError("Unsupported account field")
+        setattr(user, name, value)
+    db.flush()  # revoke_all refreshes the locked User; never lose pending edits.
+    if changes.get("active") is False:
+        revoke_all_sessions(db, user.id)
+    return user
+
+
+def reset_password(db: Session, user_id: UUID, password: str, *, temporary: bool = True) -> User:
+    from app.services.sessions import revoke_all_sessions
+
+    password_hash = hash_password(password)
+    user = lock_user(db, user_id)
+    if user.password_hash is None:
+        raise AuthError("external_account", "La cuenta utiliza un proveedor externo.", 409)
+    user.password_hash = password_hash
+    user.must_change_password = temporary
+    db.flush()
+    revoke_all_sessions(db, user.id)
+    return user
+
+
+def change_password(db: Session, user_id: UUID, current_password: str, new_password: str) -> None:
+    user = lock_user(db, user_id)
+    # Reuse the bounded verifier and limiter, without an intervening commit.
+    verify_credentials(db, user.username, current_password, origin="internal-web")
+    reset_password(db, user.id, new_password, temporary=False)
 
 
 # Reserve before hashing so parallel failures cannot all pass an unlocked check.

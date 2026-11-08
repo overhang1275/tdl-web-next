@@ -6,14 +6,17 @@ import pytest
 from sqlalchemy import event, func, select, text
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
+from test_accounts import PASSWORD
+from test_accounts import accounts as accounts
+from test_api_security import AUDIENCE, GROUP, ISSUER, _token
+from test_api_security import jwks_server as jwks_server
+from test_api_security import rsa_key as rsa_key
+from test_auth_sessions_api import client as client
+from test_sessions import session_env as session_env
 
 from app.config import Settings, settings
 from app.models import AuthSession, ExternalIdentity, User
 from app.services import auth
-from test_accounts import PASSWORD, accounts
-from test_api_security import AUDIENCE, GROUP, ISSUER, _token, jwks_server, rsa_key
-from test_auth_sessions_api import client
-from test_sessions import session_env
 
 
 @pytest.fixture
@@ -243,9 +246,12 @@ def test_unstorable_display_name_does_not_break_login(client, provider, rsa_key)
     ("issuer", "invalid_issuer"), ("audience", "invalid_audience"), ("expired", "token_expired")])
 def test_exchange_rejects_invalid_external_crypto(client, provider, rsa_key, session_env, mutation, code):
     claims = jwt.decode(_token(rsa_key), options={"verify_signature": False})
-    if mutation == "issuer": claims["iss"] += "/"
-    if mutation == "audience": claims["aud"] = "tdl-api"
-    if mutation == "expired": claims["exp"] = claims["iat"] - 1
+    if mutation == "issuer":
+        claims["iss"] += "/"
+    if mutation == "audience":
+        claims["aud"] = "tdl-api"
+    if mutation == "expired":
+        claims["exp"] = claims["iat"] - 1
     if mutation == "algorithm":
         token = jwt.encode(claims, "an-untrusted-secret" * 4, algorithm="HS256", headers={"kid": "test-key"})
     else:

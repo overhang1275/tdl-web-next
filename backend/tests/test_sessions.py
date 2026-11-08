@@ -1,6 +1,6 @@
 import hashlib
-import os
 import multiprocessing
+import os
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from threading import Barrier
@@ -56,7 +56,7 @@ def session_env(monkeypatch, tmp_path):
 @pytest.fixture
 def issued(db_session, session_env):
     sessions, clock, key, redis = session_env
-    user = User(username="admin", display_name="Administrator", must_change_password=True)
+    user = User(username="admin", display_name="Administrator", must_change_password=False)
     db_session.add(user)
     db_session.flush()
     pair = sessions.issue_session(db_session, user)
@@ -72,7 +72,7 @@ def test_issue_signed_safe_identity_and_hash_only(db_session, session_env, issue
     assert payload["sid"] == str(pair.session_id)
     assert payload["exp"] - payload["iat"] == 300
     assert pair.expires_at == payload["exp"]
-    assert pair.must_change_password and pair.user.username == "admin"
+    assert not pair.must_change_password and pair.user.username == "admin"
     assert "password" not in pair.user.model_dump_json().replace("must_change_password", "")
     with Session(test_engine) as db:
         row = db.get(AuthSession, pair.session_id)
@@ -90,12 +90,18 @@ def test_invalid_jwt_rejected(db_session, session_env, issued, mutation):
     if mutation == "refresh_as_access":
         token = pair.refresh_token
     else:
-        if mutation == "issuer": claims["iss"] = "other"
-        if mutation == "audience": claims["aud"] = "other"
-        if mutation == "expired": claims["exp"] = int(clock[0].timestamp())
-        if mutation in {"sid", "sub"}: claims[mutation] = str(uuid4())
-        if mutation == "malformed_sid": claims["sid"] = 123
-        if mutation == "missing_iat": claims.pop("iat")
+        if mutation == "issuer":
+            claims["iss"] = "other"
+        if mutation == "audience":
+            claims["aud"] = "other"
+        if mutation == "expired":
+            claims["exp"] = int(clock[0].timestamp())
+        if mutation in {"sid", "sub"}:
+            claims[mutation] = str(uuid4())
+        if mutation == "malformed_sid":
+            claims["sid"] = 123
+        if mutation == "missing_iat":
+            claims.pop("iat")
         token = jwt.encode(claims, "a-long-secret" * 4 if mutation == "hs256" else key, algorithm="HS256" if mutation == "hs256" else "RS256")
     with pytest.raises(AuthError) as error:
         sessions.verify_session(db_session, token)
@@ -130,8 +136,10 @@ def test_polling_and_refresh_do_not_extend_idle_or_absolute(db_session, session_
     assert row.absolute_expires_at == start + timedelta(seconds=28800)
     assert row.idle_expires_at == start + timedelta(seconds=1800)
     clock[0] = start + timedelta(seconds=1800)
-    with pytest.raises(AuthError): sessions.verify_session(db_session, pair.access_token)
-    with pytest.raises(AuthError): sessions.rotate_session(db_session, pair.refresh_token)
+    with pytest.raises(AuthError):
+        sessions.verify_session(db_session, pair.access_token)
+    with pytest.raises(AuthError):
+        sessions.rotate_session(db_session, pair.refresh_token)
 
 
 def test_activity_throttled_and_absolute_limit(db_session, session_env, issued):
@@ -156,7 +164,8 @@ def test_activity_throttled_and_absolute_limit(db_session, session_env, issued):
     db_session.commit()
     assert pair.expires_at == int((start + timedelta(seconds=28800)).timestamp())
     clock[0] += timedelta(seconds=1)
-    with pytest.raises(AuthError): sessions.rotate_session(db_session, pair.refresh_token)
+    with pytest.raises(AuthError):
+        sessions.rotate_session(db_session, pair.refresh_token)
 
 
 def test_refresh_concurrent_across_connections(test_engine, session_env, issued):
@@ -192,7 +201,8 @@ def test_reused_refresh_revokes_family(db_session, session_env, issued, generati
     with pytest.raises(sessions.RefreshReplay):
         sessions.rotate_session(db_session, original.refresh_token)
     db_session.commit()  # Explicit caller contract: persist replay revocation before 401.
-    with pytest.raises(AuthError): sessions.verify_session(db_session, pair.access_token)
+    with pytest.raises(AuthError):
+        sessions.verify_session(db_session, pair.access_token)
 
 
 def test_random_token_cannot_revoke_known_session(db_session, session_env, issued):
@@ -201,7 +211,8 @@ def test_random_token_cannot_revoke_known_session(db_session, session_env, issue
     claims = jwt.decode(pair.refresh_token, options={"verify_signature": False})
     forged_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     for token in (str(pair.session_id) + ".random", jwt.encode(claims, forged_key, algorithm="RS256"), pair.access_token):
-        with pytest.raises(AuthError): sessions.rotate_session(db_session, token)
+        with pytest.raises(AuthError):
+            sessions.rotate_session(db_session, token)
         db_session.rollback()
         assert sessions.verify_session(db_session, pair.access_token).username == "admin"
 
@@ -211,7 +222,8 @@ def test_rollback_cache_cannot_authorize_orphan_successor(db_session, session_en
     _, original = issued
     orphan = sessions.rotate_session(db_session, original.refresh_token)
     db_session.rollback()
-    with pytest.raises(AuthError): sessions.rotate_session(db_session, orphan.refresh_token)
+    with pytest.raises(AuthError):
+        sessions.rotate_session(db_session, orphan.refresh_token)
     db_session.rollback()
     actual = sessions.rotate_session(db_session, original.refresh_token)
     db_session.commit()
@@ -251,7 +263,8 @@ def test_revoke_all_and_helpers_do_not_commit(db_session, session_env, issued, t
     sessions.revoke_all_sessions(db_session, user.id)
     db_session.commit()
     for pair in (original, second):
-        with pytest.raises(AuthError): sessions.verify_session(db_session, pair.access_token)
+        with pytest.raises(AuthError):
+            sessions.verify_session(db_session, pair.access_token)
 
 
 @pytest.mark.parametrize("generations", [1, 3])
@@ -274,7 +287,8 @@ def test_lost_cache_during_grace_is_transient_even_for_older_generation(db_sessi
     with pytest.raises(sessions.RefreshReplay):
         sessions.rotate_session(db_session, original.refresh_token)
     db_session.commit()
-    with pytest.raises(AuthError): sessions.verify_session(db_session, pair.access_token)
+    with pytest.raises(AuthError):
+        sessions.verify_session(db_session, pair.access_token)
 
 
 def test_advanced_cache_successor_is_conflict_without_revoke(db_session, session_env, issued):
@@ -324,6 +338,7 @@ def _process_rotate(url, schema, private, public, prefix, token, barrier):
     # Spawn starts a fresh interpreter: no inherited engine, Redis client, key
     # objects, cache, mutex, or monkeypatch from the parent process.
     from pathlib import Path
+
     from app.services import sessions
 
     settings.jwt_private_key_file = Path(private)
@@ -385,7 +400,8 @@ def test_stale_identity_map_cannot_bypass_revocation(test_engine, db_session, se
     with Session(test_engine) as other:
         sessions.revoke_session(other, pair.session_id)
         other.commit()
-    with pytest.raises(AuthError): sessions.verify_session(db_session, pair.access_token)
+    with pytest.raises(AuthError):
+        sessions.verify_session(db_session, pair.access_token)
 
 
 def test_missing_key_fails_safely_without_session(db_session, session_env, issued, monkeypatch, tmp_path):

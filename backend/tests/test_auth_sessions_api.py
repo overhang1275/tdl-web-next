@@ -4,12 +4,13 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 from sqlalchemy.orm import Session
+from test_accounts import PASSWORD
+from test_accounts import accounts as accounts
+from test_sessions import session_env as session_env
 
 from app.database import get_db
 from app.main import app
 from app.models import AuthSession, User
-from test_accounts import PASSWORD, accounts
-from test_sessions import session_env
 
 
 @pytest.fixture
@@ -156,6 +157,7 @@ def test_commit_failure_after_cache_write_does_not_deliver_orphan(client, sessio
 def test_login_holds_verified_user_lock_until_issuance_then_reset_revokes(client, test_engine, session_env, monkeypatch):
     from sqlalchemy import text
     from sqlalchemy.exc import OperationalError
+
     from app.api.v1 import auth as routes
 
     sessions, *_ = session_env

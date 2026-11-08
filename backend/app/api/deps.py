@@ -17,7 +17,12 @@ def get_current_user(request: Request, db: Session = Depends(get_db)) -> UserRea
     if scheme.lower() != "bearer" or not token:
         raise ApiError("unauthorized", "Inicia sesión para continuar.", 401)
     try:
-        return verify_session(db, token)
+        user = verify_session(db, token)
+        if user.must_change_password and (request.method, request.url.path) not in {
+            ("GET", "/api/v1/auth/me"), ("POST", "/api/v1/auth/change-password"), ("POST", "/api/v1/auth/logout")
+        }:
+            raise ApiError("password_change_required", "Cambia la contraseña para continuar.", 403)
+        return user
     except AuthError as exc:
         raise ApiError(exc.code, exc.message, exc.status_code) from exc
 
