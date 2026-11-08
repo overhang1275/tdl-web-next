@@ -10,16 +10,31 @@ import secrets
 import shlex
 import stat
 import subprocess
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 from uuid import UUID, uuid4
 
 
-def read_env(path: Path) -> dict[str, str]:
-    if not path.exists():
-        return {}
+def read_env(path: Path, *, privileged: bool = False) -> dict[str, str]:
+    if privileged:
+        checked_path(path)
+        trusted_parent(path)
+        try:
+            with regular_file(path) as stream:
+                metadata = os.fstat(stream.fileno())
+                # Previous native installers used root-owned0640; only that legacy mode may upgrade.
+                if metadata.st_uid != 0 or stat.S_IMODE(metadata.st_mode) not in {0o600, 0o640}:
+                    raise ValueError('Environment input must be root-owned0600 (legacy root-owned0640 may upgrade)')
+                content = bounded_bytes(stream).decode('utf-8')
+        except FileNotFoundError:
+            return {}
+    else:
+        if not path.exists():
+            return {}
+        content = path.read_text()
     values = {}
-    for line in path.read_text().splitlines():
+    for line in content.splitlines():
         if not line.strip() or line.lstrip().startswith('#') or '=' not in line:
             continue
         key, value = line.split('=', 1)
@@ -107,22 +122,24 @@ def write_private(path: Path, content: str | bytes, uid: int = 0, gid: int = 0) 
         os.close(directory)
 
 
-def key_bytes(path: Path, uid: int, gid: int) -> bytes:
+@contextmanager
+def regular_file(path: Path):
     directory = parent_fd(path)
     try:
         descriptor = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
         with os.fdopen(descriptor, 'rb') as stream:
             if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
-                raise ValueError('JWT key files must be regular files')
-            raw = stream.read(65537)
-            if len(raw) > 65536:
-                raise ValueError('JWT key file is too large')
-            os.fchmod(stream.fileno(), 0o600)
-            if os.geteuid() == 0:
-                os.fchown(stream.fileno(), uid, gid)
-            return raw
+                raise ValueError('Input must be a regular file')
+            yield stream
     finally:
         os.close(directory)
+
+
+def bounded_bytes(stream) -> bytes:
+    raw = stream.read(65537)
+    if len(raw) > 65536:
+        raise ValueError('Input file is too large')
+    return raw
 
 
 def openssl(*args: str, content: bytes | None = None) -> bytes:
@@ -137,20 +154,29 @@ def prepare_keys(private: Path, public: Path, uid: int, gid: int) -> None:
         raise ValueError('JWT key files must be distinct')
     if public.exists() and not private.exists():
         raise ValueError('JWT private key missing; restore the original key pair')
-    raw = key_bytes(private, uid, gid) if private.exists() else openssl(
-        'genpkey', '-algorithm', 'RSA', '-pkeyopt', 'rsa_keygen_bits:2048')
-    openssl('rsa', '-check', '-noout', content=raw)
-    derived = openssl('pkey', '-pubout', content=raw)
-    description = openssl('pkey', '-text_pub', '-noout', content=raw).decode()
-    bits = re.search(r'Public-Key: \((\d+) bit\)', description)
-    if not bits or int(bits[1]) < 2048:
-        raise ValueError('JWT keys must use RSA with at least 2048 bits')
-    if public.exists() and key_bytes(public, uid, gid) != derived:
-        raise ValueError('JWT key files do not match; restore the original key pair')
-    if not private.exists():
-        write_private(private, raw, uid, gid)
-    if not public.exists():
-        write_private(public, derived, uid, gid)
+    with ExitStack() as files:
+        private_file = files.enter_context(regular_file(private)) if private.exists() else None
+        public_file = files.enter_context(regular_file(public)) if public.exists() else None
+        raw = bounded_bytes(private_file) if private_file else openssl(
+            'genpkey', '-algorithm', 'RSA', '-pkeyopt', 'rsa_keygen_bits:2048')
+        openssl('rsa', '-check', '-noout', content=raw)
+        derived = openssl('pkey', '-pubout', content=raw)
+        description = openssl('pkey', '-text_pub', '-noout', content=raw).decode()
+        bits = re.search(r'Public-Key: \((\d+) bit\)', description)
+        if not bits or int(bits[1]) < 2048:
+            raise ValueError('JWT keys must use RSA with at least 2048 bits')
+        if public_file and bounded_bytes(public_file) != derived:
+            raise ValueError('JWT key files do not match; restore the original key pair')
+        # Repair only the validated objects, never paths that may have changed during validation.
+        for stream in (private_file, public_file):
+            if stream:
+                os.fchmod(stream.fileno(), 0o600)
+                if os.geteuid() == 0:
+                    os.fchown(stream.fileno(), uid, gid)
+        if not private_file:
+            write_private(private, raw, uid, gid)
+        if not public_file:
+            write_private(public, derived, uid, gid)
 
 
 def database_identity(raw: str) -> tuple:
@@ -179,7 +205,7 @@ def configure(output: Path, domain: str, legacy: Path, root: Path, deployment: s
     checked_path(output)
     trusted_parent(output)
     options = native_options or {}
-    previous = {**read_env(legacy), **read_env(output)}
+    previous = {**read_env(legacy, privileged=True), **read_env(output, privileged=True)}
     fresh = str(options.get('FRESH', False)).lower() in {'true', '1'}
     data = previous.get('DATA_DIR') or str(root / 'data')
     if not Path(data).is_absolute():

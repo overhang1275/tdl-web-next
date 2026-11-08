@@ -101,6 +101,7 @@ def test_runtime_configuration_preserves_secret_and_does_not_infer_auth_url(tmp_
     env.write_text('AUTH_SECRET=keep-session-key\nAUTHENTIK_CLIENT_SECRET=keep-client-secret\n'
                    'AUTHENTIK_CLIENT_ID=client\nAUTHENTIK_ISSUER=https://identity.test/application/o/tdl/\n'
                    'DOWNLOADS_DIR=/mnt/existing\n')
+    env.chmod(0o640)
     candidate = tmp_path / 'candidate.env'
     result = shell('collect_options\nwrite_environment "$CANDIDATE"', tmp_path,
         ENV_FILE=env, CANDIDATE=candidate, SOURCE_DIR=ROOT, PUBLIC_URL='https://reference.test',
@@ -257,6 +258,7 @@ for raw in sys.argv[3:]:
 def test_legacy_fresh_initial_env_and_candidate_share_one_identity(tmp_path):
     legacy = tmp_path / 'legacy.env'
     legacy.write_text(f'DATABASE_URL=sqlite:///{tmp_path}/old.sqlite3\n')
+    legacy.chmod(0o640)
     result = shell('''
 collect_options
 APP_GROUP="$(id -gn)"
@@ -286,6 +288,7 @@ def test_repair_adds_bootstrap_file_in_config_not_temporary_candidate_directory(
     config = tmp_path / 'etc'
     config.mkdir()
     (config / 'tld-web.env').write_text('AUTH_SECRET=keep-existing-session-secret\n')
+    (config / 'tld-web.env').chmod(0o640)
     stage = tmp_path / 'stage'
     stage.mkdir()
     candidate = stage / 'candidate.env'
