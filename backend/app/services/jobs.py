@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import uuid4
 
@@ -24,6 +24,7 @@ from app.services.dedupe import key_for_payload
 from app.services.files import job_download_root
 from app.services.logs import append_deleted_job_log, append_job_log
 from app.services.paths import chat_path_key, safe_child
+from app.services.runtime_settings import require_storage_available
 
 
 class QueueUnavailableError(RuntimeError):
@@ -48,7 +49,7 @@ ACTIVE_STATUSES = (JobStatus.pending, JobStatus.running)
 
 
 def get_queue() -> Queue:
-    return Queue("telegram-downloads", connection=Redis.from_url(settings.redis_url))
+    return Queue(settings.rq_queue_name, connection=Redis.from_url(settings.redis_url))
 
 
 def ensure_queue_available() -> Queue:
@@ -66,6 +67,7 @@ def create_job(
     enqueue: bool = True,
     idempotency_key: str | None = None,
 ) -> DownloadJob:
+    require_storage_available(db)
     queue = ensure_queue_available() if enqueue else None
     dedupe_key = key_for_payload(payload, idempotency_key) if enqueue else None
     existing = None
@@ -94,6 +96,13 @@ def create_job(
     )
     db.add(job)
     try:
+        db.flush()
+        chat_key = chat_path_key(job.chat_id)
+        export_dir = safe_child(settings.exports_dir, chat_key)
+        download_dir = safe_child(settings.downloads_dir, chat_key, job.output_subfolder)
+        job.export_json_path = str(export_dir / "export.json")
+        job.filtered_json_path = str(export_dir / f"filtered-job-{job.id}.json")
+        job.download_path = str(download_dir)
         db.commit()
     except IntegrityError as exc:
         db.rollback()
@@ -106,14 +115,6 @@ def create_job(
         if existing is not None:
             raise DuplicateJobError(existing) from exc
         raise
-    db.refresh(job)
-    chat_key = chat_path_key(job.chat_id)
-    export_dir = safe_child(settings.exports_dir, chat_key)
-    download_dir = safe_child(settings.downloads_dir, chat_key, job.output_subfolder)
-    job.export_json_path = str(export_dir / "export.json")
-    job.filtered_json_path = str(export_dir / f"filtered-job-{job.id}.json")
-    job.download_path = str(download_dir)
-    db.commit()
     db.refresh(job)
     if enqueue:
         try:
@@ -135,13 +136,13 @@ def enqueue_job(db: Session, job: DownloadJob, delay: int = 0, queue=None) -> bo
         DownloadJob.status.in_(ACTIVE_STATUSES),
         DownloadJob.cancel_requested.is_(False),
         DownloadJob.rq_job_id == job.rq_job_id,
-    ).values(rq_job_id=token, rq_enqueued_at=datetime.utcnow(), status=JobStatus.pending))
+    ).values(rq_job_id=token, rq_enqueued_at=datetime.now(UTC), status=JobStatus.pending))
     db.commit()
     db.refresh(job)
     if not claimed.rowcount:
         if job.cancel_requested and job.status in ACTIVE_STATUSES:
             job.status, job.stage = JobStatus.cancelled, JobStage.cancelled
-            job.finished_at = datetime.utcnow()
+            job.finished_at = datetime.now(UTC)
             db.commit()
         return False
     kwargs = {"job_id": token, "job_timeout": settings.command_timeout_seconds + 120}
@@ -196,6 +197,8 @@ def cancel_job(db: Session, job: DownloadJob) -> DownloadJob:
 
 
 def retry_job(db: Session, job: DownloadJob, mode: str = "pending") -> DownloadJob:
+    require_storage_available(db)
+    db.refresh(job)
     if mode not in {"pending", "failed"}:
         raise ValueError("mode must be pending or failed")
     if job.status in ACTIVE_STATUSES:
@@ -214,7 +217,6 @@ def retry_job(db: Session, job: DownloadJob, mode: str = "pending") -> DownloadJ
         DownloadJob.id == job.id,
         DownloadJob.status.in_((JobStatus.failed, JobStatus.cancelled)),
     ).values(status=JobStatus.pending))
-    db.commit()
     db.refresh(job)
     if not claimed.rowcount:
         return job
@@ -233,7 +235,10 @@ def retry_job(db: Session, job: DownloadJob, mode: str = "pending") -> DownloadJ
             reset_pending_files(db, job)
     except Exception as exc:
         db.rollback()
-        job.status, job.stage = JobStatus.failed, JobStage.failed
+        require_storage_available(db)
+        db.refresh(job)
+        if job.status != JobStatus.cancelled:
+            job.status, job.stage = JobStatus.failed, JobStage.failed
         job.error_message = str(exc)
         db.commit()
         raise
@@ -251,6 +256,8 @@ def retry_job(db: Session, job: DownloadJob, mode: str = "pending") -> DownloadJ
 
 
 def wipe_delete_job(db: Session, job: DownloadJob) -> None:
+    require_storage_available(db)
+    db.refresh(job)
     if not shutil.which("wipe"):
         raise DeleteJobError("wipe no está instalado.")
 
@@ -428,7 +435,7 @@ def sync_pending_jobs_with_queue(db: Session, job_id: int | None = None) -> None
             rq_status = str(rq_job.get_status()).lower()
         except NoSuchJobError:
             # The SQL token is committed just before enqueue; allow that gap.
-            if job.rq_enqueued_at and (datetime.utcnow() - job.rq_enqueued_at).total_seconds() < 30:
+            if job.rq_enqueued_at and (datetime.now(UTC) - job.rq_enqueued_at).total_seconds() < 30:
                 continue
             error = "Trabajo ausente de la cola. Usa Reintentar pendientes para recuperar el avance guardado."
             rq_status = "missing"
@@ -443,7 +450,7 @@ def sync_pending_jobs_with_queue(db: Session, job_id: int | None = None) -> None
                 DownloadJob.id == job.id, DownloadJob.rq_job_id == token,
                 DownloadJob.status.in_(ACTIVE_STATUSES),
             ).values(stage=JobStage.failed, status=JobStatus.failed,
-                     error_message=error, finished_at=datetime.utcnow()),
+                     error_message=error, finished_at=datetime.now(UTC)),
                 execution_options={"synchronize_session": False})
             changed = changed or bool(result.rowcount)
     if changed:

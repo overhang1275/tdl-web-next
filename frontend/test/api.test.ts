@@ -39,4 +39,27 @@ describe("apiFetch", () => {
     const headers = new Headers(init.headers);
     expect(headers.get("x-requested-with")).toBe("tdl-web");
   });
+
+  it("redirects to login only when the session is gone", async () => {
+    const assign = vi.fn();
+    vi.stubGlobal("window", { location: { pathname: "/change-password", assign } });
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(null, { status: 401 })));
+    await expect(apiFetch("/api/session/change-password")).rejects.toMatchObject({ status: 401 });
+    expect(assign).toHaveBeenCalledWith("/login");
+  });
+
+  it("shows a rejected current password without leaving the form", async () => {
+    const assign = vi.fn();
+    vi.stubGlobal("window", { location: { pathname: "/change-password", assign } });
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(
+      JSON.stringify({ error: { code: "invalid_credentials", message: "La contraseña actual es incorrecta." } }),
+      { status: 400, headers: { "content-type": "application/json" } },
+    )));
+    await expect(apiFetch("/api/session/change-password")).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_credentials",
+      message: "La contraseña actual es incorrecta.",
+    });
+    expect(assign).not.toHaveBeenCalled();
+  });
 });

@@ -3,12 +3,11 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from sqlalchemy import create_engine, select
+from sqlalchemy import select
 from sqlalchemy.orm import sessionmaker
 
 from app import models, worker
 from app.config import settings
-from app.database import Base
 from app.models import DownloadJob, JobStatus
 from app.schemas import JobCreate
 from app.services import jobs
@@ -16,9 +15,8 @@ from app.services.tdl import TdlError
 
 
 @pytest.fixture
-def runtime(tmp_path, monkeypatch):
-    engine = create_engine(f"sqlite:///{tmp_path / 'db.sqlite'}")
-    Base.metadata.create_all(engine)
+def runtime(tmp_path, monkeypatch, test_engine):
+    engine = test_engine
     sessions = sessionmaker(bind=engine, expire_on_commit=False)
     for name in ('exports_dir', 'downloads_dir', 'logs_dir'):
         monkeypatch.setattr(settings, name, tmp_path / name)
@@ -36,7 +34,6 @@ def runtime(tmp_path, monkeypatch):
     monkeypatch.setattr(jobs, 'get_queue', lambda: queue)
     with sessions() as db:
         yield db, queue
-    engine.dispose()
 
 
 def make_job(db, messages):
@@ -60,6 +57,21 @@ def successful_download(self, source, destination, **kwargs):
     if kwargs.get('should_cancel'):
         kwargs['should_cancel']()
     return ''
+
+
+def test_postgres_aggregate_bytes_remain_exact_for_worker_speed(runtime):
+    from app.services.transfers import update_transfer_totals
+
+    db, _ = runtime
+    job = make_job(db, [])
+    size = 9_007_199_254_740_993
+    db.add(models.DownloadFile(job_id=job.id, chat_id='123', message_id='large',
+        file_name='large.bin', message_json='{}', destination_root='/tmp',
+        output_dir='large', size=size, status='completed'))
+    update_transfer_totals(db, job, commit=False)
+    assert job.download_observed_bytes == 9_007_199_254_740_993
+    # The worker divides bytes by monotonic (float) elapsed seconds before commit.
+    assert int(job.download_observed_bytes / 2.0) == 4_503_599_627_370_496
 
 
 def test_interruption_records_only_final_files_and_retry_keeps_same_job(runtime, monkeypatch):
@@ -437,25 +449,6 @@ def test_failed_continuation_enqueue_keeps_progress_and_can_retry(runtime, monke
         run_next(queue)
     db.expire_all()
     assert db.get(DownloadJob, job.id).total_downloaded_files == 2
-
-
-def test_sqlite_migration_preserves_existing_jobs(tmp_path, monkeypatch):
-    from sqlalchemy import inspect, text
-
-    from app import database
-    engine = create_engine(f"sqlite:///{tmp_path / 'legacy.sqlite'}")
-    monkeypatch.setattr(database, 'engine', engine)
-    monkeypatch.setattr(settings, 'database_url', f"sqlite:///{tmp_path / 'legacy.sqlite'}")
-    with engine.begin() as connection:
-        connection.execute(text('CREATE TABLE download_jobs (id INTEGER PRIMARY KEY, chat_id TEXT, export_json_path TEXT)'))
-        connection.execute(text("INSERT INTO download_jobs VALUES (7, '123', NULL)"))
-    database.migrate_sqlite()
-    database.migrate_sqlite()  # Restart must be idempotent.
-    columns = {column['name'] for column in inspect(engine).get_columns('download_jobs')}
-    assert {'transfer_initialized', 'total_failed_files', 'export_cursor', 'export_upper_id', 'rq_enqueued_at'} <= columns
-    with engine.connect() as connection:
-        assert connection.execute(text('SELECT id, chat_id, transfer_initialized FROM download_jobs')).one() == (7, '123', 0)
-    engine.dispose()
 
 
 def test_terminal_transition_honors_late_cancellation(runtime):

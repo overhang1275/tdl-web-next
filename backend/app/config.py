@@ -3,6 +3,9 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+from sqlalchemy.engine import make_url
+from sqlalchemy.exc import ArgumentError
+
 
 def load_env_file(path: Path = Path(".env"), *, override: bool = False) -> None:
     if not path.exists():
@@ -43,6 +46,7 @@ class Settings:
     tdl_binary: str
     tdl_namespace: str
     command_timeout_seconds: int
+    authentik_enabled: bool
     authentik_issuer: str
     authentik_audience: str
     authentik_jwks_url: str
@@ -60,10 +64,26 @@ class Settings:
         self.exports_dir = Path(os.getenv("EXPORTS_DIR", self.base_dir / "exports")).resolve()
         self.downloads_dir = Path(os.getenv("DOWNLOADS_DIR", self.base_dir / "downloads")).resolve()
         self.logs_dir = Path(os.getenv("LOGS_DIR", self.base_dir / "logs")).resolve()
-        self.database_url = os.getenv(
-            "DATABASE_URL", f"sqlite:///{self.base_dir / 'telegram_downloader.sqlite3'}"
-        )
+        try:
+            database_url = make_url(os.getenv("DATABASE_URL", ""))
+            if database_url.drivername not in {"postgresql", "postgresql+psycopg"} or not database_url.database:
+                raise ValueError
+        except (ArgumentError, ValueError):
+            raise RuntimeError(
+                "DATABASE_URL must name a PostgreSQL database: "
+                "postgresql+psycopg://user:password@host/database. SQLite is no longer supported."
+            ) from None
+        self.database_url = database_url.set(drivername="postgresql+psycopg").render_as_string(hide_password=False)
+        self.rq_queue_name = os.getenv(
+            "RQ_QUEUE_NAME", "" if self.environment == "production" else "telegram-downloads"
+        ).strip()
+        if not self.rq_queue_name:
+            raise RuntimeError("RQ_QUEUE_NAME must not be empty")
         self.redis_url = os.getenv("REDIS_URL", "redis://127.0.0.1:6379/0")
+        self.auth_rate_limit_prefix = "tdl:auth:login"
+        self.auth_rotation_prefix = "tdl:auth:rotation"
+        self.jwt_private_key_file = Path(os.getenv("JWT_PRIVATE_KEY_FILE", self.base_dir / "keys" / "jwt-private.pem")).resolve()
+        self.jwt_public_key_file = Path(os.getenv("JWT_PUBLIC_KEY_FILE", self.base_dir / "keys" / "jwt-public.pem")).resolve()
         self.tdl_binary = os.getenv("TDL_BINARY", "tdl")
         self.tdl_namespace = os.getenv("TDL_NAMESPACE", "default")
         self.command_timeout_seconds = int(os.getenv("COMMAND_TIMEOUT_SECONDS", "7200"))
@@ -72,6 +92,10 @@ class Settings:
             1, int(os.getenv("DOWNLOAD_IDLE_TIMEOUT_SECONDS", "600"))
         )
         self.export_batch_size = max(1, int(os.getenv("EXPORT_BATCH_SIZE", "5000")))
+        authentik_enabled = os.getenv("AUTHENTIK_ENABLED", "false").strip().lower()
+        if authentik_enabled not in {"true", "false"}:
+            raise RuntimeError("AUTHENTIK_ENABLED must be true or false")
+        self.authentik_enabled = authentik_enabled == "true"
         self.authentik_issuer = os.getenv("AUTHENTIK_ISSUER", "").strip()
         self.authentik_audience = os.getenv("AUTHENTIK_AUDIENCE", "").strip()
         self.authentik_jwks_url = os.getenv("AUTHENTIK_JWKS_URL", "").strip()
@@ -84,18 +108,15 @@ class Settings:
         self.enable_docs = _bool("ENABLE_DOCS", self.environment != "production")
 
     def validate(self) -> None:
-        if os.getenv("DEPLOYMENT_MODE") == "docker" and self.database_url.startswith("sqlite:///"):
-            database_dir = Path(self.database_url.removeprefix("sqlite:///")).resolve().parent
-            mounted_dir = Path(os.getenv("DATABASE_DIR", str(self.base_dir))).resolve()
-            if database_dir != mounted_dir:
-                raise RuntimeError("DATABASE_DIR must match the SQLite directory mounted by Docker")
-        if self.environment != "production":
+        if not self.authentik_enabled:
             return
-        if not self.authentik_issuer or not self.authentik_audience or not self.authentik_jwks_url:
+        if not all((self.authentik_issuer, self.authentik_audience, self.authentik_jwks_url, self.authentik_admin_group)):
             raise RuntimeError(
-                "AUTHENTIK_ISSUER, AUTHENTIK_AUDIENCE and AUTHENTIK_JWKS_URL are required "
-                "in production"
+                "AUTHENTIK_ISSUER, AUTHENTIK_AUDIENCE, AUTHENTIK_JWKS_URL and "
+                "AUTHENTIK_ADMIN_GROUP are required when AUTHENTIK_ENABLED=true"
             )
+        if len(self.authentik_issuer) > 2048:
+            raise RuntimeError("AUTHENTIK_ISSUER must be at most 2048 characters")
 
     def ensure_directories(self) -> None:
         for path in (

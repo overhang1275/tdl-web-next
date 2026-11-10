@@ -8,6 +8,7 @@ from app.api.errors import ApiError
 from app.database import get_db
 from app.schemas import ResetRequest, UserRead
 from app.services.admin import reset_application_state
+from app.services.audit import audited_operation
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
@@ -24,4 +25,8 @@ def reset(
             "Escribe REINICIAR para confirmar.",
             400,
         )
-    return reset_application_state(db, keep_session=payload.keep_session)
+    with audited_operation(db, _.id, "application.reset") as event:
+        result = reset_application_state(db, keep_session=payload.keep_session)
+        complete = result.get("redis_cleared") and result.get("filesystem_cleared")
+        event["outcome"] = "success" if complete else "partial"
+    return result

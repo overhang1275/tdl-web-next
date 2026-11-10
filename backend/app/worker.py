@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import time
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 
 from sqlalchemy import select, update
@@ -87,7 +87,7 @@ def mark_terminal(db, job: DownloadJob, status: JobStatus, error: str | None = N
         conditions.append(DownloadJob.cancel_requested.is_(False))
     result = db.execute(update(DownloadJob).where(*conditions).values(
         status=status, stage=JobStage(status.value), error_message=error,
-        finished_at=datetime.utcnow(), download_speed_bps=0,
+        finished_at=datetime.now(UTC), download_speed_bps=0,
         download_eta_seconds=0 if status == JobStatus.completed else None,
     ), execution_options={"synchronize_session": False})
     db.commit()
@@ -231,7 +231,7 @@ def run_download_job(job_id: int, token: str | None = None) -> None:
             return
         job = db.get(DownloadJob, job_id)
         execution_token = job.rq_job_id
-        job.started_at = job.started_at or datetime.utcnow()
+        job.started_at = job.started_at or datetime.now(UTC)
         db.commit()
         tdl = TdlService()
 

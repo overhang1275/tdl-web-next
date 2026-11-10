@@ -5,7 +5,7 @@ import signal
 import subprocess
 import threading
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 
 from app.services.tdl import TdlService
 
@@ -47,7 +47,7 @@ class InteractiveLoginService:
                 "code",
             ]
             tdl.ensure_runtime_dirs()
-            session = LoginSession(started_at=datetime.utcnow())
+            session = LoginSession(started_at=datetime.now(UTC))
             try:
                 import pty
             except ImportError as exc:
@@ -72,7 +72,7 @@ class InteractiveLoginService:
                 except Exception:
                     pass
                 session.error = f"tdl binary not found: {tdl.binary}"
-                session.finished_at = datetime.utcnow()
+                session.finished_at = datetime.now(UTC)
                 self._session = session
                 raise RuntimeError(session.error) from exc
 
@@ -133,7 +133,7 @@ class InteractiveLoginService:
         returncode = process.wait()
         with self._lock:
             session.returncode = returncode
-            session.finished_at = datetime.utcnow()
+            session.finished_at = datetime.now(UTC)
             if session.master_fd is not None:
                 try:
                     os.close(session.master_fd)

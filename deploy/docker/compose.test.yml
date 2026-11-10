@@ -1,10 +1,15 @@
 name: tdl-console-test
 
 x-api-env: &api-env
-  APP_ENV: production
+  APP_ENV: test
+  PYTHONPATH: /app/backend
+  E2E_INTEGRATION: '1'
+  E2E_LOCAL_PASSWORD: ${E2E_LOCAL_PASSWORD:-Isolated-only-password-2026}
+  AUTHENTIK_ENABLED: ${AUTHENTIK_ENABLED:-false}
   DATA_DIR: /data
-  DATABASE_URL: sqlite:////data/test.sqlite3
+  DATABASE_URL: postgresql+psycopg://tdl_test:tdl_test@postgres:5432/tdl_test
   REDIS_URL: redis://redis:6379/1
+  RQ_QUEUE_NAME: ${RQ_QUEUE_NAME:?Set isolated RQ_QUEUE_NAME}
   TDL_BINARY: /app/scripts/fake-tdl.sh
   AUTHENTIK_ISSUER: http://oidc:9000/application/o/tdl-console/
   AUTHENTIK_AUDIENCE: tdl-console
@@ -13,6 +18,18 @@ x-api-env: &api-env
   TRUSTED_HOSTS: api,localhost,127.0.0.1
 
 services:
+  postgres:
+    image: postgres:16.15-alpine
+    environment:
+      POSTGRES_USER: tdl_test
+      POSTGRES_PASSWORD: tdl_test
+      POSTGRES_DB: tdl_test
+    volumes: [test-postgres:/var/lib/postgresql/data]
+    healthcheck:
+      test: [CMD-SHELL, pg_isready -U tdl_test -d tdl_test]
+      interval: 2s
+      timeout: 2s
+      retries: 30
   redis:
     image: redis:7.4-alpine
     healthcheck:
@@ -21,6 +38,7 @@ services:
       timeout: 2s
       retries: 20
   oidc:
+    image: ${TDL_TEST_IMAGE_PREFIX:-tdl-console-test}-backend-tests
     build:
       context: ../..
       dockerfile: deploy/docker/Dockerfile.api
@@ -31,7 +49,30 @@ services:
       interval: 2s
       timeout: 3s
       retries: 20
+  migrate:
+    image: ${TDL_TEST_IMAGE_PREFIX:-tdl-console-test}-backend-tests
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.api
+      target: tests
+    command: [alembic, upgrade, head]
+    environment: *api-env
+    volumes: [test-data:/data]
+    depends_on:
+      postgres: {condition: service_healthy}
+  bootstrap:
+    image: ${TDL_TEST_IMAGE_PREFIX:-tdl-console-test}-backend-tests
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.api
+      target: tests
+    command: [python, /app/scripts/bootstrap-test-auth.py]
+    environment: *api-env
+    volumes: [test-data:/data]
+    depends_on:
+      migrate: {condition: service_completed_successfully}
   api:
+    image: ${TDL_TEST_IMAGE_PREFIX:-tdl-console-test}-backend-tests
     build:
       context: ../..
       dockerfile: deploy/docker/Dockerfile.api
@@ -40,14 +81,17 @@ services:
     environment: *api-env
     volumes: [test-data:/data]
     depends_on:
+      postgres: {condition: service_healthy}
+      migrate: {condition: service_completed_successfully}
+      bootstrap: {condition: service_completed_successfully}
       redis: {condition: service_healthy}
-      oidc: {condition: service_healthy}
     healthcheck:
       test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
       interval: 2s
       timeout: 3s
       retries: 30
   worker:
+    image: ${TDL_TEST_IMAGE_PREFIX:-tdl-console-test}-backend-tests
     build:
       context: ../..
       dockerfile: deploy/docker/Dockerfile.api
@@ -58,6 +102,7 @@ services:
     depends_on:
       api: {condition: service_healthy}
   web:
+    image: ${TDL_TEST_IMAGE_PREFIX:-tdl-console-test}-web
     build:
       context: ../..
       dockerfile: deploy/docker/Dockerfile.web
@@ -65,6 +110,7 @@ services:
     environment:
       AUTH_SECRET: playwright-test-secret-at-least-32-characters
       AUTH_URL: http://web:3000
+      AUTHENTIK_ENABLED: ${AUTHENTIK_ENABLED:-false}
       AUTHENTIK_ISSUER: http://oidc:9000/application/o/tdl-console/
       AUTHENTIK_CLIENT_ID: tdl-console
       AUTHENTIK_CLIENT_SECRET: test-client-secret
@@ -72,23 +118,36 @@ services:
       API_INTERNAL_URL: http://api:8000
     depends_on:
       api: {condition: service_healthy}
+      bootstrap: {condition: service_completed_successfully}
     healthcheck:
       interval: 3s
       start_period: 10s
       retries: 30
   backend-tests:
+    image: ${TDL_TEST_IMAGE_PREFIX:-tdl-console-test}-backend-tests
     build:
       context: ../..
       dockerfile: deploy/docker/Dockerfile.api
       target: tests
     profiles: [checks]
+    environment:
+      APP_ENV: test
+      DATABASE_URL: postgresql+psycopg://tdl_test:tdl_test@postgres:5432/tdl_test
+      TEST_DATABASE_URL: postgresql+psycopg://tdl_test:tdl_test@postgres:5432/tdl_test
+      TEST_REDIS_URL: redis://redis:6379/1
+      RQ_QUEUE_NAME: ${RQ_QUEUE_NAME:?Set isolated RQ_QUEUE_NAME}
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
   frontend-tests:
+    image: ${TDL_TEST_IMAGE_PREFIX:-tdl-console-test}-frontend-tests
     build:
       context: ../..
       dockerfile: deploy/docker/Dockerfile.web
       target: tests
     profiles: [checks]
   playwright:
+    image: ${TDL_TEST_IMAGE_PREFIX:-tdl-console-test}-playwright
     build:
       context: ../..
       dockerfile: deploy/docker/Dockerfile.playwright
@@ -96,11 +155,27 @@ services:
     environment:
       PLAYWRIGHT_BASE_URL: http://web:3000
       E2E_INTEGRATION: '1'
+      E2E_LOCAL_PASSWORD: ${E2E_LOCAL_PASSWORD:-Isolated-only-password-2026}
+      AUTHENTIK_ENABLED: ${AUTHENTIK_ENABLED:-false}
     volumes:
       - ../../docs/design-audit:/app/docs/design-audit
     depends_on:
       web: {condition: service_healthy}
       worker: {condition: service_started}
+      auth-control: {condition: service_started}
+
+  auth-control:
+    image: ${TDL_TEST_IMAGE_PREFIX:-tdl-console-test}-backend-tests
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.api
+      target: tests
+    command: [uvicorn, test_auth_control:app, --app-dir, /app/scripts, --host, 0.0.0.0, --port, '9001']
+    profiles: [checks]
+    environment: *api-env
+    depends_on:
+      bootstrap: {condition: service_completed_successfully}
 
 volumes:
+  test-postgres:
   test-data:

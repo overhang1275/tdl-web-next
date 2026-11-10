@@ -13,6 +13,6 @@ export default defineConfig({
     include: ["test/**/*.test.ts", "test/**/*.test.tsx"],
   },
   resolve: {
-    alias: { "@": root },
+    alias: { "@": root, "server-only": fileURLToPath(new URL("./test/server-only.ts", import.meta.url)) },
   },
 });

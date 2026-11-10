@@ -46,6 +46,33 @@ async function proxy(init: RequestInit = {}, token: Record<string, unknown> | nu
 }
 
 describe("BFF authentication and forwarding", () => {
+  it.each(["token", "refresh", "exchange", "logout", "activity"])("blocks the internal auth/%s endpoint", async (name) => {
+    const req = await request(`/api/v1/auth/${name}`);
+    const response = await routes.GET(req, { params: Promise.resolve({ path: ["auth", name] }) });
+    expect(response.status).toBe(404);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it.each([["auth%2frefresh"], ["auth", "..", "auth", "token"], ["auth%252frefresh"]])("rejects normalized path bypass %j", async (...path) => {
+    const req = await request("/api/v1/jobs");
+    const response = await routes.GET(req, { params: Promise.resolve({ path }) });
+    expect(response.status).toBe(404);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("keeps the cookie and fails recoverably on refresh outage", async () => {
+    fetchMock.mockResolvedValue(Response.json({ error: { code: "auth_unavailable" } }, { status: 503 }));
+    const response = await proxy({}, { expiresAt: 1, refreshToken: "outage-refresh" });
+    expect(response.status).toBe(503);
+    expect(response.headers.get("set-cookie")).not.toContain("Max-Age=0");
+  });
+
+  it("blocks app data with a restricted password-change session", async () => {
+    const response = await proxy({}, { mustChangePassword: true });
+    expect(response.status).toBe(403);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it("returns JSON 401 without a session", async () => {
     const response = await proxy({}, null);
     expect(response.status).toBe(401);
@@ -79,12 +106,12 @@ describe("BFF authentication and forwarding", () => {
   });
 
   it("refreshes an expired token and persists the rotated HttpOnly session", async () => {
-    fetchMock.mockImplementation(async (url) => String(url).includes("/application/o/token/")
-      ? Response.json({ access_token: "fresh-access", refresh_token: "rotated-refresh", expires_in: 300 })
+    fetchMock.mockImplementation(async (url) => String(url).includes("/auth/refresh")
+      ? Response.json({ access_token: "fresh-access", refresh_token: "rotated-refresh", expires_at: Date.now() / 1000 + 300, session_id: "session", must_change_password: false, user: { id: "operator", name: "Operator", username: "operator", groups: [] } })
       : Response.json({ ok: true }));
     const response = await proxy({}, { expiresAt: 1, refreshToken: "old-refresh" });
     expect(response.status).toBe(200);
-    expect(String(fetchMock.mock.calls[0][0])).toBe("https://auth.test/application/o/token/");
+    expect(String(fetchMock.mock.calls[0][0])).toBe("http://api:8000/api/v1/auth/refresh");
     expect(new Headers(fetchMock.mock.calls.at(-1)![1]?.headers).get("authorization")).toBe("Bearer fresh-access");
     const cookies = response.headers.get("set-cookie") ?? "";
     expect(cookies).toContain("HttpOnly");
@@ -93,7 +120,7 @@ describe("BFF authentication and forwarding", () => {
   });
 
   it("fails closed when refresh fails", async () => {
-    fetchMock.mockResolvedValue(Response.json({ error: "invalid_grant" }, { status: 400 }));
+    fetchMock.mockResolvedValue(Response.json({ error: { code: "invalid_token" } }, { status: 401 }));
     expect((await proxy({}, { expiresAt: 1, refreshToken: "revoked" })).status).toBe(401);
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
@@ -101,10 +128,10 @@ describe("BFF authentication and forwarding", () => {
   it("shares one refresh when dashboard requests arrive together", async () => {
     let refreshes = 0;
     fetchMock.mockImplementation(async (url) => {
-      if (!String(url).includes("/application/o/token/")) return Response.json({ ok: true });
+      if (!String(url).includes("/auth/refresh")) return Response.json({ ok: true });
       if (++refreshes > 1) return Response.json({ error: "invalid_grant" }, { status: 400 });
       await new Promise((resolve) => setTimeout(resolve, 30));
-      return Response.json({ access_token: "fresh-access", refresh_token: "rotated", expires_in: 300 });
+      return Response.json({ access_token: "fresh-access", refresh_token: "rotated", expires_at: Date.now() / 1000 + 300, session_id: "session", must_change_password: false, user: { id: "operator", username: "operator", name: "Operator", groups: [] } });
     });
     const responses = await Promise.all(Array.from({ length: 3 }, () => proxy({}, { expiresAt: 1, refreshToken: "shared-once" })));
     expect(responses.map((response) => response.status)).toEqual([200, 200, 200]);

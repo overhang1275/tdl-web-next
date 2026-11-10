@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import enum
-from datetime import datetime
+from datetime import UTC, datetime
+from uuid import UUID, uuid4
 
 from sqlalchemy import (
+    BigInteger,
     Boolean,
+    CheckConstraint,
     Date,
     DateTime,
     Enum,
@@ -14,11 +17,68 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    Uuid,
     text,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
+
+
+class User(Base):
+    __tablename__ = "users"
+    __table_args__ = (
+        CheckConstraint("username ~ '^[a-z0-9._-]{3,64}$'", name="ck_users_username"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    username: Mapped[str] = mapped_column(String(64), unique=True)
+    display_name: Mapped[str | None] = mapped_column(String(255))
+    password_hash: Mapped[str | None] = mapped_column(Text)
+    active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    must_change_password: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC), onupdate=lambda: datetime.now(UTC))
+
+
+class ExternalIdentity(Base):
+    __tablename__ = "external_identities"
+    __table_args__ = (UniqueConstraint("issuer", "subject", name="uq_external_identities_issuer_subject"),)
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    user_id: Mapped[UUID] = mapped_column(ForeignKey("users.id"), index=True)
+    issuer: Mapped[str] = mapped_column(String(2048))
+    subject: Mapped[str] = mapped_column(String(255))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
+
+
+class AuthSession(Base):
+    __tablename__ = "auth_sessions"
+    __table_args__ = (CheckConstraint("generation >= 0", name="ck_auth_sessions_generation"),)
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    user_id: Mapped[UUID] = mapped_column(ForeignKey("users.id"), index=True)
+    refresh_token_hash: Mapped[str] = mapped_column(String(64), unique=True)
+    previous_refresh_token_hash: Mapped[str | None] = mapped_column(String(64), index=True)
+    family_id: Mapped[UUID] = mapped_column(Uuid, default=uuid4, index=True)
+    generation: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
+    last_activity_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
+    absolute_expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    idle_expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    rotated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class AuditEvent(Base):
+    __tablename__ = "audit_events"
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    actor_id: Mapped[UUID | None] = mapped_column(ForeignKey("users.id"), index=True)
+    action: Mapped[str] = mapped_column(String(128))
+    target_id: Mapped[str | None] = mapped_column(String(255))
+    outcome: Mapped[str] = mapped_column(String(32))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC), index=True)
 
 
 class JobStatus(str, enum.Enum):
@@ -65,14 +125,14 @@ class DownloadJob(Base):
             "uq_download_jobs_active_dedupe",
             "dedupe_key",
             unique=True,
-            sqlite_where=text("status IN ('pending','running')"),
+            postgresql_where=text("status IN ('pending','running')"),
         ),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
     files: Mapped[list[DownloadFile]] = relationship(cascade="all, delete-orphan")
     rq_job_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
-    rq_enqueued_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    rq_enqueued_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     chat_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     chat_title: Mapped[str | None] = mapped_column(String(255), nullable=True)
     hashtag: Mapped[str | None] = mapped_column(String(128), nullable=True)
@@ -92,8 +152,8 @@ class DownloadJob(Base):
     total_filtered_messages: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     total_downloaded_files: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     download_observed_files: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
-    download_observed_bytes: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
-    download_speed_bps: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    download_observed_bytes: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
+    download_speed_bps: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
     download_eta_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
     status: Mapped[JobStatus] = mapped_column(Enum(JobStatus), default=JobStatus.pending, nullable=False)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -102,9 +162,9 @@ class DownloadJob(Base):
     export_cursor: Mapped[int | None] = mapped_column(Integer, nullable=True)
     export_upper_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     operation_attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
-    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     dedupe_key: Mapped[str | None] = mapped_column(String(64), nullable=True)
     deletion_requested: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     deletion_error: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -124,8 +184,8 @@ class DownloadFile(Base):
     destination_root: Mapped[str] = mapped_column(Text)
     output_dir: Mapped[str] = mapped_column(Text)
     local_path: Mapped[str | None] = mapped_column(Text, nullable=True)
-    expected_size: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    size: Mapped[int] = mapped_column(Integer, default=0)
+    expected_size: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    size: Mapped[int] = mapped_column(BigInteger, default=0)
     status: Mapped[str] = mapped_column(String(16), default="pending", index=True)
     attempts: Mapped[int] = mapped_column(Integer, default=0)
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -147,4 +207,4 @@ class DownloadTemplate(Base):
     refresh_export: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     export_only: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     output_subfolder: Mapped[str | None] = mapped_column(String(128), nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False)

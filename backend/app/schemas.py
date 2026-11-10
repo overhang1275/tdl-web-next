@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import date, datetime
 from typing import Literal
+from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -65,11 +66,70 @@ class JobCreate(BaseModel):
 
 
 class UserRead(BaseModel):
+    id: UUID | None = None
+    session_id: UUID | None = None
     username: str
     email: str | None = None
     name: str | None = None
     groups: list[str] = Field(default_factory=list)
     expires_at: datetime | None = None
+    must_change_password: bool = False
+
+
+class TokenPair(BaseModel):
+    access_token: str = Field(repr=False)
+    refresh_token: str = Field(repr=False)
+    expires_at: int
+    session_id: UUID
+    must_change_password: bool
+    user: UserRead
+
+
+class LocalLoginRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    username: str = Field(min_length=1, max_length=64)
+    password: str = Field(min_length=1, max_length=128, repr=False)
+
+
+class RefreshRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    refresh_token: str = Field(min_length=1, max_length=4096, repr=False)
+
+
+class ExchangeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    access_token: str = Field(min_length=1, max_length=16384, repr=False)
+
+
+class PasswordReset(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    password: str = Field(min_length=12, max_length=128, repr=False)
+
+
+class PasswordChange(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    current_password: str = Field(min_length=1, max_length=128, repr=False)
+    new_password: str = Field(min_length=12, max_length=128, repr=False)
+
+
+class UserCreate(PasswordReset):
+    username: str = Field(min_length=3, max_length=64, pattern=r"^[a-zA-Z0-9._-]+$")
+    display_name: str | None = Field(default=None, max_length=255, pattern=r"^[^\x00]*$")
+
+
+class UserUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    active: bool | None = Field(default=None, strict=True)
+    display_name: str | None = Field(default=None, max_length=255, pattern=r"^[^\x00]*$")
+
+    @model_validator(mode="after")
+    def active_not_null(self):
+        if "active" in self.model_fields_set and self.active is None:
+            raise ValueError("active cannot be null")
+        return self
 
 
 class StatusRead(BaseModel):
@@ -108,6 +168,20 @@ class ErrorResponse(BaseModel):
 
 class ORMModel(BaseModel):
     model_config = ConfigDict(from_attributes=True)
+
+
+class LocalUserRead(ORMModel):
+    id: UUID
+    username: str
+    display_name: str | None
+    active: bool
+    must_change_password: bool
+    created_at: datetime
+    updated_at: datetime
+
+
+class ManagedUserRead(LocalUserRead):
+    is_local: bool
 
 
 class JobRead(BaseModel):

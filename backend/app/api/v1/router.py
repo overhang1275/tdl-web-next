@@ -14,12 +14,14 @@ from app.api.v1 import (
     status,
     telegram,
     templates,
+    users,
 )
 from app.services.runtime_settings import guard_storage_write
 
 api_router = APIRouter()
 api_router.include_router(health.router)
 api_router.include_router(auth.router)
+api_router.include_router(users.router)
 api_router.include_router(status.router)
 api_router.include_router(dashboard.router)
 api_router.include_router(chats.router, dependencies=[Depends(guard_storage_write)])

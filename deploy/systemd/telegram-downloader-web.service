@@ -2,13 +2,14 @@
 Description=TDL Console Next.js frontend
 After=network-online.target telegram-downloader-api.service
 Wants=network-online.target telegram-downloader-api.service
+Requires=telegram-downloader-api.service
 
 [Service]
 User=telegramdl
 Group=telegramdl
 WorkingDirectory=/opt/tld-web/current/frontend/.next/standalone
-EnvironmentFile=/etc/telegram-downloader/telegram-downloader.env
-Environment=NODE_ENV=production HOSTNAME=127.0.0.1 PORT=3000
+EnvironmentFile=/etc/tld-web/runtime.env
+Environment=NODE_ENV=production HOSTNAME=127.0.0.1 PORT=8080
 ExecStart=/opt/tld-web/node/bin/node /opt/tld-web/current/frontend/.next/standalone/server.js
 Restart=on-failure
 RestartSec=5

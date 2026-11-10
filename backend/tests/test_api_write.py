@@ -4,13 +4,11 @@ from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from app import database
 from app.api.deps import get_current_user
 from app.config import settings
-from app.database import Base
 from app.main import app
 from app.models import DownloadFile, DownloadJob, JobStatus
 from app.schemas import UserRead
@@ -39,7 +37,7 @@ class FakeQueue:
 
 
 @pytest.fixture
-def api(tmp_path, monkeypatch):
+def api(tmp_path, monkeypatch, test_engine):
     for name, value in {
         "base_dir": tmp_path,
         "sessions_dir": tmp_path / "sessions",
@@ -49,8 +47,7 @@ def api(tmp_path, monkeypatch):
     }.items():
         monkeypatch.setattr(settings, name, value)
     settings.ensure_directories()
-    engine = create_engine(f"sqlite:///{tmp_path / 'write.sqlite'}")
-    Base.metadata.create_all(engine)
+    engine = test_engine
     sessions = sessionmaker(bind=engine, expire_on_commit=False)
     monkeypatch.setattr(database, "engine", engine)
     monkeypatch.setattr(database, "SessionLocal", sessions)
@@ -177,3 +174,19 @@ def test_reset_keeps_session_by_default(api):
     assert response.status_code == 200, response.text
     with sessions() as db:
         assert db.query(DownloadJob).count() == 0
+
+
+@pytest.mark.parametrize('terminal_status', [JobStatus.completed, JobStatus.failed, JobStatus.cancelled])
+def test_completed_job_can_repeat_same_idempotency_key(api, terminal_status):
+    client, sessions, _ = api
+    headers = {**WRITE_HEADERS, 'Idempotency-Key': 'same-key'}
+    first = client.post('/api/v1/jobs', headers=headers, json=create_payload())
+    assert first.status_code == 201, first.text
+    with sessions() as db:
+        job = db.get(DownloadJob, first.json()['id'])
+        job.status = terminal_status
+        db.commit()
+    second = client.post('/api/v1/jobs', headers=headers, json=create_payload())
+    assert second.status_code == 201, second.text
+    assert second.json()['id'] != first.json()['id']
+    assert client.post('/api/v1/jobs', headers=headers, json=create_payload()).status_code == 409

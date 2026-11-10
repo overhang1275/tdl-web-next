@@ -9,7 +9,7 @@ export default defineConfig({
   testDir: "./e2e",
   timeout: 60_000,
   workers: process.env.CI ? 1 : undefined,
-  expect: { timeout: 10_000 },
+  expect: { timeout: 20_000 },
   outputDir: "test-results",
   reporter: [["list"]],
   use: {

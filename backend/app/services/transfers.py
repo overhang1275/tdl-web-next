@@ -93,7 +93,7 @@ def initialize_transfers(db: Session, job: DownloadJob) -> None:
     update_transfer_totals(db, job)
 
 
-def reconcile_files(db: Session, items: list[DownloadFile]) -> None:
+def reconcile_files(db: Session, items: list[DownloadFile], *, commit: bool = True) -> None:
     for item in items:
         if item.status == "completed":
             if not verified_file(item):
@@ -120,31 +120,37 @@ def reconcile_files(db: Session, items: list[DownloadFile]) -> None:
             continue
         item.status, item.local_path, item.size = "completed", str(path), size
         item.last_error = None
-    db.commit()
+    if commit:
+        db.commit()
+    else:
+        db.flush()
 
 
-def update_transfer_totals(db: Session, job: DownloadJob) -> None:
+def update_transfer_totals(db: Session, job: DownloadJob, *, commit: bool = True) -> None:
+    db.flush()
     files, size = db.execute(select(func.count(), func.coalesce(func.sum(DownloadFile.size), 0)).where(
         DownloadFile.job_id == job.id, DownloadFile.status == "completed",
     )).one()
     job.total_downloaded_files = files
     job.download_observed_files = files
-    job.download_observed_bytes = size
+    job.download_observed_bytes = int(size)
     job.total_failed_files = db.scalar(select(func.count()).select_from(DownloadFile).where(
         DownloadFile.job_id == job.id, DownloadFile.status == "failed",
     )) or 0
-    db.commit()
+    if commit:
+        db.commit()
+    else:
+        db.flush()
 
 
 def reset_pending_files(db: Session, job: DownloadJob) -> None:
     items = list(db.scalars(select(DownloadFile).where(DownloadFile.job_id == job.id)))
-    reconcile_files(db, items)
+    reconcile_files(db, items, commit=False)
     for item in items:
         if item.status != "completed":
             item.status, item.attempts, item.last_error = "pending", 0, None
     job.operation_attempts = 0
-    db.commit()
-    update_transfer_totals(db, job)
+    update_transfer_totals(db, job, commit=False)
 
 
 def reset_failed_files(db: Session, job: DownloadJob) -> None:
@@ -153,5 +159,4 @@ def reset_failed_files(db: Session, job: DownloadJob) -> None:
         if item.status == "failed":
             item.status, item.attempts, item.last_error = "pending", 0, None
     job.operation_attempts = 0
-    db.commit()
-    update_transfer_totals(db, job)
+    update_transfer_totals(db, job, commit=False)

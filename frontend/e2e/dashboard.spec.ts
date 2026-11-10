@@ -1,10 +1,8 @@
-import { encode } from "@auth/core/jwt";
 import { expect, test, type Page } from "@playwright/test";
 import fs from "node:fs";
 import path from "node:path";
 
-const baseURL = process.env.PLAYWRIGHT_BASE_URL ?? "http://127.0.0.1:3100";
-const secret = "playwright-test-secret-at-least-32-characters";
+test.skip(!process.env.E2E_INTEGRATION, "Requires a real local authentication session.");
 const screenshots = path.resolve("../docs/design-audit/screenshots", process.env.AUDIT_RUN ?? "validation");
 fs.mkdirSync(screenshots, { recursive: true });
 
@@ -82,29 +80,11 @@ const status = {
 };
 
 async function authenticate(page: Page) {
-  const token = await encode({
-    token: {
-      sub: "admin",
-      name: "Admin",
-      email: "admin@example.com",
-      accessToken: "fixture-access-token",
-      expiresAt: Math.floor(Date.now() / 1000) + 3600,
-      groups: ["tdl-admin"],
-    },
-    secret,
-    salt: "authjs.session-token",
-    maxAge: 3600,
-  });
-  await page.context().addCookies([
-    {
-      name: "authjs.session-token",
-      value: token,
-      url: baseURL,
-      httpOnly: true,
-      sameSite: "Lax",
-      secure: false,
-    },
-  ]);
+  await page.goto("/login");
+  await page.getByLabel("Usuario", { exact: true }).fill("local-admin");
+  await page.getByLabel("Contraseña", { exact: true }).fill(process.env.E2E_LOCAL_PASSWORD!);
+  await page.getByRole("button", { name: "Iniciar sesión", exact: true }).click();
+  await expect(page).toHaveURL(/\/$/);
 }
 
 async function mockApi(page: Page) {

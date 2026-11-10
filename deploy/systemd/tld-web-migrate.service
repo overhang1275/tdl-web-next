@@ -1,0 +1,19 @@
+[Unit]
+Description=TDL PostgreSQL migration
+After=network-online.target postgresql.service
+Wants=network-online.target
+Before=telegram-downloader-api.service telegram-downloader-worker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=telegramdl
+Group=telegramdl
+WorkingDirectory=/opt/tld-web/current/backend
+EnvironmentFile=/etc/tld-web/runtime.env
+ExecStart=/opt/tld-web/current/venv/bin/alembic upgrade head
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+UMask=0077

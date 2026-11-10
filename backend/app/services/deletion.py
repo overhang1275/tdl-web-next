@@ -17,9 +17,12 @@ from app.services.jobs import (
     get_queue,
     wipe_delete_job,
 )
+from app.services.runtime_settings import require_storage_available
 
 
 def enqueue_delete(db, job: DownloadJob, delay: int = 0) -> str:
+    require_storage_available(db)
+    db.refresh(job)
     token = uuid4().hex
     job.deletion_requested = True
     job.deletion_error = None
@@ -48,6 +51,7 @@ def enqueue_delete(db, job: DownloadJob, delay: int = 0) -> str:
 def run_delete(job_id: int, token: str | None = None) -> None:
     db = SessionLocal()
     try:
+        require_storage_available(db)
         job = db.get(DownloadJob, job_id)
         if job is None:
             return
@@ -55,6 +59,7 @@ def run_delete(job_id: int, token: str | None = None) -> None:
             return
         if job.status in ACTIVE_STATUSES:
             cancel_job(db, job)
+            require_storage_available(db)
             job.deletion_requested = True
             job.deletion_rq_job_id = None
             db.commit()
@@ -79,6 +84,8 @@ def reconcile_deletions() -> None:
             ).all()
         )
         for job in jobs:
+            require_storage_available(db)
+            db.refresh(job)
             if job.deletion_rq_job_id:
                 try:
                     Job.fetch(job.deletion_rq_job_id, connection=get_queue().connection)

@@ -5,7 +5,7 @@ from test_api_write import WRITE_HEADERS, create_payload
 from test_api_write import api as api
 
 from app.config import settings
-from app.models import DownloadFile, DownloadJob, JobStatus
+from app.models import DownloadFile, DownloadJob, JobStage, JobStatus
 
 
 def values(root):
@@ -227,3 +227,436 @@ def test_native_rejects_temporary_storage(api, monkeypatch, destination):
     response = client.put('/api/v1/settings', headers=WRITE_HEADERS,
                           json={**values(Path(destination)), 'confirm_move': True})
     assert response.status_code == 400, response.text
+
+
+# Observe the real PostgreSQL wait instead of assuming a thread delay means blocking.
+def _wait_for_storage_contender(engine, contender_pid, finished):
+    from time import monotonic
+
+    from sqlalchemy import text
+
+    deadline = monotonic() + 10
+    with engine.connect() as observer:
+        while monotonic() < deadline:
+            if finished.is_set():
+                return False
+            if contender_pid and observer.scalar(text(
+                "SELECT EXISTS (SELECT FROM pg_locks WHERE pid = :pid "
+                "AND locktype = 'advisory' AND NOT granted)"
+            ), {'pid': contender_pid[0]}):
+                return True
+            finished.wait(0.01)
+    raise AssertionError('Contender neither completed nor waited for the storage lock')
+
+
+@pytest.mark.parametrize('first', ['create', 'move'])
+def test_create_job_and_move_are_serialized(api, monkeypatch, tmp_path, first):
+    _race_storage_request_with_move(api, monkeypatch, tmp_path, first, 'create')
+
+
+@pytest.mark.parametrize('first', ['delete', 'move'])
+def test_delete_job_and_move_are_serialized(api, monkeypatch, tmp_path, first):
+    _race_storage_request_with_move(api, monkeypatch, tmp_path, first, 'delete')
+
+
+def _race_storage_request_with_move(api, monkeypatch, tmp_path, first, action):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier, Event, current_thread
+
+    from sqlalchemy import event
+
+    from app.models import RuntimeSettings
+    from app.services import runtime_settings as runtime
+
+    client, sessions, _ = api
+    engine = sessions.kw['bind']
+    if action == 'delete':
+        with sessions() as db:
+            job = DownloadJob(chat_id='123', output_subfolder='download', status=JobStatus.completed)
+            db.add(job)
+            db.commit()
+            job_id = job.id
+    ready = Barrier(2, timeout=10)
+    release = Event()
+    finished = Event()
+    contender_pid = []
+    paused = False
+
+    def pause_first(db, *_):
+        nonlocal paused
+        if not paused:
+            paused = True
+            ready.wait()
+            assert release.wait(10)
+
+    if first == 'move':
+        require_idle = runtime._require_idle
+
+        def pause_idle(db):
+            require_idle(db)
+            pause_first(db)
+
+        monkeypatch.setattr(runtime, '_require_idle', pause_idle)
+    else:
+        # Keep the first job/deletion uncommitted while the move attempts its check.
+        event.listen(sessions.class_, 'before_flush', pause_first)
+
+    def capture_pid(connection, cursor, *_):
+        if current_thread().name != 'MainThread' and paused and not contender_pid:
+            contender_pid.append(cursor.connection.info.backend_pid)
+
+    event.listen(engine, 'before_cursor_execute', capture_pid)
+
+    def move():
+        return client.put('/api/v1/settings', headers=WRITE_HEADERS,
+                          json={**values(tmp_path / 'racing-move'), 'confirm_move': True})
+
+    def mutate():
+        if action == 'create':
+            return client.post('/api/v1/jobs', headers=WRITE_HEADERS, json=create_payload())
+        return client.request('DELETE', f'/api/v1/jobs/{job_id}',
+                              headers=WRITE_HEADERS, json={'confirm': True})
+
+    def second():
+        try:
+            return (mutate if first == 'move' else move)()
+        finally:
+            finished.set()
+
+    try:
+        with ThreadPoolExecutor(1, thread_name_prefix='storage-first') as one, \
+                ThreadPoolExecutor(1, thread_name_prefix='storage-second') as two:
+            winner = one.submit(move if first == 'move' else mutate)
+            ready.wait()
+            loser = two.submit(second)
+            try:
+                blocked = _wait_for_storage_contender(engine, contender_pid, finished)
+            finally:
+                release.set()
+            responses = [winner.result(timeout=10), loser.result(timeout=10)]
+        accepted = 202 if first == 'move' or action == 'delete' else 201
+        assert [response.status_code for response in responses] == [accepted, 409], [
+            response.text for response in responses]
+        assert blocked, 'Incompatible operation bypassed the PostgreSQL storage lock'
+        with sessions() as db:
+            row = db.get(RuntimeSettings, 1)
+            assert bool(row and row.operation_status == 'queued') == (first == 'move')
+    finally:
+        release.set()
+        event.remove(engine, 'before_cursor_execute', capture_pid)
+        if first != 'move':
+            event.remove(sessions.class_, 'before_flush', pause_first)
+
+
+def test_lock_released_after_rollback(api):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier, Event
+
+    from app.services.runtime_settings import _lock
+
+    _, sessions, _ = api
+    ready = Barrier(2, timeout=10)
+    finished = Event()
+    contender_pid = []
+    with sessions() as owner:
+        _lock(owner)
+        owner.add(DownloadJob(chat_id='rolled-back', output_subfolder='download'))
+        owner.flush()
+
+        def contend():
+            try:
+                with sessions() as db:
+                    contender_pid.append(db.connection().connection.driver_connection.info.backend_pid)
+                    ready.wait()
+                    _lock(db)
+                    db.commit()
+            finally:
+                finished.set()
+
+        with ThreadPoolExecutor(1) as executor:
+            waiting = executor.submit(contend)
+            ready.wait()
+            try:
+                blocked = _wait_for_storage_contender(sessions.kw['bind'], contender_pid, finished)
+            finally:
+                owner.rollback()
+            waiting.result(timeout=10)
+        assert blocked, 'Storage lock must remain held until rollback'
+    with sessions() as db:
+        assert db.query(DownloadJob).count() == 0
+
+
+def test_nested_storage_lock_preserves_pending_changes(api):
+    from sqlalchemy import text
+
+    from app.services.runtime_settings import _lock
+
+    _, sessions, _ = api
+    with sessions() as db:
+        db.execute(text("SET LOCAL lock_timeout = '1s'"))
+        _lock(db)
+        assert db.scalar(text('SHOW lock_timeout')) == '1s'
+        job = DownloadJob(chat_id='kept', output_subfolder='download')
+        db.add(job)
+        _lock(db)
+        assert db.scalar(text('SHOW lock_timeout')) == '1s'
+        db.commit()
+    with sessions() as db:
+        assert db.query(DownloadJob).one().chat_id == 'kept'
+
+
+def test_storage_guard_refreshes_preloaded_move_state(api):
+    from starlette.requests import Request
+
+    from app.api.errors import ApiError
+    from app.models import RuntimeSettings
+    from app.services.runtime_settings import guard_storage_write
+
+    _, sessions, _ = api
+    with sessions() as db:
+        db.add(RuntimeSettings(id=1, values_json='{}', operation_status='idle'))
+        db.commit()
+    with sessions() as stale, sessions() as writer:
+        cached = stale.get(RuntimeSettings, 1)
+        row = writer.get(RuntimeSettings, 1)
+        row.operation_status = 'queued'
+        writer.commit()
+        assert cached.operation_status == 'idle'
+        with pytest.raises(ApiError) as error:
+            guard_storage_write(Request({'type': 'http', 'method': 'POST'}), stale)
+        assert error.value.status_code == 409
+
+
+@pytest.mark.parametrize('action', ['create', 'retry', 'delete', 'wipe', 'reset'])
+def test_storage_services_reject_pending_move(api, action):
+    from app.api.errors import ApiError
+    from app.models import RuntimeSettings
+    from app.schemas import JobCreate
+    from app.services.admin import reset_application_state
+    from app.services.deletion import enqueue_delete
+    from app.services.jobs import create_job, retry_job, wipe_delete_job
+
+    _, sessions, _ = api
+    with sessions() as db:
+        job = DownloadJob(chat_id='123', output_subfolder='download', status=JobStatus.failed)
+        db.add(job)
+        db.add(RuntimeSettings(id=1, values_json='{}', operation_status='queued'))
+        db.commit()
+        with pytest.raises(ApiError) as error:
+            if action == 'create':
+                create_job(db, JobCreate(**create_payload()), enqueue=False)
+            elif action == 'retry':
+                retry_job(db, job)
+            elif action == 'delete':
+                enqueue_delete(db, job)
+            elif action == 'wipe':
+                wipe_delete_job(db, job)
+            else:
+                reset_application_state(db)
+        assert error.value.status_code == 409
+
+
+def test_reset_keeps_storage_lock_through_filesystem_cleanup(api, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier, Event
+
+    from app.services import admin
+    from app.services.runtime_settings import _lock
+
+    client, sessions, _ = api
+    ready = Barrier(2, timeout=10)
+    finished = Event()
+    contender_pid = []
+    cleanup = admin._remove_contents
+    checked = False
+
+    def contend():
+        try:
+            with sessions() as db:
+                contender_pid.append(db.connection().connection.driver_connection.info.backend_pid)
+                ready.wait()
+                _lock(db)
+                db.commit()
+        finally:
+            finished.set()
+
+    with ThreadPoolExecutor(1) as executor:
+        waiting = None
+
+        def check_cleanup(path):
+            nonlocal checked, waiting
+            if not checked:
+                checked = True
+                waiting = executor.submit(contend)
+                ready.wait()
+                assert _wait_for_storage_contender(sessions.kw['bind'], contender_pid, finished), (
+                    'Reset released the storage lock before deleting files')
+            cleanup(path)
+
+        monkeypatch.setattr(admin, '_remove_contents', check_cleanup)
+        response = client.post('/api/v1/admin/reset', headers=WRITE_HEADERS,
+                               json={'confirmation': 'REINICIAR', 'keep_session': True})
+        if waiting is not None:
+            waiting.result(timeout=10)
+        assert response.status_code == 200, response.text
+        assert checked
+
+
+@pytest.mark.parametrize('phase', ['create_paths', 'retry_snapshot', 'retry_reconcile'])
+def test_late_job_preparation_cannot_cross_cancel_and_move(api, monkeypatch, tmp_path, phase):
+    import json
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier, Event, current_thread
+
+    from sqlalchemy import event
+
+    from app.services import runtime_settings as runtime
+    from app.services import transfers
+
+    client, sessions, _ = api
+    engine = sessions.kw['bind']
+    ready = Barrier(2, timeout=10)
+    release = Event()
+    finished = Event()
+    contender_pid = []
+    paused = False
+    job_id = None
+    target = tmp_path / 'late-preparation-move'
+    if phase != 'create_paths':
+        created = client.post('/api/v1/jobs', headers=WRITE_HEADERS, json=create_payload())
+        job_id = created.json()['id']
+        with sessions() as db:
+            job = db.get(DownloadJob, job_id)
+            job.status = JobStatus.failed
+            Path(job.filtered_json_path).parent.mkdir(parents=True, exist_ok=True)
+            Path(job.filtered_json_path).write_text(json.dumps({'id': 123, 'messages': []}))
+            db.commit()
+
+    def pause():
+        nonlocal paused
+        if not paused:
+            paused = True
+            ready.wait()
+            assert release.wait(10)
+
+    commit = sessions.class_.commit
+
+    def pause_paths(db):
+        nonlocal job_id
+        for item in db.dirty:
+            if isinstance(item, DownloadJob) and item.download_path and not paused:
+                job_id = item.id
+                pause()
+                break
+        return commit(db)
+
+    if phase == 'create_paths':
+        monkeypatch.setattr(sessions.class_, 'commit', pause_paths)
+    elif phase == 'retry_snapshot':
+        write = transfers.write_json_atomic
+
+        def pause_snapshot(*args, **kwargs):
+            pause()
+            return write(*args, **kwargs)
+
+        monkeypatch.setattr(transfers, 'write_json_atomic', pause_snapshot)
+    else:
+        reconcile = transfers.reconcile_files
+
+        def pause_reconcile(*args, **kwargs):
+            result = reconcile(*args, **kwargs)
+            pause()
+            return result
+
+        monkeypatch.setattr(transfers, 'reconcile_files', pause_reconcile)
+
+    def capture_pid(connection, cursor, *_):
+        if current_thread().name != 'MainThread' and paused and not contender_pid:
+            contender_pid.append(cursor.connection.info.backend_pid)
+
+    event.listen(engine, 'before_cursor_execute', capture_pid)
+
+    def prepare():
+        if phase == 'create_paths':
+            return client.post('/api/v1/jobs', headers=WRITE_HEADERS, json=create_payload())
+        return client.post(f'/api/v1/jobs/{job_id}/retry', headers=WRITE_HEADERS)
+
+    def cancel_and_move():
+        try:
+            cancelled = client.post(f'/api/v1/jobs/{job_id}/cancel', headers=WRITE_HEADERS)
+            assert cancelled.status_code == 200, cancelled.text
+            move = client.put('/api/v1/settings', headers=WRITE_HEADERS,
+                              json={**values(target), 'confirm_move': True})
+            assert move.status_code == 202, move.text
+            runtime.run_settings_move(move.json()['operation']['id'])
+        finally:
+            finished.set()
+
+    try:
+        with ThreadPoolExecutor(1) as first, ThreadPoolExecutor(1) as second:
+            preparation = first.submit(prepare)
+            ready.wait()
+            mutation = second.submit(cancel_and_move)
+            try:
+                blocked = _wait_for_storage_contender(engine, contender_pid, finished)
+            finally:
+                release.set()
+            response = preparation.result(timeout=10)
+            mutation.result(timeout=10)
+            assert response.status_code in (200, 201), response.text
+        with sessions() as db:
+            job = db.get(DownloadJob, job_id)
+            assert job.download_path == str(target / '123' / 'download')
+            assert job.status == JobStatus.cancelled
+            assert job.stage == JobStage.cancelled
+            assert job.cancel_requested is True
+        assert blocked, 'Preparation released storage exclusion before its final write'
+    finally:
+        release.set()
+        event.remove(engine, 'before_cursor_execute', capture_pid)
+
+
+def test_worker_storage_lock_bounds_writers_and_allows_polling(api, monkeypatch, tmp_path):
+    from concurrent.futures import ThreadPoolExecutor, wait
+    from threading import Barrier, Event
+    from time import monotonic
+
+    from app.services import runtime_settings as runtime
+
+    client, sessions, _ = api
+    move = client.put('/api/v1/settings', headers=WRITE_HEADERS,
+                      json={**values(tmp_path / 'slow-move'), 'confirm_move': True})
+    assert move.status_code == 202, move.text
+    ready = Barrier(2, timeout=10)
+    release = Event()
+    copy = runtime._copy_tree
+
+    def slow_copy(*args):
+        ready.wait()
+        assert release.wait(10)
+        return copy(*args)
+
+    monkeypatch.setattr(runtime, '_copy_tree', slow_copy)
+    with ThreadPoolExecutor(5) as executor:
+        worker = executor.submit(runtime.run_settings_move, move.json()['operation']['id'])
+        ready.wait()
+        started = monotonic()
+        writers = [executor.submit(client.post, '/api/v1/jobs', headers=WRITE_HEADERS,
+                                   json={**create_payload(), 'chat_id': str(index)}) for index in range(4)]
+        try:
+            done, pending = wait(writers, timeout=2)
+            elapsed = monotonic() - started
+            polling = client.get('/api/v1/jobs')
+            assert polling.status_code == 200, polling.text
+            assert not pending, 'Writers waited indefinitely behind the file-copy transaction'
+            assert elapsed < 2
+            assert [future.result().status_code for future in done] == [409] * 4
+            assert all(future.result().json()['error']['code'] == 'storage_busy' for future in done)
+            assert polling.json()['total'] == 0
+        finally:
+            release.set()
+            worker.result(timeout=10)
+    assert client.get('/api/v1/settings').json()['operation']['status'] == 'completed'
+    assert client.post('/api/v1/jobs', headers=WRITE_HEADERS, json=create_payload()).status_code == 201
+    with sessions() as db:
+        assert db.query(DownloadJob).count() == 1

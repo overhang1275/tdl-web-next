@@ -7,6 +7,7 @@ from app.api.deps import get_current_user
 from app.config import settings
 from app.database import get_db
 from app.schemas import SettingsUpdate, UserRead
+from app.services.audit import audited_operation
 from app.services.runtime_settings import load_runtime, operation, retry_move, save_settings
 
 router = APIRouter(tags=["settings"])
@@ -52,7 +53,9 @@ def read_settings(db: Session = Depends(get_db), _: UserRead = Depends(get_curre
 @router.put("/settings")
 def update_settings(payload: SettingsUpdate, response: Response,
                     db: Session = Depends(get_db), _: UserRead = Depends(get_current_user)) -> dict:
-    moving = save_settings(db, payload)
+    with audited_operation(db, _.id, "settings.update") as result:
+        moving = save_settings(db, payload)
+        result["outcome"] = "accepted" if moving else "success"
     response.status_code = 202 if moving else 200
     return read_settings(db, _)
 
@@ -60,5 +63,6 @@ def update_settings(payload: SettingsUpdate, response: Response,
 @router.post("/settings/retry", status_code=202)
 def retry_settings_move(db: Session = Depends(get_db),
                         _: UserRead = Depends(get_current_user)) -> dict:
-    retry_move(db)
+    with audited_operation(db, _.id, "settings.retry", outcome="accepted"):
+        retry_move(db)
     return read_settings(db, _)

@@ -13,6 +13,11 @@ MASTER = ROOT / 'install-tld.sh'
 pytestmark = pytest.mark.skipif(os.name == 'nt', reason='Native Bash installer is tested in Linux Docker')
 
 
+@pytest.fixture(autouse=True)
+def isolated_installer_environment(monkeypatch):
+    monkeypatch.delenv('DATABASE_URL', raising=False)
+
+
 def shell(code, tmp_path, **variables):
     return subprocess.run(['bash', '-c', 'source "$MASTER"\n' + code],
         env={**os.environ, 'MASTER': str(MASTER), 'APP_ROOT': str(tmp_path / 'app-root'),
@@ -39,11 +44,156 @@ def test_saved_defaults_are_read_as_data_not_shell(tmp_path):
     config = tmp_path / 'install.conf'
     marker = tmp_path / 'executed'
     config.write_text(f'APP_PORT=8181\nPUBLIC_URL=\nUNUSED=$(touch {marker})\n')
+    config.chmod(0o640)
     result = shell('collect_options\nprint_summary', tmp_path, INSTALL_CONF=config)
     assert result.returncode == 0, result.stderr
     assert 'APP_PORT=8181' in result.stdout
     assert 'PUBLIC_URL=\n' in result.stdout
     assert not marker.exists()
+
+
+@pytest.mark.parametrize('kind', ['service_owned', 'writable', 'symlink', 'fifo'])
+def test_early_root_env_reads_reject_untrusted_input_before_paths(tmp_path, kind):
+    env = tmp_path / 'input.env'
+    env.write_text(f'APP_ROOT={tmp_path / "should-not-exist"}\n')
+    env.chmod(0o600)
+    if kind == 'service_owned':
+        os.chown(env, 10001, 10001)
+    elif kind == 'writable':
+        env.chmod(0o660)
+    elif kind == 'symlink':
+        link = tmp_path / 'link.env'
+        link.symlink_to(env)
+        env = link
+    else:
+        env.unlink()
+        os.mkfifo(env, 0o600)
+    result = shell('collect_options\nmkdir -p "$APP_ROOT"', tmp_path, ENV_FILE=env)
+    assert result.returncode != 0
+    assert not (tmp_path / 'should-not-exist').exists()
+
+
+def test_repair_refuses_service_writable_release_code(tmp_path):
+    release = tmp_path / 'release'
+    for name in ('backend/app/admin.py', 'scripts/configure-env.py', 'venv/bin/python'):
+        target = release / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text('fixture')
+    (release / 'backend/app/admin.py').chmod(0o666)
+    result = shell('RELEASE="$TEST_RELEASE"\nverify_release_code', tmp_path, TEST_RELEASE=release)
+    assert result.returncode != 0
+    assert 'root' in result.stderr
+
+
+def test_repair_refuses_code_directory_link_outside_release(tmp_path):
+    release = tmp_path / 'release'
+    for name in ('backend', 'scripts', 'venv'):
+        (release / name).mkdir(parents=True)
+    attacker = tmp_path / 'replaceable'
+    (attacker / 'root-owned').mkdir(parents=True)
+    os.chown(attacker, 10001, 10001)
+    (release / 'backend' / 'app').symlink_to(attacker / 'root-owned')
+    result = shell('RELEASE="$TEST_RELEASE"\nverify_release_code', tmp_path, TEST_RELEASE=release)
+    assert result.returncode != 0
+
+
+@pytest.mark.parametrize('untrusted', ['file_target_parent', 'release', 'release_parent'])
+def test_repair_rejects_replaceable_root_code_before_helper(tmp_path, untrusted):
+    release = tmp_path / 'releases' / 'candidate'
+    for name in ('backend', 'scripts', 'venv'):
+        (release / name).mkdir(parents=True)
+    marker = tmp_path / 'executed-helper'
+    target = release / 'scripts' / 'configure-env.py'
+    target.write_text(f'from pathlib import Path\nPath({str(marker)!r}).touch()\n')
+    target.chmod(0o600)
+    if untrusted == 'file_target_parent':
+        outside = tmp_path / 'service-owned'
+        outside.mkdir()
+        moved = outside / 'root-owned.py'
+        target.rename(moved)
+        target.symlink_to(moved)
+        os.chown(outside, 10001, 10001)
+        assert moved.stat().st_uid == 0
+    else:
+        os.chown(release if untrusted == 'release' else release.parent, 10001, 10001)
+    result = shell('RELEASE="$TEST_RELEASE"\nverify_release_code\npython3 "$RELEASE/scripts/configure-env.py"',
+                   tmp_path, TEST_RELEASE=release)
+    assert result.returncode != 0
+    assert not marker.exists()
+
+
+def test_repair_rejects_replaceable_intermediate_symlink_hop(tmp_path):
+    release = tmp_path / 'releases' / 'candidate'
+    for name in ('backend', 'scripts', 'venv'):
+        (release / name).mkdir(parents=True)
+    marker = tmp_path / 'executed-helper'
+    trusted = tmp_path / 'trusted-root'
+    trusted.mkdir()
+    final = trusted / 'configure-env.py'
+    final.write_text(f'from pathlib import Path\nPath({str(marker)!r}).touch()\n')
+    final.chmod(0o600)
+    outside = tmp_path / 'service-owned'
+    outside.mkdir()
+    hop = outside / 'hop.py'
+    hop.symlink_to(final)
+    os.chown(outside, 10001, 10001)
+    target = release / 'scripts' / 'configure-env.py'
+    target.symlink_to(hop)
+    assert final.stat().st_uid == 0
+    result = shell('RELEASE="$TEST_RELEASE"\nverify_release_code\npython3 "$RELEASE/scripts/configure-env.py"',
+                   tmp_path, TEST_RELEASE=release)
+    assert result.returncode != 0
+    assert not marker.exists()
+
+
+def test_repair_rejects_service_owned_ancestor_link_in_sticky_directory(tmp_path):
+    release = tmp_path / 'trusted' / 'candidate'
+    for name in ('backend', 'scripts', 'venv'):
+        (release / name).mkdir(parents=True)
+    sticky = tmp_path / 'sticky'
+    sticky.mkdir()
+    sticky.chmod(0o1777)
+    alias = sticky / 'release'
+    alias.symlink_to(release.parent)
+    os.lchown(alias, 10001, 10001)
+    result = shell('RELEASE="$TEST_RELEASE/candidate"\nverify_release_code',
+                   tmp_path, TEST_RELEASE=alias)
+    assert result.returncode != 0
+    assert 'Enlace de código modificable' in result.stderr
+
+
+def test_repair_rejects_dotdot_after_symlink_hop(tmp_path):
+    release = tmp_path / 'releases' / 'candidate'
+    for name in ('backend', 'scripts', 'venv', 'frontend'):
+        (release / name).mkdir(parents=True)
+    marker = tmp_path / 'executed-helper'
+    outside = tmp_path / 'service-owned'
+    (outside / 'dir').mkdir(parents=True)
+    payload = outside / 'evil.py'
+    payload.write_text(f'from pathlib import Path\nPath({str(marker)!r}).touch()\n')
+    payload.chmod(0o600)
+    (release / 'frontend' / 'link').symlink_to(outside / 'dir')
+    (release / 'frontend' / 'evil.py').write_text('pass\n')
+    target = release / 'scripts' / 'configure-env.py'
+    target.symlink_to('../frontend/link/../evil.py')
+    os.chown(outside, 10001, 10001)
+    result = shell('RELEASE="$TEST_RELEASE"\nverify_release_code\npython3 "$RELEASE/scripts/configure-env.py"',
+                   tmp_path, TEST_RELEASE=release)
+    assert result.returncode != 0
+    assert not marker.exists()
+
+
+def test_repair_accepts_trusted_root_release_with_venv_interpreter_link(tmp_path):
+    import sys
+    release = tmp_path / 'releases' / 'candidate'
+    for name in ('backend', 'scripts', 'venv/bin', 'venv/lib'):
+        (release / name).mkdir(parents=True)
+    (release / 'venv/bin/python').symlink_to(Path(sys.executable).resolve())
+    (release / 'venv/lib64').symlink_to('lib')
+    result = shell('RELEASE="$TEST_RELEASE"\nverify_release_code\n"$RELEASE/venv/bin/python" -c "print(123)"',
+                   tmp_path, TEST_RELEASE=release)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == '123'
 
 
 @pytest.mark.parametrize('assignment', ['APP_ROOT=/', 'APP_PORT=70000',
@@ -78,6 +228,13 @@ def test_units_use_loopback_selected_user_and_separate_processes(tmp_path):
     assert '--host 127.0.0.1 --port 8182' in api
     assert 'app.rq_worker' in worker
     assert '0.0.0.0' not in web + api + worker
+    migrate = (units / 'tld-web-migrate.service').read_text()
+    assert 'Type=oneshot' in migrate and 'alembic upgrade head' in migrate
+    assert 'Requires=tld-web-migrate.service' in api + worker
+    assert 'Requires=tld-web-api.service' in web
+    for unit in (api, worker, web, migrate):
+        assert 'EnvironmentFile=' + str(tmp_path / 'etc' / 'runtime.env') in unit
+        assert 'tld-web.env' not in unit
 
 
 def test_external_redis_has_no_local_systemctl_or_configuration_changes(tmp_path):
@@ -96,6 +253,7 @@ def test_runtime_configuration_preserves_secret_and_does_not_infer_auth_url(tmp_
     env.write_text('AUTH_SECRET=keep-session-key\nAUTHENTIK_CLIENT_SECRET=keep-client-secret\n'
                    'AUTHENTIK_CLIENT_ID=client\nAUTHENTIK_ISSUER=https://identity.test/application/o/tdl/\n'
                    'DOWNLOADS_DIR=/mnt/existing\n')
+    env.chmod(0o640)
     candidate = tmp_path / 'candidate.env'
     result = shell('collect_options\nwrite_environment "$CANDIDATE"', tmp_path,
         ENV_FILE=env, CANDIDATE=candidate, SOURCE_DIR=ROOT, PUBLIC_URL='https://reference.test',
@@ -103,13 +261,196 @@ def test_runtime_configuration_preserves_secret_and_does_not_infer_auth_url(tmp_
     assert result.returncode == 0, result.stderr
     values = dict(line.split('=', 1) for line in candidate.read_text().splitlines())
     assert values['AUTH_SECRET'] == 'keep-session-key'
-    assert values['AUTHENTIK_CLIENT_SECRET'] == 'keep-client-secret'
+    assert values['AUTHENTIK_ENABLED'] == 'false'
+    assert 'AUTHENTIK_CLIENT_SECRET' not in values
     assert values['DOWNLOADS_DIR'] == '/mnt/existing'
     assert values['PUBLIC_URL'] == 'https://reference.test'
     assert values['AUTH_URL'] == 'http://localhost:8080'
     assert values['REDIS_URL'] == 'redis://127.0.0.1:6379/0'
     assert 'WEB_PASSWORD' not in values
     assert 'SECRET_KEY' not in values
+
+
+def test_local_configuration_needs_no_provider_and_never_prints_password(tmp_path):
+    result = shell('''
+collect_options
+APP_GROUP="$(id -gn)"
+ensure_oidc
+write_environment "$ENV_FILE"
+''', tmp_path, SOURCE_DIR=ROOT, ASSUME_YES=1)
+    assert result.returncode == 0, result.stderr
+    env = tmp_path / 'etc' / 'tld-web.env'
+    values = dict(line.split('=', 1) for line in env.read_text().splitlines())
+    password = Path(values['ADMIN_PASSWORD_FILE'])
+    assert len(password.read_text().strip()) >= 12
+    assert str(password) in result.stdout and 'sudo cat --' in result.stdout
+    assert password.read_text().strip() not in result.stdout + result.stderr
+    assert env.stat().st_mode & 0o777 == 0o600
+    assert password.stat().st_mode & 0o777 == 0o600
+
+
+def test_bootstrap_passes_only_protected_paths_to_root_cli(tmp_path):
+    root = tmp_path / 'app-root'
+    executable = root / 'release' / 'venv' / 'bin' / 'python'
+    executable.parent.mkdir(parents=True)
+    log = tmp_path / 'argv'
+    executable.write_text('#!/bin/bash\nprintf "%s\\n" "$@" > "$ARGV_LOG"\n')
+    executable.chmod(0o755)
+    env = tmp_path / 'etc' / 'tld-web.env'
+    env.parent.mkdir()
+    password = env.parent / 'initial-password'
+    password.write_text('fixture-password-private\n')
+    password.chmod(0o600)
+    env.write_text(f'ADMIN_USERNAME=operator\nADMIN_PASSWORD_FILE={password}\n')
+    env.chmod(0o600)
+    result = shell('collect_options\nRELEASE="$APP_ROOT/release"\nbootstrap_admin', tmp_path, ARGV_LOG=log)
+    assert result.returncode == 0, result.stderr
+    argv = log.read_text().splitlines()
+    assert argv[:3] == ['-m', 'app.admin', 'create-admin']
+    assert argv[argv.index('--env-file') + 1] == str(env)
+    assert argv[argv.index('--password-file') + 1] == str(password)
+    assert 'fixture-password-private' not in log.read_text() + result.stdout + result.stderr
+
+
+def test_yes_and_piped_dry_run_flags_create_no_secrets(tmp_path):
+    for command in ([str(MASTER)], []):
+        args = ['bash', *command, '--dry-run', '--yes', '--fresh', '--admin-username', 'operator',
+                '--admin-password-file', str(tmp_path / 'private-password')]
+        result = subprocess.run(args if command else ['bash', '-s', '--', *args[1:]],
+            input='' if command else MASTER.read_text(), text=True, capture_output=True, timeout=10,
+            env={**os.environ, 'APP_ROOT': str(tmp_path / 'app'), 'CONFIG_DIR': str(tmp_path / 'config')})
+        assert result.returncode == 0, result.stderr
+    assert not (tmp_path / 'app').exists()
+    assert not (tmp_path / 'config').exists()
+    assert not (tmp_path / 'private-password').exists()
+
+
+def test_password_prompt_uses_pty_without_echo_and_preserves_on_repair(tmp_path):
+    import pty
+    import select
+    import time
+
+    terminal, child = pty.openpty()
+    password = 'Interactive-private-password-2026'
+    process = subprocess.Popen(['bash', '-c', 'source "$MASTER"; init_input; '
+        'ASSUME_YES=1; collect_options; ASSUME_YES=0; write_environment "$ENV_FILE"'],
+        stdin=child, stdout=child, stderr=child, start_new_session=True,
+        env={**os.environ, 'MASTER': str(MASTER), 'SOURCE_DIR': str(ROOT), 'APP_ROOT': str(tmp_path / 'app-root'),
+             'CONFIG_DIR': str(tmp_path / 'etc')})
+    os.close(child)
+    transcript = b''
+    try:
+        deadline = time.monotonic() + 10
+        while b'Contrase' not in transcript and time.monotonic() < deadline:
+            if select.select([terminal], [], [], 0.1)[0]:
+                transcript += os.read(terminal, 65536)
+        assert b'Contrase' in transcript
+        os.write(terminal, (password + '\n').encode())
+        process.wait(timeout=10)
+        while select.select([terminal], [], [], 0)[0]:
+            try:
+                transcript += os.read(terminal, 65536)
+            except OSError:
+                break
+        assert process.returncode == 0, transcript.decode(errors='replace')
+        assert password.encode() not in transcript
+        password_file = tmp_path / 'etc' / 'admin-password'
+        assert password_file.read_text().strip() == password
+        repair = shell('collect_options\nwrite_environment "$ENV_FILE"', tmp_path, SOURCE_DIR=ROOT, ASSUME_YES=1)
+        assert repair.returncode == 0, repair.stderr
+        assert password_file.read_text().strip() == password
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+        os.close(terminal)
+
+
+def test_secret_directory_writable_by_service_is_rejected(tmp_path):
+    if os.geteuid() != 0:
+        pytest.skip('Root directory trust guard requires root')
+    config = tmp_path / 'etc'
+    config.mkdir(mode=0o777)
+    config.chmod(0o777)
+    result = shell('collect_options\nwrite_environment "$ENV_FILE"', tmp_path, SOURCE_DIR=ROOT)
+    assert result.returncode != 0
+    assert not (config / 'admin-password').exists()
+
+
+def test_generated_keys_are_api_readable_but_env_and_password_are_root_only():
+    import tempfile
+
+    if os.geteuid() != 0:
+        pytest.skip('UID permission probe requires root')
+    with tempfile.TemporaryDirectory(prefix='tdl-bootstrap-permissions-') as temporary:
+        directory = Path(temporary)
+        directory.chmod(0o755)
+        result = shell('umask 077\ncollect_options\nwrite_environment "$ENV_FILE"', directory,
+                       SOURCE_DIR=ROOT, ASSUME_YES=1, APP_UID=10001, APP_GID=10001)
+        assert result.returncode == 0, result.stderr
+        env = directory / 'etc' / 'tld-web.env'
+        values = dict(line.split('=', 1) for line in env.read_text().splitlines())
+        probe = subprocess.run(['python3', '-c', '''
+import sys
+from pathlib import Path
+for raw in sys.argv[1:3]:
+    assert Path(raw).read_bytes()
+for raw in sys.argv[3:]:
+    try:
+        Path(raw).read_bytes()
+    except PermissionError:
+        pass
+    else:
+        raise AssertionError('service can read root-only material')
+''', values['JWT_PRIVATE_KEY_FILE'], values['JWT_PUBLIC_KEY_FILE'], str(env), values['ADMIN_PASSWORD_FILE']],
+            user=10001, group=10001, capture_output=True, text=True)
+        assert probe.returncode == 0, probe.stderr
+
+
+def test_legacy_fresh_initial_env_and_candidate_share_one_identity(tmp_path):
+    legacy = tmp_path / 'legacy.env'
+    legacy.write_text(f'DATABASE_URL=sqlite:///{tmp_path}/old.sqlite3\n')
+    legacy.chmod(0o640)
+    result = shell('''
+collect_options
+APP_GROUP="$(id -gn)"
+SAVE_DEFAULTS=0
+prepare_environment
+write_environment "$TEST_CANDIDATE"
+''', tmp_path, SOURCE_DIR=ROOT, FRESH=1, LEGACY_ENV_FILE=legacy, TEST_CANDIDATE=tmp_path / 'candidate')
+    assert result.returncode == 0, result.stderr
+    first = dict(line.split('=', 1) for line in (tmp_path / 'etc' / 'tld-web.env').read_text().splitlines())
+    second = dict(line.split('=', 1) for line in (tmp_path / 'candidate').read_text().splitlines())
+    names = ('DATABASE_URL', 'AUTH_SECRET', 'TDL_POSTGRES_PASSWORD', 'TDL_POSTGRES_ADMIN_PASSWORD',
+             'INSTALLATION_ID', 'RQ_QUEUE_NAME', 'ADMIN_PASSWORD_FILE', 'JWT_PRIVATE_KEY_FILE')
+    assert all(first[name] == second[name] for name in names)
+
+
+def test_canonical_env_symlink_is_rejected(tmp_path):
+    config = tmp_path / 'etc'
+    config.mkdir()
+    target = tmp_path / 'target.env'
+    target.write_text('AUTH_SECRET=keep\n')
+    (config / 'tld-web.env').symlink_to(target)
+    result = shell('collect_options\nvalidate_options', tmp_path)
+    assert result.returncode != 0
+
+
+def test_repair_adds_bootstrap_file_in_config_not_temporary_candidate_directory(tmp_path):
+    config = tmp_path / 'etc'
+    config.mkdir()
+    (config / 'tld-web.env').write_text('AUTH_SECRET=keep-existing-session-secret\n')
+    (config / 'tld-web.env').chmod(0o640)
+    stage = tmp_path / 'stage'
+    stage.mkdir()
+    candidate = stage / 'candidate.env'
+    result = shell('collect_options\nwrite_environment "$TEST_CANDIDATE"', tmp_path,
+                   SOURCE_DIR=ROOT, TEST_CANDIDATE=candidate, ASSUME_YES=1)
+    assert result.returncode == 0, result.stderr
+    values = dict(line.split('=', 1) for line in candidate.read_text().splitlines())
+    assert Path(values['ADMIN_PASSWORD_FILE']) == config / 'admin-password'
+    assert (config / 'admin-password').is_file()
+    assert not (stage / 'admin-password').exists()
 
 
 def test_release_extraction_rejects_traversal(tmp_path):
@@ -145,7 +486,7 @@ def test_candidate_native_values_are_explicit(tmp_path):
     assert values['PUBLIC_URL'] == 'https://reference.test'
 
 
-@pytest.mark.parametrize('failure', ['backup', 'health'])
+@pytest.mark.parametrize('failure', ['backup', 'migration', 'bootstrap', 'health'])
 @pytest.mark.parametrize('lan', [False, True])
 def test_activation_failure_recovers_environment_units_and_services(tmp_path, failure, lan):
     root = tmp_path / 'app-root'
@@ -154,7 +495,9 @@ def test_activation_failure_recovers_environment_units_and_services(tmp_path, fa
     (root / 'current').symlink_to(root / 'old')
     config = tmp_path / 'etc'
     config.mkdir()
-    (config / 'tld-web.env').write_text('AUTH_SECRET=original\n')
+    original = 'AUTH_SECRET=original\nDATABASE_URL=postgresql://app:pw@localhost/old\n'
+    (config / 'tld-web.env').write_text(original)
+    (config / 'tld-web.env').chmod(0o600)
     units = tmp_path / 'units'
     units.mkdir()
     (units / 'tld-web.service').write_text('old web unit')
@@ -163,6 +506,7 @@ def test_activation_failure_recovers_environment_units_and_services(tmp_path, fa
         (config / 'network.nft').write_text('old firewall configuration')
     candidate = tmp_path / 'candidate'
     candidate.write_text('AUTH_SECRET=new\n')
+    candidate.chmod(0o600)
     log = tmp_path / 'commands'
     result = shell('''
 collect_options
@@ -174,6 +518,7 @@ CANDIDATE="$TEST_CANDIDATE"
 if [[ "$APP_HOST" == 0.0.0.0 ]]; then render_firewall "$WORK/network.nft"; fi
 systemctl() { echo "$*" >> "$COMMAND_LOG"; }
 data_admin() {
+    echo "admin-$1" >> "$COMMAND_LOG"
     if [[ "$1" == backup ]]; then
         [[ "$FAILURE" != backup ]] || return 1
         mkdir -p "$APP_ROOT/backups/snapshot"
@@ -181,16 +526,33 @@ data_admin() {
     fi
 }
 configure_redis() { :; }
+prepare_postgres() { :; }
+prepare_runtime() { cp "$CANDIDATE" "$WORK/runtime.env"; }
+migrate_database() {
+    [[ "$(readlink "$APP_ROOT/current")" == "$APP_ROOT/old" ]] || exit 81
+    [[ "$(env_read "$ENV_FILE" AUTH_SECRET)" == original ]] || exit 82
+    echo migration >> "$COMMAND_LOG"
+    [[ "$FAILURE" != migration ]]
+}
+bootstrap_admin() {
+    [[ "$(readlink "$APP_ROOT/current")" == "$APP_ROOT/old" ]] || exit 83
+    [[ "$FAILURE" != bootstrap ]]
+}
 health_check() { [[ "$FAILURE" != health ]]; }
 activate_release
 ''', tmp_path, TEST_CANDIDATE=candidate, COMMAND_LOG=log, FAILURE=failure, INSTALL_REDIS=0,
         APP_HOST='0.0.0.0' if lan else '127.0.0.1')
     assert result.returncode != 0
-    assert (config / 'tld-web.env').read_text() == 'AUTH_SECRET=original\n'
+    assert result.returncode not in (81, 82, 83)
+    assert (config / 'tld-web.env').read_text() == original
     assert (units / 'tld-web.service').read_text() == 'old web unit'
     assert (root / 'current').resolve() == root / 'old'
     expected = 'start ' + ('tld-web-network ' if lan else '') + 'tld-web-api tld-web-worker tld-web'
     assert expected in log.read_text()
+    assert 'restore-database' not in log.read_text()
+    if failure != 'backup':
+        events = log.read_text()
+        assert events.index('stop tld-web') < events.index('admin-backup') < events.index('migration')
     if lan:
         assert (config / 'network.nft').read_text() == 'old firewall configuration'
         assert (units / 'tld-web-network.service').read_text() == 'old firewall unit'
@@ -207,6 +569,7 @@ ensure_oidc() { :; }
 prepare_candidate() { :; }
 prepare_environment() { :; }
 prepare_repair() { echo repaired; }
+verify_release_code() { :; }
 activate_release() { :; }
 resolve_source() { exit 91; }
 build_release() { exit 92; }
@@ -214,6 +577,35 @@ run_installation
 ''', tmp_path)
     assert result.returncode == 0, result.stderr
     assert 'repaired' in result.stdout
+
+
+def test_fresh_legacy_activation_never_opens_or_restores_sqlite(tmp_path):
+    root, config = tmp_path / 'app-root', tmp_path / 'etc'
+    (root / 'old').mkdir(parents=True)
+    (root / 'current').symlink_to(root / 'old')
+    config.mkdir()
+    sqlite = root / 'legacy.sqlite3'
+    sqlite.write_bytes(b'preserve old state')
+    env = config / 'tld-web.env'
+    original = f'DATABASE_URL=sqlite:///{sqlite}\n'
+    env.write_text(original)
+    env.chmod(0o600)
+    result = shell('''
+collect_options
+WORK="$APP_ROOT/work"; mkdir "$WORK" "$SYSTEMD_DIR"
+RELEASE="$APP_ROOT/new"
+systemctl() { :; }
+data_admin() { exit 91; }
+prepare_postgres() { echo prepared-fresh; }
+prepare_runtime() { :; }
+migrate_database() { return 1; }
+activate_release
+''', tmp_path, FRESH=1, INSTALL_REDIS=0)
+    assert result.returncode == 1
+    assert 'prepared-fresh' in result.stdout
+    assert sqlite.read_bytes() == b'preserve old state'
+    assert env.read_text() == original
+    assert (root / 'current').resolve() == root / 'old'
 
 
 def test_empty_input_accepts_prompt_default_using_pty(tmp_path):
@@ -246,6 +638,7 @@ def test_master_refuses_overlapping_data_and_code(tmp_path):
     config = tmp_path / 'etc'
     config.mkdir()
     (config / 'tld-web.env').write_text('DATA_DIR=/etc\n')
+    (config / 'tld-web.env').chmod(0o600)
     result = shell('collect_options\nvalidate_data_paths', tmp_path)
     assert result.returncode != 0
     assert 'datos' in result.stderr.lower()
@@ -302,21 +695,23 @@ def test_database_parent_cannot_be_system_configuration(tmp_path):
     config = tmp_path / 'etc'
     config.mkdir()
     (config / 'tld-web.env').write_text('DATABASE_URL=sqlite:////etc/database.sqlite3\n')
+    (config / 'tld-web.env').chmod(0o600)
     result = shell('collect_options\nvalidate_data_paths', tmp_path)
     assert result.returncode != 0
     assert 'datos' in result.stderr.lower()
 
 
-def test_oidc_discovery_must_match_exact_issuer(tmp_path):
+def test_optional_oidc_configuration_does_not_fetch_discovery(tmp_path):
     result = shell('''
 collect_options
 WORK="$APP_ROOT/work"; mkdir -p "$WORK"
-fetch() { echo '{"issuer":"https://other.test/"}' > "$2"; }
+fetch() { exit 91; }
 ensure_oidc
-''', tmp_path, AUTHENTIK_ISSUER='https://identity.test/application/o/tdl/',
+write_environment "$ENV_FILE"
+''', tmp_path, SOURCE_DIR=ROOT, AUTHENTIK_ENABLED='true', AUTHENTIK_ISSUER='https://identity.test/application/o/tdl/',
         AUTHENTIK_CLIENT_ID='client', AUTHENTIK_CLIENT_SECRET='secret')
-    assert result.returncode != 0
-    assert 'issuer' in result.stderr.lower()
+    assert result.returncode == 0, result.stderr
+    assert 'AUTHENTIK_ENABLED=true' in (tmp_path / 'etc' / 'tld-web.env').read_text()
 
 
 def test_layout_aliases_preserve_existing_app_directory(tmp_path):
@@ -331,7 +726,7 @@ def test_layout_aliases_preserve_existing_app_directory(tmp_path):
     assert os.readlink(root / 'config') == str(tmp_path / 'etc')
 
 
-def test_first_run_creates_complete_env_before_requesting_authentik(tmp_path):
+def test_first_run_creates_complete_local_env_without_authentik(tmp_path):
     root = tmp_path / 'app-root'
     root.mkdir()
     result = shell('''
@@ -341,7 +736,7 @@ WORK="$APP_ROOT/work"; mkdir "$WORK"
 prepare_environment
 ensure_oidc
 ''', tmp_path, SOURCE_DIR=ROOT, ASSUME_YES=1)
-    assert result.returncode != 0
+    assert result.returncode == 0, result.stderr
     env = tmp_path / 'etc' / 'tld-web.env'
     assert env.exists(), result.stderr
     values = dict(line.split('=', 1) for line in env.read_text().splitlines())
@@ -350,10 +745,10 @@ ensure_oidc
     assert values['DOWNLOAD_BATCH_SIZE'] == '100'
     assert len(values['AUTH_SECRET']) == 64
     assert os.readlink(root / '.env') == str(env)
-    assert env.stat().st_mode & 0o777 == 0o640
+    assert env.stat().st_mode & 0o777 == 0o600
     assert (tmp_path / 'etc' / 'install.conf').exists()
     assert values['AUTH_SECRET'] not in result.stdout + result.stderr
-    assert 'asistente' in result.stderr.lower()
+    assert values['AUTHENTIK_ENABLED'] == 'false'
 
 
 def test_preparing_environment_preserves_existing_bytes_and_secret(tmp_path):
@@ -362,6 +757,7 @@ def test_preparing_environment_preserves_existing_bytes_and_secret(tmp_path):
     env = config / 'tld-web.env'
     original = 'AUTH_SECRET=do-not-change\nCUSTOM_SETTING=keep\n'
     env.write_text(original)
+    env.chmod(0o600)
     result = shell('collect_options\nprepare_environment', tmp_path)
     assert result.returncode == 0, result.stderr
     assert env.read_text() == original
@@ -371,6 +767,7 @@ def test_generated_configuration_does_not_cancel_next_install_attempt(tmp_path):
     config = tmp_path / 'etc'
     config.mkdir()
     (config / 'tld-web.env').write_text('AUTH_SECRET=generated\n')
+    (config / 'tld-web.env').chmod(0o600)
     result = shell('id() { echo 0; }; run_installation() { echo "ACTION=$ACTION"; }; main --yes', tmp_path)
     assert result.returncode == 0, result.stderr
     assert 'ACTION=install' in result.stdout
@@ -380,6 +777,7 @@ def test_installed_application_keeps_noninteractive_cancel_default(tmp_path):
     config = tmp_path / 'etc'
     config.mkdir()
     (config / 'tld-web.env').write_text('AUTH_SECRET=generated\n')
+    (config / 'tld-web.env').chmod(0o600)
     root = tmp_path / 'app-root'
     (root / 'release').mkdir(parents=True)
     (root / 'current').symlink_to(root / 'release')

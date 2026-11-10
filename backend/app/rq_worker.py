@@ -9,10 +9,12 @@ from app.services.deletion import reconcile_deletions
 
 
 def main() -> None:
+    settings.validate()
+    settings.apply_umask()
     init_db()
     reconcile_deletions()
     connection = Redis.from_url(settings.redis_url)
-    worker = Worker([Queue("telegram-downloads", connection=connection)], connection=connection)
+    worker = Worker([Queue(settings.rq_queue_name, connection=connection)], connection=connection)
     worker.work(with_scheduler=True)
 
 

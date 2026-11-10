@@ -20,6 +20,7 @@ from app.schemas import (
     Page,
     UserRead,
 )
+from app.services.audit import audited_operation
 from app.services.deletion import enqueue_delete
 from app.services.files import (
     downloaded_file_path,
@@ -208,7 +209,8 @@ def delete_job_endpoint(
         raise ApiError("confirmation_required", "Confirma la eliminación.", 400)
     job = get_job_or_404(db, job_id)
     try:
-        enqueue_delete(db, job)
+        with audited_operation(db, _.id, "job.delete", job_id, outcome="accepted"):
+            enqueue_delete(db, job)
     except QueueUnavailableError as exc:
         raise ApiError("queue_unavailable", str(exc), 503) from exc
     return job_read(db, job, queue_position(job))
