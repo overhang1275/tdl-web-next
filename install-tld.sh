@@ -610,6 +610,10 @@ prepare_repair() {
     [[ -n "$NODE_BINARY" ]] || NODE_BINARY="$(find "$APP_ROOT/tools" -maxdepth 3 -type f -path '*/bin/node' -perm -u+x 2>/dev/null | sort -V | tail -1)"
     [[ -x "$NODE_BINARY" ]] || die 'No existe Node; usa update para reconstruir las dependencias.'
     TDL_BINARY="$(env_read "$ENV_FILE" TDL_BINARY)"
+    if [[ ! -x "$TDL_BINARY" ]]; then
+        TDL_BINARY="$(find "$APP_ROOT/tools" -maxdepth 3 -type f -path '*/tdl' -perm -u+x 2>/dev/null | sort -V | tail -1)"
+    fi
+    [[ -x "$TDL_BINARY" ]] || die 'No existe tdl; usa update para reconstruir los binarios.'
     RESOLVED_VERSION="$(env_read "$ENV_FILE" APP_VERSION)"
     RESOLVED_METHOD="$(env_read "$ENV_FILE" RESOLVED_METHOD)"
     export NODE_BINARY TDL_BINARY RESOLVED_VERSION RESOLVED_METHOD

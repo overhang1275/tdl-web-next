@@ -600,7 +600,7 @@ activate_release
         assert (units / 'tld-web-network.service').read_text() == 'old firewall unit'
 
 
-def test_repair_finds_versioned_node_when_env_lacks_it(tmp_path):
+def test_repair_finds_versioned_binaries_when_env_paths_are_missing(tmp_path):
     root = tmp_path / 'app-root'
     release = root / 'releases' / '20260101T000000-1'
     standalone = release / 'frontend' / '.next' / 'standalone'
@@ -614,15 +614,20 @@ def test_repair_finds_versioned_node_when_env_lacks_it(tmp_path):
     node.parent.mkdir(parents=True)
     node.write_text('#!/bin/sh\n')
     node.chmod(0o755)
+    tdl = root / 'tools' / 'tdl-0.20.4-64bit' / 'tdl'
+    tdl.parent.mkdir(parents=True)
+    tdl.write_text('#!/bin/sh\n')
+    tdl.chmod(0o755)
     (root / 'current').symlink_to(release)
     config = tmp_path / 'etc'
     config.mkdir()
     env = config / 'tld-web.env'
-    env.write_text('AUTH_SECRET=x\n')
+    env.write_text('AUTH_SECRET=x\nTDL_BINARY=/opt/tld-web/bin/tdl\n')
     env.chmod(0o600)
-    result = shell('collect_options\nprepare_repair\necho "NODE=$NODE_BINARY"', tmp_path)
+    result = shell('collect_options\nprepare_repair\necho "NODE=$NODE_BINARY"\necho "TDL=$TDL_BINARY"', tmp_path)
     assert result.returncode == 0, result.stderr
     assert f'NODE={node}' in result.stdout
+    assert f'TDL={tdl}' in result.stdout
 
 
 def test_repair_does_not_fetch_or_build(tmp_path):
