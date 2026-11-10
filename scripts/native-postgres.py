@@ -89,9 +89,13 @@ def provision(values, cluster, journal):
     addresses = psql(cluster, 'SHOW listen_addresses;')
     if not set(address.strip() for address in addresses.split(',')) <= {'localhost', '127.0.0.1', '::1'}:
         raise RuntimeError('El cluster local debe escuchar solo loopback; no se cambia su configuración compartida')
+    # Conservatively treat regex/include/group selectors as potential matches for trust.
     trust = psql(cluster, sql.SQL("""SELECT count(*) FROM pg_hba_file_rules WHERE error IS NOT NULL OR (
-        auth_method='trust' AND database && ARRAY['all','sameuser','samerole','samegroup',{}]
-        AND user_name && ARRAY['all',{}])""").format(sql.Literal(expected), sql.Literal(expected)))
+        auth_method='trust' AND (database && ARRAY['all','sameuser','samerole','samegroup',{}]
+            OR EXISTS (SELECT 1 FROM unnest(database) selector WHERE left(selector,1) IN ('/','@')))
+        AND (user_name && ARRAY['all',{}]
+            OR EXISTS (SELECT 1 FROM unnest(user_name) selector WHERE left(selector,1) IN ('/','+','@')))
+        )""").format(sql.Literal(expected), sql.Literal(expected)))
     if trust != '0':
         raise RuntimeError('Reglas HBA trust o inválidas para la aplicación; configure acceso específico autenticado')
     role = psql(cluster, sql.SQL("SELECT coalesce(shobj_description(oid, 'pg_authid'), '') FROM pg_roles WHERE rolname={}").format(sql.Literal(expected)))

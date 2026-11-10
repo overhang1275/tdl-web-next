@@ -1,12 +1,81 @@
 from __future__ import annotations
 
 import json
+import os
+import socket
 import subprocess
+import tempfile
+from pathlib import Path
 from uuid import uuid4
 
 import pytest
 from sqlalchemy import create_engine, text
 from test_deploy import load
+
+
+@pytest.fixture(scope='module')
+def parsed_hba_cluster():
+    binaries = Path('/usr/lib/postgresql/16/bin')
+    if not (binaries / 'initdb').is_file():
+        pytest.skip('Requires PostgreSQL16 server tools in the isolated Linux test runner')
+    import pwd
+    postgres = pwd.getpwnam('postgres')
+    with tempfile.TemporaryDirectory(prefix='tdl-hba-review-') as temporary:
+        root = Path(temporary)
+        root.chmod(0o755)
+        data, sockets = root / 'data', root / 'sockets'
+        for directory in (data, sockets):
+            directory.mkdir(mode=0o700)
+            os.chown(directory, postgres.pw_uid, postgres.pw_gid)
+        with socket.socket() as listener:
+            listener.bind(('127.0.0.1', 0))
+            port = listener.getsockname()[1]
+        def run(tool, *args, **kwargs):
+            return subprocess.run(['runuser', '-u', 'postgres', '--', str(binaries / tool), *args],
+                                  check=True, capture_output=True, text=True, timeout=20, **kwargs)
+        run('initdb', '-D', str(data), '--no-locale', '--encoding=UTF8', '--auth-local=peer', '--auth-host=scram-sha-256')
+        run('pg_ctl', '-D', str(data), '-l', str(data / 'server.log'), '-w', 'start', '-o',
+            f'-c listen_addresses=127.0.0.1 -c port={port} -c unix_socket_directories={sockets}')
+        try:
+            def query(statement):
+                sql = statement.as_string() if hasattr(statement, 'as_string') else statement
+                return run('psql', '-h', str(sockets), '-p', str(port), '-d', 'postgres',
+                           '-X', '-At', '-v', 'ON_ERROR_STOP=1', input=sql).stdout.strip()
+            yield data / 'pg_hba.conf', query, port
+        finally:
+            run('pg_ctl', '-D', str(data), '-m', 'immediate', '-w', 'stop')
+
+
+@pytest.mark.parametrize('database,user,method,reject', [
+    ('/^tdl_', 'all', 'trust', True),
+    ('all', '/^tdl_', 'trust', True),
+    ('/^tdl_', '/^tdl_', 'trust', True),
+    ('/^unrelated_', 'all', 'trust', True),
+    ('/^tdl_', '/^tdl_', 'scram-sha-256', False),
+    ('unrelated', 'all', 'trust', False),
+])
+def test_provision_checks_actual_parsed_hba_selectors(parsed_hba_cluster, tmp_path, monkeypatch,
+                                                     database, user, method, reject):
+    native = load('native-postgres')
+    hba, query, port = parsed_hba_cluster
+    hba.write_text(f'local all postgres peer\nhost {database} {user} 127.0.0.1/32 {method}\n'
+                   'host all all 127.0.0.1/32 scram-sha-256\n')
+    parsed = json.loads(query("SELECT row_to_json(r) FROM pg_hba_file_rules r WHERE line_number=2;"))
+    assert parsed['error'] is None
+    assert parsed['database'] == [database] and parsed['user_name'] == [user]
+    identifier = str(uuid4())
+    name = 'tdl_' + identifier.replace('-', '')
+    monkeypatch.setattr(native, 'psql', lambda cluster, statement: query(statement))
+    values = {'INSTALLATION_ID': identifier,
+              'DATABASE_URL': f'postgresql://{name}:disposable-test@127.0.0.1:{port}/{name}'}
+    if reject:
+        with pytest.raises(RuntimeError, match='trust'):
+            native.provision(values, ('16', 'review', str(port)), tmp_path / 'journal.json')
+        assert query(f"SELECT count(*) FROM pg_roles WHERE rolname='{name}';") == '0'
+        assert not (tmp_path / 'journal.json').exists()
+    else:
+        native.provision(values, ('16', 'review', str(port)), tmp_path / 'journal.json')
+        assert native.verify_target(values, fresh=True) == 16
 
 
 @pytest.mark.parametrize('query', ['', '?sslmode=require', '?sslmode=verify-full'])

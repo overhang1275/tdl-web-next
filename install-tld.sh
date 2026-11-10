@@ -616,17 +616,24 @@ prepare_repair() {
 
 verify_release_code() {
     python3 - "$RELEASE" <<'PY'
-import os, sys
+import sys
 from pathlib import Path
 release=Path(sys.argv[1])
+def trusted_chain(path):
+    for item in (path, *path.parents):
+        metadata=item.stat()
+        sticky_ancestor=item != path and item.is_dir() and metadata.st_mode & 0o1000
+        if metadata.st_uid != 0 or (metadata.st_mode & 0o022 and not sticky_ancestor):
+            raise SystemExit('Código root o sus directorios modificables por otro usuario; reconstruye con update')
+trusted_chain(release)
+trusted_chain(release.resolve(strict=True))
 for base in (release/'backend', release/'scripts', release/'venv'):
     if not base.is_dir(): raise SystemExit('Release root incompleta')
     for path in (base, *base.rglob('*')):
+        trusted_chain(path)
+        trusted_chain(path.resolve(strict=True))
         if path.is_symlink() and path.is_dir() and not path.resolve().is_relative_to(release):
             raise SystemExit('Código root enlazado a directorio fuera de la release; reconstruye con update')
-        st=path.stat()
-        if st.st_uid != 0 or st.st_mode & 0o022:
-            raise SystemExit('Código ejecutado por root modificable por otro usuario; reconstruye con update')
 PY
 }
 

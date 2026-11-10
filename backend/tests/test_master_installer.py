@@ -97,6 +97,44 @@ def test_repair_refuses_code_directory_link_outside_release(tmp_path):
     assert result.returncode != 0
 
 
+@pytest.mark.parametrize('untrusted', ['file_target_parent', 'release', 'release_parent'])
+def test_repair_rejects_replaceable_root_code_before_helper(tmp_path, untrusted):
+    release = tmp_path / 'releases' / 'candidate'
+    for name in ('backend', 'scripts', 'venv'):
+        (release / name).mkdir(parents=True)
+    marker = tmp_path / 'executed-helper'
+    target = release / 'scripts' / 'configure-env.py'
+    target.write_text(f'from pathlib import Path\nPath({str(marker)!r}).touch()\n')
+    target.chmod(0o600)
+    if untrusted == 'file_target_parent':
+        outside = tmp_path / 'service-owned'
+        outside.mkdir()
+        moved = outside / 'root-owned.py'
+        target.rename(moved)
+        target.symlink_to(moved)
+        os.chown(outside, 10001, 10001)
+        assert moved.stat().st_uid == 0
+    else:
+        os.chown(release if untrusted == 'release' else release.parent, 10001, 10001)
+    result = shell('RELEASE="$TEST_RELEASE"\nverify_release_code\npython3 "$RELEASE/scripts/configure-env.py"',
+                   tmp_path, TEST_RELEASE=release)
+    assert result.returncode != 0
+    assert not marker.exists()
+
+
+def test_repair_accepts_trusted_root_release_with_venv_interpreter_link(tmp_path):
+    import sys
+    release = tmp_path / 'releases' / 'candidate'
+    for name in ('backend', 'scripts', 'venv/bin', 'venv/lib'):
+        (release / name).mkdir(parents=True)
+    (release / 'venv/bin/python').symlink_to(Path(sys.executable).resolve())
+    (release / 'venv/lib64').symlink_to('lib')
+    result = shell('RELEASE="$TEST_RELEASE"\nverify_release_code\n"$RELEASE/venv/bin/python" -c "print(123)"',
+                   tmp_path, TEST_RELEASE=release)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == '123'
+
+
 @pytest.mark.parametrize('assignment', ['APP_ROOT=/', 'APP_PORT=70000',
     'PUBLIC_URL=http://example.test', 'APP_USER=root', 'APP_REF=--upload-pack=bad',
     'APP_ROOT=/opt/../etc', 'INSTALL_METHOD=unknown', 'APP_ALLOWED_SUBNET=0.0.0.0/0'])
