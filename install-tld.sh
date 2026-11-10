@@ -626,29 +626,40 @@ def reject(message):
     raise SystemExit(message)
 
 def trusted(path, hops=0):
-    if hops > max_hops:
-        reject('Cadena de enlaces no soportada en el código de la release; reconstruye con update')
     if not path.is_absolute():
         reject('Ruta de código no absoluta en la release; reconstruye con update')
-    parts = path.parts
     current = Path(path.anchor)
-    for index, part in enumerate(parts[1:]):
-        current = current / part
+    pending = list(path.parts[1:])
+    while pending:
+        part = pending.pop(0)
+        if part == '.':
+            continue
+        if part == '..':
+            current = current.parent
+            continue
+        candidate = current / part
         try:
-            metadata = current.lstat()
+            metadata = candidate.lstat()
         except OSError as error:
             reject(f'Código de la release inaccesible: {error}')
         if stat.S_ISLNK(metadata.st_mode):
+            hops += 1
+            if hops > max_hops:
+                reject('Cadena de enlaces no soportada en el código de la release; reconstruye con update')
             # A sticky parent only protects links owned by root; the service can replace its own link.
             if metadata.st_uid != 0:
                 reject('Enlace de código modificable por otro usuario; reconstruye con update')
-            target = Path(os.path.normpath(current.parent / os.readlink(current)))
-            trusted(target, hops + 1)
-            current = target
+            target = Path(os.readlink(candidate))
+            if target.is_absolute():
+                current = Path(target.anchor)
+                pending = list(target.parts[1:]) + pending
+            else:
+                pending = list(target.parts) + pending
             continue
-        sticky = index < len(parts) - 2 and stat.S_ISDIR(metadata.st_mode) and metadata.st_mode & 0o1000
+        sticky = bool(pending) and stat.S_ISDIR(metadata.st_mode) and metadata.st_mode & 0o1000
         if metadata.st_uid != 0 or (metadata.st_mode & 0o022 and not sticky):
             reject('Código root o sus directorios modificables por otro usuario; reconstruye con update')
+        current = candidate
 
 trusted(release)
 for base in (release/'backend', release/'scripts', release/'venv'):

@@ -159,7 +159,28 @@ def test_repair_rejects_service_owned_ancestor_link_in_sticky_directory(tmp_path
     result = shell('RELEASE="$TEST_RELEASE/candidate"\nverify_release_code',
                    tmp_path, TEST_RELEASE=alias)
     assert result.returncode != 0
-    assert 'modificable' in result.stderr
+    assert 'Enlace de código modificable' in result.stderr
+
+
+def test_repair_rejects_dotdot_after_symlink_hop(tmp_path):
+    release = tmp_path / 'releases' / 'candidate'
+    for name in ('backend', 'scripts', 'venv', 'frontend'):
+        (release / name).mkdir(parents=True)
+    marker = tmp_path / 'executed-helper'
+    outside = tmp_path / 'service-owned'
+    (outside / 'dir').mkdir(parents=True)
+    payload = outside / 'evil.py'
+    payload.write_text(f'from pathlib import Path\nPath({str(marker)!r}).touch()\n')
+    payload.chmod(0o600)
+    (release / 'frontend' / 'link').symlink_to(outside / 'dir')
+    (release / 'frontend' / 'evil.py').write_text('pass\n')
+    target = release / 'scripts' / 'configure-env.py'
+    target.symlink_to('../frontend/link/../evil.py')
+    os.chown(outside, 10001, 10001)
+    result = shell('RELEASE="$TEST_RELEASE"\nverify_release_code\npython3 "$RELEASE/scripts/configure-env.py"',
+                   tmp_path, TEST_RELEASE=release)
+    assert result.returncode != 0
+    assert not marker.exists()
 
 
 def test_repair_accepts_trusted_root_release_with_venv_interpreter_link(tmp_path):
