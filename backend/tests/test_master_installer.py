@@ -385,7 +385,7 @@ def test_generated_keys_are_api_readable_but_env_and_password_are_root_only():
     with tempfile.TemporaryDirectory(prefix='tdl-bootstrap-permissions-') as temporary:
         directory = Path(temporary)
         directory.chmod(0o755)
-        result = shell('collect_options\nwrite_environment "$ENV_FILE"', directory,
+        result = shell('umask 077\ncollect_options\nwrite_environment "$ENV_FILE"', directory,
                        SOURCE_DIR=ROOT, ASSUME_YES=1, APP_UID=10001, APP_GID=10001)
         assert result.returncode == 0, result.stderr
         env = directory / 'etc' / 'tld-web.env'

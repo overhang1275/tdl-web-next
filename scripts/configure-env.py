@@ -87,6 +87,8 @@ def parent_fd(path: Path, *, create: bool = False) -> int:
             if create:
                 try:
                     os.mkdir(component, mode=0o755, dir_fd=directory)
+                    # umask must not leave key directories untraversable by the service user.
+                    os.chmod(component, 0o755, dir_fd=directory)
                 except FileExistsError:
                     pass
             child = os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
