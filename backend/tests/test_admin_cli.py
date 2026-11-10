@@ -35,6 +35,16 @@ def secret(tmp_path, mode=0o600):
     return path
 
 
+def test_environment_loader_unescapes_quoted_values(tmp_path, monkeypatch):
+    from app import admin
+    envfile = tmp_path / "quoted.env"
+    envfile.write_text('AUTHENTIK_CLIENT_SECRET="a\\\\b\\"c"\n', encoding="utf8")
+    envfile.chmod(0o600)
+    monkeypatch.setattr(os, "environ", dict(os.environ))
+    admin._load_environment(envfile)
+    assert os.environ["AUTHENTIK_CLIENT_SECRET"] == 'a\\b"c'
+
+
 def test_root_cli_bootstrap_idempotent_reset_without_web(test_engine, tmp_path):
     path = secret(tmp_path)
     args = ("--username", "ADMIN", "--password-file", str(path))

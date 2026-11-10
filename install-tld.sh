@@ -158,6 +158,7 @@ collect_options() {
     SERVICE_NETWORK="$(pick_value SERVICE_NETWORK "$web-network")"
     SERVICE_MIGRATE=tld-web-migrate
     RUNTIME_ENV="$CONFIG_DIR/runtime.env"
+    WEB_ENV="$CONFIG_DIR/web.env"
     SERVICES=("$SERVICE_API" "$SERVICE_WORKER" "$SERVICE_WEB")
     if [[ "$APP_HOST" == 0.0.0.0 ]]; then SERVICES=("$SERVICE_NETWORK" "${SERVICES[@]}"); fi
     BACKUPS_DIR="$APP_ROOT/backups"
@@ -301,7 +302,7 @@ Requires=$SERVICE_API.service
 User=$APP_USER
 Group=${APP_GROUP:-$APP_USER}
 WorkingDirectory=$APP_ROOT/current/frontend/.next/standalone
-EnvironmentFile=$RUNTIME_ENV
+EnvironmentFile=$WEB_ENV
 Environment=NODE_ENV=production HOSTNAME=$APP_HOST PORT=$APP_PORT
 ExecStart=$NODE_BINARY $APP_ROOT/current/frontend/.next/standalone/server.js
 Restart=on-failure
@@ -743,7 +744,7 @@ prepare_postgres() {
 
 prepare_runtime() {
     "$RELEASE/venv/bin/python" "$SOURCE_DIR/scripts/native-postgres.py" runtime \
-        --env "$CANDIDATE" --output "$WORK/runtime.env"
+        --env "$CANDIDATE" --output "$WORK/runtime.env" --web-output "$WORK/web.env"
 }
 
 migrate_database() {
@@ -783,9 +784,10 @@ activate_release() (
         if [[ "$replaced" == 1 ]]; then
             systemctl stop "${SERVICES[@]}" || true
             systemctl stop "$SERVICE_MIGRATE" || true
-            for file in env defaults runtime; do
+            for file in env defaults runtime web; do
                 local destination="$ENV_FILE"; [[ "$file" != defaults ]] || destination="$INSTALL_CONF"
                 [[ "$file" != runtime ]] || destination="$RUNTIME_ENV"
+                [[ "$file" != web ]] || destination="$WEB_ENV"
                 if [[ -f "$backup/$file" ]]; then cp -p -- "$backup/$file" "$destination.rollback"; mv -f -- "$destination.rollback" "$destination"; else rm -f -- "$destination"; fi
             done
             if [[ "$APP_HOST" == 0.0.0.0 ]]; then
@@ -827,6 +829,7 @@ activate_release() (
     [[ ! -f "$ENV_FILE" ]] || cp -p -- "$ENV_FILE" "$backup/env"
     [[ ! -f "$INSTALL_CONF" ]] || cp -p -- "$INSTALL_CONF" "$backup/defaults"
     [[ ! -f "$RUNTIME_ENV" ]] || cp -p -- "$RUNTIME_ENV" "$backup/runtime"
+    [[ ! -f "$WEB_ENV" ]] || cp -p -- "$WEB_ENV" "$backup/web"
     if [[ "$APP_HOST" == 0.0.0.0 && -f "$CONFIG_DIR/network.nft" ]]; then cp -p "$CONFIG_DIR/network.nft" "$backup/network.nft"; fi
     for unit in "${SERVICES[@]}" "$SERVICE_MIGRATE"; do [[ ! -f "$SYSTEMD_DIR/$unit.service" ]] || cp -p -- "$SYSTEMD_DIR/$unit.service" "$backup/"; done
     if [[ "$INSTALL_REDIS" == 1 ]]; then
@@ -844,6 +847,8 @@ activate_release() (
     mv -f -- "$ENV_FILE.next" "$ENV_FILE"
     install -m 600 -o root -g root "$WORK/runtime.env" "$RUNTIME_ENV.next"
     mv -f -- "$RUNTIME_ENV.next" "$RUNTIME_ENV"
+    install -m 600 -o root -g root "$WORK/web.env" "$WEB_ENV.next"
+    mv -f -- "$WEB_ENV.next" "$WEB_ENV"
     if [[ "$APP_HOST" == 0.0.0.0 ]]; then install -m 600 "$WORK/network.nft" "$CONFIG_DIR/network.nft"; fi
     if [[ "$SAVE_DEFAULTS" == 1 ]]; then write_defaults "$INSTALL_CONF"; fi
     for unit in "${SERVICES[@]}" "$SERVICE_MIGRATE"; do install -m 644 "$WORK/units/$unit.service" "$SYSTEMD_DIR/"; done

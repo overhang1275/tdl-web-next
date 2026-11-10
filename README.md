@@ -4,14 +4,15 @@
 
 A Spanish-language web console for downloading Telegram media with `tdl`. Next.js renders
 the interface and acts as a BFF; FastAPI exposes `/api/v1` and holds the application logic;
-Redis/RQ runs the jobs. SQLite stores jobs, files, templates and settings, while the Telegram
-session, exports, logs and downloads live on the filesystem.
+Redis/RQ runs the jobs. PostgreSQL stores jobs, files, templates, users, sessions and
+settings, while the Telegram session, exports, logs and downloads live on the filesystem.
 
 The migration from the Jinja/HTMX UI is implemented: a Next.js 16 frontend, a FastAPI API,
-Authentik authentication, an RQ worker and two independent deployment paths (native LXC and
-Docker Compose). The real Authentik login has been verified in the local Docker environment.
-A real LXC installation, the public tunnel and downloads against real Telegram are still
-pending validation.
+local username/password authentication with optional Authentik single sign-on, an RQ worker
+and two independent deployment paths (native LXC and Docker Compose). Local login and the
+optional Authentik flow have been verified in the local Docker environment. A real LXC
+installation, the public tunnel and downloads against real Telegram are still pending
+validation.
 
 ## Architecture
 
@@ -19,9 +20,9 @@ pending validation.
 flowchart LR
   U[User] -->|HTTPS| N[Nginx / Next.js]
   N --> W[Next.js + Auth.js]
-  W -->|OIDC + PKCE| A[Authentik]
+  W -.->|optional OIDC + PKCE| A[Authentik]
   W -->|BFF: Bearer| API[FastAPI /api/v1]
-  API --> DB[(SQLite)]
+  API --> DB[(PostgreSQL)]
   API --> R[(Redis)]
   R --> WK[RQ worker]
   WK --> T[tdl]
@@ -37,16 +38,17 @@ flowchart LR
 | FastAPI | API, validation, auth, persistence and process control | Render application HTML |
 | RQ worker | Range exports, filtering, batched downloads and deletion | Serve HTTP |
 | Redis | Job queue and execution tokens | Store business state |
-| SQLite | Jobs, files, templates and runtime settings | Store large files |
+| PostgreSQL 16 | Jobs, files, templates, users, sessions, audit and settings | Store large files |
 | Filesystem | Telegram session, exports, filters, batches, logs and downloads | Replace the database |
 | `tdl` | Telegram access and file transfer | Be called from the browser |
-| Authentik | Single identity provider and access policy | Store application data |
+| Authentik | Optional single sign-on and access policy | Store application data |
 | Nginx (Docker) | TLS, rate limiting and same-origin proxy | Business logic |
 
 ## Features
 
-- Single sign-on through Authentik; the `tdl-admin` group grants access. There are no local
-  passwords or in-app registration.
+- Local username/password login with no public registration; the installer creates the first
+  administrator and only administrators manage other accounts. Authentik single sign-on is
+  optional (`AUTHENTIK_ENABLED`).
 - System status: Telegram session, `tdl` binary, Redis, worker, storage and installed version.
 - Chats with cache, search, type, order, profile, jobs and download cleanup.
 - New download with chat, text, hashtag, dates, file type, templates and output subfolder.
@@ -121,10 +123,9 @@ curl -fsSL https://raw.githubusercontent.com/overhang1275/tdl-web-next/refs/head
 ```
 
 The command opens the wizard on the available terminal, including when piped into Bash.
-It generates the basic configuration and local secret automatically, then asks for missing
-Authentik details before building. No manual `.env` copying or editing is required.
-Without a terminal it still creates the file and uses supplied environment values; missing
-Authentik details produce instructions to resume the wizard. `--yes` accepts defaults.
+It generates the basic configuration, the JWT keys and the initial administrator password
+automatically. No manual `.env` copying or editing is required. Without a terminal it still
+creates the file and uses supplied environment values. `--yes` accepts defaults.
 An already installed application defaults to cancel unless an explicit action is supplied.
 From a checkout, use `sudo bash install-tld.sh --source-dir "$PWD"`.
 
@@ -134,17 +135,21 @@ listens on `127.0.0.1:8080`, creates the passwordless `tld-web` service account 
 optional local Redis. The API uses a separate loopback port (`8000`); occupied ports are
 rejected.
 
-Login requires an external Authentik instance. The wizard asks for the HTTPS issuer, client ID
-and secret if they are missing. Configure a confidential OIDC provider with PKCE, RS256
-signing, the `openid profile email offline_access tdl-groups` scopes and the `tdl-admin`
-group. The `tdl-groups` scope must emit the `groups` claim. The callback is
+Login uses local accounts by default. The installer creates the first administrator and
+stores a one-time password in a root-only file; the app requires changing it at first login.
+There is no public registration, and only administrators manage other accounts.
+
+Authentik is optional. To enable it, set `AUTHENTIK_ENABLED=true` and configure a
+confidential OIDC provider with PKCE, RS256 signing, the
+`openid profile email offline_access tdl-groups` scopes and the `tdl-admin` group. The
+`tdl-groups` scope must emit the `groups` claim. The callback is
 `AUTH_URL/api/auth/callback/authentik`; for the default local access:
 `http://localhost:8080/api/auth/callback/authentik`. Do not mix `localhost` and `127.0.0.1`
 in the same flow: the cookie belongs to the host that starts the login.
 
 `PUBLIC_URL` is an optional reference, empty by default, and does not change `AUTH_URL`. To
 publish at `https://tld.opencore.dpdns.org`, point the tunnel at `http://127.0.0.1:8080`, use
-that HTTPS URL as `AUTH_URL` and register its callback in Authentik.
+that HTTPS URL as `AUTH_URL` and, if you enable Authentik, register its callback there.
 
 Installation layout:
 
@@ -152,7 +157,7 @@ Installation layout:
 /opt/tld-web/tools/                Versioned binaries
 /opt/tld-web/releases/<version>/   Backend, virtualenv and standalone frontend
 /opt/tld-web/current               Symlink to the active release
-/opt/tld-web/data/                 SQLite, session and files
+/opt/tld-web/data/                 Session, exports, downloads, logs and JWT keys
 /opt/tld-web/logs/                 Logs
 /opt/tld-web/tmp/                  Temporary files
 /opt/tld-web/backups/              Recovery backups, root-only
@@ -161,8 +166,10 @@ Installation layout:
 Non-secret defaults are stored in `/etc/tld-web/install.conf` and the sensitive environment
 in `/etc/tld-web/tld-web.env`, also linked at `/opt/tld-web/.env`. It is generated with
 restricted permissions and preserved across retries. `.env.native.example` is an optional
-reference. Previous installations keep their file in `/etc/telegram-downloader`,
-along with their user, paths, units and existing Nginx configuration.
+reference. The one-time administrator password is root-only at
+`/etc/tld-web/admin-password` (or the path in `ADMIN_PASSWORD_FILE`). Previous installations
+keep their file in `/etc/telegram-downloader`, along with their user, paths, units and
+existing Nginx configuration.
 
 Services: `tld-web-api`, `tld-web-worker` and `tld-web`. Maintenance from a checkout:
 
@@ -182,12 +189,13 @@ skipped. Private repositories require Git credentials and, to query Releases, `G
 the environment without persisting it.
 
 The release is built before cutover. Activation requires no pending jobs, deletions or
-transfers; it backs up SQLite, environment, defaults, units, session, exports and logs, and
-leaves downloads in place. A failure restores the previous symlink, configuration, units,
-database and services. Backups **do not include downloaded files**: keep your own external
-data backup. `repair` and `configure` reuse the installed release without downloading or
-building. In non-interactive mode, an existing installation cancels unless `--action` is
-provided; `--yes` accepts defaults and requires OIDC credentials to be configured already.
+transfers; it backs up PostgreSQL, environment, defaults, units, session, exports and logs,
+and leaves downloads in place. A failure restores the previous symlink, configuration, units
+and services; the PostgreSQL schema and data are not rolled back automatically. Backups
+**do not include downloaded files**: keep your own external data backup. `repair` and
+`configure` reuse the installed release without downloading or building. In non-interactive
+mode, an existing installation cancels unless `--action` is provided; `--yes` accepts
+defaults and uses the configured local administrator; OIDC is optional.
 
 ### Tunnel on another LAN machine
 
@@ -203,15 +211,17 @@ sources only on that port. The API stays on `127.0.0.1:8000`. The web unit requi
 the firewall; unavailable nftables support stops the change before exposure.
 Other firewall rules are preserved. For LXC `192.168.100.254`, set the tunnel
 destination to `http://192.168.100.254:8080`, with cloudflared on the allowed subnet.
-The restriction covers direct origin access; public tunnel visitors still use Authentik.
+The restriction covers direct origin access; public tunnel visitors sign in with a local
+account or with Authentik when it is enabled.
 
 ## Production with Docker Compose
 
-This path includes PostgreSQL, Authentik, Redis, the API, the worker, Next.js and Nginx. Only
-Nginx publishes ports 80/443, and it is independent of the native LXC installer.
+This path includes PostgreSQL, Redis, the API, the worker, Next.js and Nginx, plus optional
+Authentik. Only Nginx publishes ports 80/443, and it is independent of the native LXC
+installer.
 
-Requirements: Docker Engine with Compose v2, a domain with `app.DOMAIN` and `auth.DOMAIN`,
-and certificates for both names in `TLS_DIR`.
+Requirements: Docker Engine with Compose v2, a domain with `app.DOMAIN` and, to enable
+Authentik, `auth.DOMAIN`, with certificates for those names in `TLS_DIR`.
 
 ```bash
 python3 scripts/configure-env.py --deployment docker --output .env --domain example.test
@@ -226,20 +236,23 @@ they live outside `DATA_DIR`. Then:
 
 ```bash
 docker compose --env-file .env -f deploy/docker/compose.yml up -d --build --wait
-bash deploy/authentik/bootstrap.sh
 ```
 
-The blueprint creates the OIDC client and the `tdl-admin` group; the bootstrap adds `akadmin`
-to the group. The initial password is in `AUTHENTIK_BOOTSTRAP_PASSWORD` in `.env`. Do not
-publish that file.
+The `bootstrap` service creates the first administrator from `ADMIN_PASSWORD_FILE`; the app
+requires changing that password at first login. Authentik single sign-on is optional: run
+`bash deploy/authentik/bootstrap.sh` and set `AUTHENTIK_ENABLED=true` to enable it.
 
-Before updating, drain the queue, back up SQLite, run `pg_dump` for Authentik and back up the
-volumes; keep the previous images for rollback. The root `docker-compose.yml` includes the
-same Compose file.
+The blueprint creates the OIDC client and the `tdl-admin` group; the bootstrap adds `akadmin`
+to the group. The initial Authentik password is in `AUTHENTIK_BOOTSTRAP_PASSWORD` in `.env`.
+Do not publish that file.
+
+Before updating, drain the queue, back up PostgreSQL and the volumes, run `pg_dump` for
+Authentik if it is enabled, and keep the previous images for rollback. The root
+`docker-compose.yml` includes the same Compose file.
 
 ## Usage
 
-1. Sign in at `/login` through Authentik.
+1. Sign in at `/login` with a local account, or with Authentik if it is enabled.
 2. Connect Telegram in Settings using the code-based login.
 3. Create a download by choosing a chat, filters and, optionally, a template.
 4. Follow progress on the detail page; you can cancel, retry pending or failed files, and
@@ -247,7 +260,7 @@ same Compose file.
 5. Browse the job's files in the gallery or list, and review events in Activity log.
 
 In Settings you can edit the downloads folder and the limits for commands, download/export
-batches and idle time. They are stored in SQLite and take precedence over the initial
+batches and idle time. They are stored in PostgreSQL and take precedence over the initial
 environment values. Save with an empty queue. Changing the folder requires confirming the
 transfer: the worker copies and verifies with SHA-256, updates file paths and then empties the
 source. If it fails, it shows the error and allows a retry; downloads remain blocked until it
@@ -276,14 +289,16 @@ lists use `{"items", "page", "per_page", "total", "page_count"}`.
 | Settings | `PUT /settings`, `POST /settings/retry` |
 | Administration | `POST /admin/reset` |
 
-Login, callback, session and logout live in Next.js/Auth.js (`/api/auth/*`). FastAPI does not
-issue tokens: it validates the Authentik Bearer token injected by the BFF.
+Login, callback, session and logout live in Next.js/Auth.js (`/api/auth/*`). FastAPI issues
+short-lived RS256 access tokens and rotating refresh tokens; Auth.js keeps them in its
+encrypted HttpOnly cookie and the BFF forwards the access token. The Authentik flow is
+optional.
 
 ## Data and persistence
 
 | Data | Location |
 |---|---|
-| Jobs, files, templates and settings | SQLite `telegram_downloader.sqlite3` |
+| Jobs, files, templates, settings, users, sessions and audit | PostgreSQL 16 (Alembic migrations) |
 | Queue and execution tokens | Redis (`REDIS_URL`; in Docker, RQ uses its own database) |
 | Telegram session | `sessions/` |
 | Full export and per-job snapshots | `exports/<chat>/` |
@@ -292,14 +307,14 @@ issue tokens: it validates the Authentik Bearer token injected by the BFF.
 | Logs | `logs/job-<id>.log`, `logs/deleted-jobs.log` |
 | Chat cache | `chats.json` |
 
-SQLite migrations are additive (`dedupe_key`, persisted deletion and the `runtime_settings`
-table for settings and transfers). Real data is never converted or deleted without a backup.
+The PostgreSQL schema is managed with Alembic migrations. There is no SQLite importer: a
+clean install starts with an empty database, and existing SQLite files are not deleted.
 
 ## Tests
 
-The test stack is isolated: separate SQLite and Redis instances, a test OIDC/JWKS provider
-with RS256/PKCE and a fake `tdl` executable. It does not contact Telegram or mount production
-data. On exit, the scripts remove only the test containers and volumes.
+The test stack is isolated: separate PostgreSQL and Redis instances, a test OIDC/JWKS
+provider with RS256/PKCE and a fake `tdl` executable. It does not contact Telegram or mount
+production data. On exit, the scripts remove only the test containers and volumes.
 
 ```bash
 bash scripts/test.sh

@@ -232,8 +232,10 @@ def test_units_use_loopback_selected_user_and_separate_processes(tmp_path):
     assert 'Type=oneshot' in migrate and 'alembic upgrade head' in migrate
     assert 'Requires=tld-web-migrate.service' in api + worker
     assert 'Requires=tld-web-api.service' in web
-    for unit in (api, worker, web, migrate):
+    for unit in (api, worker, migrate):
         assert 'EnvironmentFile=' + str(tmp_path / 'etc' / 'runtime.env') in unit
+    assert 'EnvironmentFile=' + str(tmp_path / 'etc' / 'web.env') in web
+    for unit in (api, worker, web, migrate):
         assert 'tld-web.env' not in unit
 
 

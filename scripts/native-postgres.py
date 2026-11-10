@@ -23,12 +23,18 @@ DATABASE_URL REDIS_URL RQ_QUEUE_NAME JWT_PRIVATE_KEY_FILE JWT_PUBLIC_KEY_FILE TD
 COMMAND_TIMEOUT_SECONDS DOWNLOAD_BATCH_SIZE DOWNLOAD_IDLE_TIMEOUT_SECONDS EXPORT_BATCH_SIZE TRUSTED_HOSTS
 ENABLE_DOCS AUTHENTIK_ENABLED AUTHENTIK_ISSUER AUTHENTIK_AUDIENCE AUTHENTIK_JWKS_URL AUTHENTIK_ADMIN_GROUP
 AUTHENTIK_CLIENT_ID AUTHENTIK_CLIENT_SECRET AUTH_SECRET AUTH_URL AUTH_TRUST_HOST API_INTERNAL_URL'''.split())
+WEB_KEYS = set('''AUTH_SECRET AUTH_URL AUTH_TRUST_HOST AUTHENTIK_ENABLED AUTHENTIK_ISSUER
+AUTHENTIK_CLIENT_ID AUTHENTIK_CLIENT_SECRET API_INTERNAL_URL'''.split())
 
 
-def runtime_environment(source, destination):
+def runtime_environment(source, destination, web_destination=None):
     values = config.read_env(source, privileged=True)
+    filtered = {name: value for name, value in values.items() if name in RUNTIME_KEYS}
     config.write_private(destination, ''.join(f'{name}={config.encode_value(value)}\n'
-                                             for name, value in values.items() if name in RUNTIME_KEYS))
+                                             for name, value in filtered.items()))
+    if web_destination is not None:
+        config.write_private(web_destination, ''.join(f'{name}={config.encode_value(value)}\n'
+                                                      for name, value in filtered.items() if name in WEB_KEYS))
 
 
 def validate_url(values):
@@ -179,11 +185,12 @@ def main():
     parser.add_argument('action', choices=['prepare', 'runtime'])
     parser.add_argument('--env', required=True, type=Path)
     parser.add_argument('--output', required=True, type=Path)
+    parser.add_argument('--web-output', type=Path)
     parser.add_argument('--fresh', action='store_true')
     args = parser.parse_args()
     try:
         if args.action == 'runtime':
-            runtime_environment(args.env, args.output)
+            runtime_environment(args.env, args.output, args.web_output)
         else:
             prepare(args.env, args.output, fresh=args.fresh)
     except Exception as error:

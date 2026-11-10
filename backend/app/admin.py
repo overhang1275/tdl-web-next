@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import shlex
 import stat
 import sys
 from pathlib import Path
@@ -48,9 +49,11 @@ def _load_environment(path: Path) -> None:
             raise ValueError("Invalid environment file")
         value = value.strip()
         if value[:1] in {"'", '"'}:
-            if len(value) < 2 or value[-1] != value[0]:
+            # Same quoting rules as scripts/configure-env.py.
+            parts = shlex.split(value, comments=False)
+            if len(parts) != 1:
                 raise ValueError("Invalid quoted environment value")
-            value = value[1:-1]
+            value = parts[0]
         values[key.strip()] = value  # Literal data; never source/eval/expand.
     os.environ.update(values)
 

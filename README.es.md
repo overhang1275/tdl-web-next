@@ -4,14 +4,15 @@
 
 Consola web en español para descargar media de Telegram con `tdl`. Next.js presenta la
 interfaz y actúa como BFF; FastAPI expone `/api/v1` y concentra la lógica; Redis/RQ ejecuta
-los trabajos. SQLite conserva jobs, archivos, plantillas y ajustes; la sesión de Telegram,
-los exports, los logs y las descargas viven en el sistema de archivos.
+los trabajos. PostgreSQL conserva jobs, archivos, plantillas, usuarios, sesiones y ajustes;
+la sesión de Telegram, los exports, los logs y las descargas viven en el sistema de archivos.
 
 La migración desde la UI Jinja/HTMX está implementada: frontend Next.js 16, API FastAPI,
-autenticación con Authentik, worker RQ y dos despliegues independientes (nativo en LXC y
-Docker Compose). El login real contra Authentik está verificado en el entorno Docker local.
-Quedan pendientes de validación real la instalación en un LXC, el túnel público y las
-descargas contra Telegram real.
+autenticación local con usuario y contraseña y Authentik opcional, worker RQ y dos
+despliegues independientes (nativo en LXC y Docker Compose). El login local y el flujo
+opcional de Authentik están verificados en el entorno Docker local. Quedan pendientes de
+validación real la instalación en un LXC, el túnel público y las descargas contra Telegram
+real.
 
 ## Arquitectura
 
@@ -19,9 +20,9 @@ descargas contra Telegram real.
 flowchart LR
   U[Usuario] -->|HTTPS| N[Nginx / Next.js]
   N --> W[Next.js + Auth.js]
-  W -->|OIDC + PKCE| A[Authentik]
+  W -.->|OIDC + PKCE opcional| A[Authentik]
   W -->|BFF: Bearer| API[FastAPI /api/v1]
-  API --> DB[(SQLite)]
+  API --> DB[(PostgreSQL)]
   API --> R[(Redis)]
   R --> WK[Worker RQ]
   WK --> T[tdl]
@@ -33,20 +34,21 @@ flowchart LR
 
 | Componente | Responsabilidad | No hace |
 |---|---|---|
-| Next.js | Pantallas, formularios, tema, polling, sesión OIDC y BFF | Ejecutar comandos ni leer archivos del servidor |
+| Next.js | Pantallas, formularios, tema, polling, sesión y BFF | Ejecutar comandos ni leer archivos del servidor |
 | FastAPI | API, validación, auth, persistencia y control de procesos | Renderizar HTML de la aplicación |
 | Worker RQ | Export por rangos, filtrado, descargas por lotes y borrado | Servir HTTP |
 | Redis | Cola de trabajos y tokens de ejecución | Guardar el estado de negocio |
-| SQLite | Jobs, archivos, plantillas y ajustes de ejecución | Guardar archivos pesados |
+| PostgreSQL 16 | Jobs, archivos, plantillas, usuarios, sesiones, auditoría y ajustes | Guardar archivos pesados |
 | Sistema de archivos | Sesión de Telegram, exports, filtros, lotes, logs y descargas | Sustituir la base de datos |
 | `tdl` | Acceso a Telegram y transferencia de archivos | Ser llamado desde el navegador |
-| Authentik | Único proveedor de identidad y política de acceso | Almacenar datos de la aplicación |
+| Authentik | Inicio de sesión único y política de acceso opcionales | Almacenar datos de la aplicación |
 | Nginx (Docker) | TLS, rate limit y proxy same-origin | Lógica de negocio |
 
 ## Funciones
 
-- Login único con Authentik; el grupo `tdl-admin` autoriza el acceso. No hay contraseñas
-  locales ni registro dentro de la app.
+- Login local con usuario y contraseña, sin registro público; el instalador crea el primer
+  administrador y solo los administradores gestionan las demás cuentas. Authentik es
+  opcional (`AUTHENTIK_ENABLED`).
 - Estado del sistema: sesión de Telegram, binario `tdl`, Redis, worker, almacenamiento y
   versión instalada.
 - Chats con caché, búsqueda, tipo, orden, perfil, jobs y limpieza de descargas.
@@ -120,20 +122,24 @@ curl -fsSL https://raw.githubusercontent.com/overhang1275/tdl-web-next/refs/head
 ```
 
 El comando abre el asistente en la terminal disponible, incluso al ejecutarse por pipe.
-El instalador crea automáticamente la configuración básica y el secreto local, y pide
-los datos de Authentik que falten antes de compilar. No necesitas copiar ni editar `.env`.
-Sin terminal, genera igualmente el archivo y usa los valores proporcionados por entorno;
-si falta Authentik, indica cómo retomar el asistente. `--yes` acepta los valores por defecto.
-Una instalación ya activa cancela por defecto sin una acción explícita. Desde una copia
-local puedes usar `sudo bash install-tld.sh --source-dir "$PWD"`.
+El instalador crea automáticamente la configuración básica, las claves JWT y la contraseña
+inicial del administrador. No necesitas copiar ni editar `.env`. Sin terminal, genera
+igualmente el archivo y usa los valores proporcionados por entorno. `--yes` acepta los
+valores por defecto. Una instalación ya activa cancela por defecto sin una acción explícita.
+Desde una copia local puedes usar `sudo bash install-tld.sh --source-dir "$PWD"`.
 
 El instalador permite instalar, actualizar, reparar, reconfigurar o cancelar. De forma
 interactiva, Enter acepta los valores mostrados. Por defecto usa `/opt/tld-web`, escucha en
 `127.0.0.1:8080`, crea el usuario de servicio `tld-web` sin login y ofrece Redis local
 opcional. La API usa un puerto loopback separado (`8000`); los puertos ocupados se rechazan.
 
-El login requiere un Authentik externo. El asistente solicita issuer HTTPS, client ID y
-secreto si faltan. Configura un proveedor OIDC confidencial con PKCE, firma RS256, scopes
+El login usa cuentas locales por defecto. El instalador crea el primer administrador y
+guarda una contraseña de un solo uso en un archivo solo accesible por root; la app exige
+cambiarla al entrar. No hay registro público y solo los administradores gestionan las demás
+cuentas.
+
+Authentik es opcional. Para activarlo, define `AUTHENTIK_ENABLED=true` y configura un
+proveedor OIDC confidencial con PKCE, firma RS256, scopes
 `openid profile email offline_access tdl-groups` y grupo `tdl-admin`. El scope `tdl-groups`
 debe emitir el claim `groups`. El callback es
 `AUTH_URL/api/auth/callback/authentik`; para el acceso local por defecto:
@@ -142,7 +148,8 @@ el mismo flujo: la cookie pertenece al host que inicia el login.
 
 `PUBLIC_URL` es una referencia opcional, vacía por defecto, y no modifica `AUTH_URL`. Para
 publicar por `https://tld.opencore.dpdns.org`, configura el túnel hacia
-`http://127.0.0.1:8080`, usa esa URL HTTPS como `AUTH_URL` y registra su callback en Authentik.
+`http://127.0.0.1:8080`, usa esa URL HTTPS como `AUTH_URL` y, si activas Authentik, registra
+su callback allí.
 
 Layout de la instalación:
 
@@ -150,7 +157,7 @@ Layout de la instalación:
 /opt/tld-web/tools/                Binarios versionados
 /opt/tld-web/releases/<versión>/   Backend, venv y frontend standalone
 /opt/tld-web/current               Enlace a la versión activa
-/opt/tld-web/data/                 SQLite, sesión y archivos
+/opt/tld-web/data/                 Sesión, exports, descargas, logs y claves JWT
 /opt/tld-web/logs/                 Logs
 /opt/tld-web/tmp/                  Temporales
 /opt/tld-web/backups/              Respaldos de recuperación, solo root
@@ -159,8 +166,10 @@ Layout de la instalación:
 Los defaults sin secretos se guardan en `/etc/tld-web/install.conf` y el entorno sensible en
 `/etc/tld-web/tld-web.env`, accesible también mediante `/opt/tld-web/.env`. Se genera con
 permisos restringidos y se conserva en los reintentos. La plantilla `.env.native.example`
-queda como referencia opcional. Las instalaciones anteriores conservan su archivo en `/etc/telegram-downloader`,
-usuario, rutas, unidades y Nginx existente.
+queda como referencia opcional. La contraseña inicial del administrador está solo para root
+en `/etc/tld-web/admin-password` (o la ruta de `ADMIN_PASSWORD_FILE`). Las instalaciones
+anteriores conservan su archivo en `/etc/telegram-downloader`, usuario, rutas, unidades y
+Nginx existente.
 
 Servicios: `tld-web-api`, `tld-web-worker` y `tld-web`. Mantenimiento desde una copia local:
 
@@ -180,13 +189,14 @@ checksum inválido no se omite. Los repositorios privados requieren credenciales
 para consultar Releases, `GH_TOKEN` en el entorno, sin persistirlo.
 
 La versión se construye antes del corte. La activación exige que no haya jobs, borrados ni
-traslados pendientes, respalda SQLite, entorno, defaults, unidades, sesión, exports y logs, y
-conserva las descargas en su sitio. Un fallo recupera el enlace, la configuración, las
-unidades, la base de datos y los servicios anteriores. Los respaldos **no incluyen los
-archivos descargados**: mantén también tu respaldo externo de datos. `repair` y `configure`
-reutilizan la versión instalada sin descargar ni compilar. En modo no interactivo, una
-instalación existente cancela si no se indica `--action`; `--yes` acepta defaults y requiere
-las credenciales OIDC ya configuradas.
+traslados pendientes, respalda PostgreSQL, entorno, defaults, unidades, sesión, exports y
+logs, y conserva las descargas en su sitio. Un fallo recupera el enlace, la configuración,
+las unidades y los servicios anteriores; el esquema y los datos de PostgreSQL no se
+revierten automáticamente. Los respaldos **no incluyen los archivos descargados**: mantén
+también tu respaldo externo de datos. `repair` y `configure` reutilizan la versión instalada
+sin descargar ni compilar. En modo no interactivo, una instalación existente cancela si no se
+indica `--action`; `--yes` acepta defaults y usa el administrador local configurado; OIDC es
+opcional.
 
 ### Túnel en otra máquina de la LAN
 
@@ -204,16 +214,16 @@ detiene antes de exponerla. Las demás reglas de firewall se conservan.
 
 Para el LXC `192.168.100.254`, configura el destino del túnel como
 `http://192.168.100.254:8080` (HTTP). La máquina de `cloudflared` debe pertenecer a
-la subred permitida. Esta restricción protege el acceso directo al origen; los
-usuarios que accedan por el túnel público siguen pasando por Authentik.
+la subred permitida. Esta restricción protege el acceso directo al origen; los usuarios que
+accedan por el túnel público entran con una cuenta local o con Authentik si está activado.
 
 ## Producción con Docker Compose
 
-Esta vía incluye PostgreSQL, Authentik, Redis, API, worker, Next.js y Nginx. Solo Nginx
-publica 80/443 y es independiente del instalador nativo del LXC.
+Esta vía incluye PostgreSQL, Redis, API, worker, Next.js y Nginx, además de Authentik
+opcional. Solo Nginx publica 80/443 y es independiente del instalador nativo del LXC.
 
-Requisitos: Docker Engine con Compose v2, dominio con `app.DOMAIN` y `auth.DOMAIN`, y
-certificados para ambos nombres en `TLS_DIR`.
+Requisitos: Docker Engine con Compose v2, dominio con `app.DOMAIN` y, para activar Authentik,
+`auth.DOMAIN`, con certificados para esos nombres en `TLS_DIR`.
 
 ```bash
 python3 scripts/configure-env.py --deployment docker --output .env --domain example.test
@@ -228,20 +238,23 @@ estén fuera de `DATA_DIR`. Después:
 
 ```bash
 docker compose --env-file .env -f deploy/docker/compose.yml up -d --build --wait
-bash deploy/authentik/bootstrap.sh
 ```
 
-El blueprint crea el cliente OIDC y el grupo `tdl-admin`; el bootstrap añade `akadmin` al
-grupo. La contraseña inicial está en `AUTHENTIK_BOOTSTRAP_PASSWORD` del `.env`. No publiques
-ese archivo.
+El servicio `bootstrap` crea el primer administrador a partir de `ADMIN_PASSWORD_FILE`; la
+app exige cambiar esa contraseña al entrar. Authentik es opcional: ejecuta
+`bash deploy/authentik/bootstrap.sh` y define `AUTHENTIK_ENABLED=true` para activarlo.
 
-Antes de actualizar, drena la cola, respalda SQLite, haz `pg_dump` de Authentik y respalda los
-volúmenes; conserva las imágenes anteriores para el rollback. El archivo raíz
+El blueprint crea el cliente OIDC y el grupo `tdl-admin`; el bootstrap añade `akadmin` al
+grupo. La contraseña inicial de Authentik está en `AUTHENTIK_BOOTSTRAP_PASSWORD` del `.env`.
+No publiques ese archivo.
+
+Antes de actualizar, drena la cola, respalda PostgreSQL y los volúmenes, haz `pg_dump` de
+Authentik si está activo y conserva las imágenes anteriores para el rollback. El archivo raíz
 `docker-compose.yml` incluye el mismo Compose.
 
 ## Uso
 
-1. Entra por `/login` con Authentik.
+1. Entra por `/login` con una cuenta local, o con Authentik si está activado.
 2. Conecta Telegram en Configuración mediante el login por código.
 3. Crea una descarga eligiendo chat, filtros y, si quieres, una plantilla.
 4. Sigue el progreso en el detalle; puedes cancelar, reintentar pendientes o fallidos y
@@ -249,7 +262,7 @@ volúmenes; conserva las imágenes anteriores para el rollback. El archivo raíz
 5. Revisa los archivos en la galería o lista del job y los eventos en Registros.
 
 En Configuración puedes editar la carpeta de descargas y los límites de comando, lotes de
-descarga/exportación y espera sin progreso. Se guardan en SQLite y prevalecen sobre los
+descarga/exportación y espera sin progreso. Se guardan en PostgreSQL y prevalecen sobre los
 valores iniciales del entorno. Guarda con la cola vacía. Cambiar la carpeta exige confirmar
 el traslado: el worker copia y verifica SHA-256, actualiza las rutas de los archivos y
 después vacía el origen. Si falla, muestra el error y permite reintentar; las descargas
@@ -279,14 +292,15 @@ listas paginadas usan `{"items", "page", "per_page", "total", "page_count"}`.
 | Configuración | `PUT /settings`, `POST /settings/retry` |
 | Administración | `POST /admin/reset` |
 
-El login, callback, sesión y logout viven en Next.js/Auth.js (`/api/auth/*`). FastAPI no emite
-tokens: valida el Bearer de Authentik que inyecta el BFF.
+El login, callback, sesión y logout viven en Next.js/Auth.js (`/api/auth/*`). FastAPI emite
+access tokens RS256 de vida corta y refresh tokens rotatorios; Auth.js los guarda en su
+cookie HttpOnly cifrada y el BFF adjunta el access token. El flujo de Authentik es opcional.
 
 ## Datos y persistencia
 
 | Dato | Dónde |
 |---|---|
-| Jobs, archivos, plantillas y ajustes | SQLite `telegram_downloader.sqlite3` |
+| Jobs, archivos, plantillas, ajustes, usuarios, sesiones y auditoría | PostgreSQL 16 (migraciones Alembic) |
 | Cola y tokens de ejecución | Redis (`REDIS_URL`; en Docker, RQ usa una base separada) |
 | Sesión de Telegram | `sessions/` |
 | Export completo y snapshots por job | `exports/<chat>/` |
@@ -295,15 +309,14 @@ tokens: valida el Bearer de Authentik que inyecta el BFF.
 | Logs | `logs/job-<id>.log`, `logs/deleted-jobs.log` |
 | Caché de chats | `chats.json` |
 
-Las migraciones de SQLite son aditivas (`dedupe_key`, borrado persistido y la tabla
-`runtime_settings` para ajustes y traslado). No se convierten ni borran datos reales sin
-respaldo.
+El esquema PostgreSQL se gestiona con migraciones Alembic. No hay importador de SQLite: una
+instalación limpia empieza con la base vacía y los archivos SQLite existentes no se borran.
 
 ## Pruebas
 
-El stack de pruebas es aislado: SQLite y Redis separados, OIDC/JWKS de prueba con RS256/PKCE
-y un ejecutable `tdl` falso. No contacta Telegram ni monta datos de producción. Al salir, los
-scripts eliminan exclusivamente los contenedores y volúmenes de pruebas.
+El stack de pruebas es aislado: PostgreSQL y Redis separados, OIDC/JWKS de prueba con
+RS256/PKCE y un ejecutable `tdl` falso. No contacta Telegram ni monta datos de producción. Al
+salir, los scripts eliminan exclusivamente los contenedores y volúmenes de pruebas.
 
 ```bash
 bash scripts/test.sh

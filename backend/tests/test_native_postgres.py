@@ -88,18 +88,24 @@ def test_native_remote_requires_verified_tls_before_any_command(query, monkeypat
 
 def test_native_runtime_filters_all_root_maintenance_credentials(tmp_path):
     native = load('native-postgres')
-    source, target = tmp_path / 'source.env', tmp_path / 'runtime.env'
+    source, target, web = tmp_path / 'source.env', tmp_path / 'runtime.env', tmp_path / 'web.env'
     source.write_text('DATABASE_URL=postgresql://app:pw@127.0.0.1/app\nAUTH_SECRET=session\n'
+                      'AUTH_URL=https://tld.test\nAPI_INTERNAL_URL=http://127.0.0.1:8000\n'
                       'TDL_POSTGRES_ADMIN_PASSWORD=maintenance\nTDL_POSTGRES_PASSWORD=duplicate\n'
                       'ADMIN_PASSWORD_FILE=/root/admin\nPG_PASS=legacy\nUNKNOWN_SECRET=hidden\n'
                       'RQ_QUEUE_NAME=tdl-unique-downloads\nJWT_PRIVATE_KEY_FILE=/data/key\n')
     source.chmod(0o600)
-    native.runtime_environment(source, target)
+    native.runtime_environment(source, target, web)
     result = target.read_text()
     assert 'DATABASE_URL=' in result and 'AUTH_SECRET=session' in result
     assert 'RQ_QUEUE_NAME=tdl-unique-downloads' in result
     assert all(secret not in result for secret in ('maintenance', 'duplicate', '/root/admin', 'legacy', 'hidden'))
     assert target.stat().st_mode & 0o777 == 0o600
+    web_result = web.read_text()
+    assert 'AUTH_SECRET=session' in web_result and 'AUTH_URL=https://tld.test' in web_result
+    assert 'API_INTERNAL_URL=http://127.0.0.1:8000' in web_result
+    assert all(name not in web_result for name in ('DATABASE_URL', 'JWT_PRIVATE_KEY_FILE', 'RQ_QUEUE_NAME', 'TDL_'))
+    assert web.stat().st_mode & 0o777 == 0o600
 
 
 @pytest.mark.parametrize('statement', ['CREATE TABLE keep_me (id integer)', 'SELECT lo_create(0)'])
