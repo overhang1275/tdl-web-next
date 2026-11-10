@@ -29,7 +29,11 @@ export function LoginForm({ external }: { external: boolean }) {
       {error && <p id="login-error" role="alert" className="text-sm text-destructive">{error}</p>}
       <Button type="submit" size="lg" className="w-full" disabled={pending || !ready}>{pending ? "Iniciando sesión…" : "Iniciar sesión"}</Button>
     </form>
-    {external && <Button variant="outline" className="w-full" disabled={pending || !ready} onClick={() => { setPending(true); void signIn("authentik", { redirectTo: "/" }); }}>Continuar con Authentik</Button>}
+    {external && <Button variant="outline" className="w-full" disabled={pending || !ready} aria-describedby={error ? "login-error" : undefined} onClick={async () => {
+      setPending(true); setError("");
+      try { await signIn("authentik", { redirectTo: "/" }); }
+      catch { setError("No se pudo conectar con Authentik. Intenta de nuevo."); setPending(false); }
+    }}>Continuar con Authentik</Button>}
   </div>;
 }
 
