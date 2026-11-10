@@ -14,15 +14,43 @@ DEFAULT_KEYS=(APP_ROOT APP_HOST APP_ALLOWED_SUBNET APP_PORT API_PORT APP_USER CR
 die() { printf 'Error: %s\n' "$*" >&2; exit 1; }
 
 env_read() {
-    local file=$1 wanted=$2 key value
-    [[ -f "$file" ]] || return 0
-    while IFS='=' read -r key value || [[ -n "$key" ]]; do
-        [[ "$key" == "$wanted" ]] || continue
-        value="${value%$'\r'}"
-        if [[ "$value" == \"*\" || "$value" == \'*\' ]]; then value="${value:1:${#value}-2}"; fi
-        printf '%s' "$value"
-        return
-    done < "$file"
+    # Runs before the source/dependencies are available, including curl | bash.
+    python3 - "$1" "$2" <<'PY'
+import os, shlex, stat, sys
+from pathlib import Path
+path=Path(sys.argv[1])
+if not path.is_absolute() or '..' in path.parts:
+    raise SystemExit('Configuración requiere ruta absoluta confiable')
+fd=os.open('/',os.O_RDONLY|os.O_DIRECTORY)
+try:
+    for component in path.parts[1:-1]:
+        child=os.open(component,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=fd)
+        os.close(fd); fd=child
+        st=os.fstat(fd)
+        if st.st_uid != 0 or (st.st_mode & 0o022 and not st.st_mode & stat.S_ISVTX):
+            raise ValueError('Directorio de configuración no confiable')
+    file=os.open(path.name,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK,dir_fd=fd)
+    with os.fdopen(file,'rb') as stream:
+        st=os.fstat(stream.fileno())
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != 0 or stat.S_IMODE(st.st_mode) not in (0o600,0o640):
+            raise ValueError('Configuración requiere archivo root0600 o legado root0640')
+        raw=stream.read(65537)
+        if len(raw)>65536: raise ValueError('Configuración demasiado grande')
+    for line in raw.decode().splitlines():
+        if '=' not in line or line.lstrip().startswith('#'): continue
+        key,value=line.split('=',1)
+        if key.strip()==sys.argv[2]:
+            value=value.strip()
+            if value.startswith(('"',"'")):
+                parts=shlex.split(value,comments=False)
+                if len(parts)!=1: raise ValueError('Valor inválido')
+                value=parts[0]
+            print(value,end=''); break
+except FileNotFoundError:
+    pass
+finally:
+    os.close(fd)
+PY
 }
 
 pick_value() {
@@ -69,6 +97,10 @@ discover_files() {
             LEGACY_ENV_FILE=/etc/telegram-downloader/telegram-downloader.env
         fi
     fi
+    local input
+    for input in "$ENV_FILE" "$INSTALL_CONF" "${LEGACY_ENV_FILE:-$ENV_FILE}"; do
+        env_read "$input" '' >/dev/null || die 'Configuración no confiable; no se modifica la instalación.'
+    done
 }
 
 collect_options() {
@@ -124,6 +156,8 @@ collect_options() {
     SERVICE_API="$(pick_value SERVICE_API "$api")"
     SERVICE_WORKER="$(pick_value SERVICE_WORKER "$worker")"
     SERVICE_NETWORK="$(pick_value SERVICE_NETWORK "$web-network")"
+    SERVICE_MIGRATE=tld-web-migrate
+    RUNTIME_ENV="$CONFIG_DIR/runtime.env"
     SERVICES=("$SERVICE_API" "$SERVICE_WORKER" "$SERVICE_WEB")
     if [[ "$APP_HOST" == 0.0.0.0 ]]; then SERVICES=("$SERVICE_NETWORK" "${SERVICES[@]}"); fi
     BACKUPS_DIR="$APP_ROOT/backups"
@@ -136,13 +170,13 @@ collect_options() {
 valid_path() { [[ "$1" =~ ^/[A-Za-z0-9_./-]+$ && "$1" != / && "$1" != *'/../'* && "$1" != */.. && "$1" != *'/./'* ]]; }
 
 validate_options() {
-    valid_path "$APP_ROOT" && valid_path "$CONFIG_DIR" && valid_path "$ENV_FILE" && valid_path "$SYSTEMD_DIR" || die 'Usa rutas absolutas sin espacios ni segmentos . o ...'
+    if ! valid_path "$APP_ROOT" || ! valid_path "$CONFIG_DIR" || ! valid_path "$ENV_FILE" || ! valid_path "$SYSTEMD_DIR"; then die 'Usa rutas absolutas sin espacios ni segmentos . o ...'; fi
     [[ "$APP_ROOT" != /etc && "$APP_ROOT" != /usr && "$APP_ROOT" != /var && "$APP_ROOT" != /home && "$APP_ROOT" != /opt ]] || die 'Elige una carpeta exclusiva para la aplicación.'
     [[ "$APP_HOST" == 127.0.0.1 || "$APP_HOST" == 0.0.0.0 ]] || die 'APP_HOST debe ser 127.0.0.1 o 0.0.0.0 con firewall.'
     [[ "$APP_ALLOWED_SUBNET" == 192.168.100.0/24 ]] || die 'La subred autorizada debe ser 192.168.100.0/24.'
     local port service
     for port in "$APP_PORT" "$API_PORT"; do
-        [[ "$port" =~ ^[0-9]{1,5}$ ]] && ((10#$port > 0 && 10#$port <= 65535)) || die 'Puerto inválido (1–65535).'
+        if [[ ! "$port" =~ ^[0-9]{1,5}$ ]] || ! ((10#$port > 0 && 10#$port <= 65535)); then die 'Puerto inválido (1–65535).'; fi
     done
     APP_PORT=$((10#$APP_PORT)); API_PORT=$((10#$API_PORT))
     [[ "$APP_PORT" != "$API_PORT" ]] || die 'Los puertos de web y API deben ser distintos.'
@@ -235,17 +269,39 @@ PY
 render_units() {
     local directory=$1
     mkdir -p -- "$directory"
+    cat > "$directory/$SERVICE_MIGRATE.service" <<EOF
+# Managed by install-tld.sh: $APP_ROOT
+[Unit]
+Description=TLD PostgreSQL migration
+After=network-online.target postgresql.service
+Wants=network-online.target
+Before=$SERVICE_API.service $SERVICE_WORKER.service
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=$APP_USER
+Group=${APP_GROUP:-$APP_USER}
+WorkingDirectory=${RELEASE:-$APP_ROOT/current}/backend
+EnvironmentFile=${MIGRATION_ENV:-$RUNTIME_ENV}
+ExecStart=${RELEASE:-$APP_ROOT/current}/venv/bin/alembic upgrade head
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+UMask=0077
+EOF
     cat > "$directory/$SERVICE_WEB.service" <<EOF
 # Managed by install-tld.sh: $APP_ROOT
 [Unit]
 Description=TLD Web frontend
 After=network-online.target $SERVICE_API.service
 Wants=network-online.target $SERVICE_API.service
+Requires=$SERVICE_API.service
 [Service]
 User=$APP_USER
 Group=${APP_GROUP:-$APP_USER}
 WorkingDirectory=$APP_ROOT/current/frontend/.next/standalone
-EnvironmentFile=$ENV_FILE
+EnvironmentFile=$RUNTIME_ENV
 Environment=NODE_ENV=production HOSTNAME=$APP_HOST PORT=$APP_PORT
 ExecStart=$NODE_BINARY $APP_ROOT/current/frontend/.next/standalone/server.js
 Restart=on-failure
@@ -280,13 +336,14 @@ EOF
 # Managed by install-tld.sh: $APP_ROOT
 [Unit]
 Description=TLD Web API
-After=network-online.target
+After=network-online.target $SERVICE_MIGRATE.service
 Wants=network-online.target
+Requires=$SERVICE_MIGRATE.service
 [Service]
 User=$APP_USER
 Group=${APP_GROUP:-$APP_USER}
 WorkingDirectory=$APP_ROOT/current/backend
-EnvironmentFile=$ENV_FILE
+EnvironmentFile=$RUNTIME_ENV
 ExecStart=$APP_ROOT/current/venv/bin/uvicorn app.main:app --host 127.0.0.1 --port $API_PORT --workers 1
 ExecStartPost=/usr/bin/curl --fail --silent --retry 15 --retry-delay 1 --retry-connrefused http://127.0.0.1:$API_PORT/health
 Restart=on-failure
@@ -299,7 +356,7 @@ UMask=0077
 [Install]
 WantedBy=multi-user.target
 EOF
-    sed "s/Description=TLD Web API/Description=TLD Web worker/;s|^ExecStart=.*|ExecStart=$APP_ROOT/current/venv/bin/python -m app.rq_worker|;/^ExecStartPost=/d;s/^After=network-online.target$/After=network-online.target $SERVICE_API.service/" \
+    sed "s/Description=TLD Web API/Description=TLD Web worker/;s|^ExecStart=.*|ExecStart=$APP_ROOT/current/venv/bin/python -m app.rq_worker|;/^ExecStartPost=/d;s/^After=.*/After=network-online.target $SERVICE_MIGRATE.service $SERVICE_API.service/;s/^Requires=.*/Requires=$SERVICE_MIGRATE.service $SERVICE_API.service/" \
         "$directory/$SERVICE_API.service" > "$directory/$SERVICE_WORKER.service"
 }
 
@@ -351,6 +408,7 @@ preflight() {
     [[ -d /run/systemd/system ]] || die 'Se requiere systemd dentro del LXC.'
     # This is a trusted operating-system file, never installer input.
     local ID VERSION_ID
+    # shellcheck disable=SC1091
     source /etc/os-release
     case "$ID:$VERSION_ID" in debian:13*|ubuntu:24.*|ubuntu:26.*) ;; *) die 'Se requiere Debian 13 o Ubuntu 24.04/26.04.' ;; esac
     if command -v python3 >/dev/null; then python3 -c 'import sys; assert sys.version_info >= (3,12), "Se requiere Python 3.12+"'; fi
@@ -384,6 +442,8 @@ PY
     fi
     [[ "$(id -u "$APP_USER")" != 0 ]] || die 'El usuario del servicio no puede tener UID 0.'
     APP_GROUP="$(id -gn "$APP_USER")"
+    exec {INSTALL_LOCK}>"$CONFIG_DIR/install.lock"
+    flock -n "$INSTALL_LOCK" || die 'Ya existe una instalación en curso.'
     chgrp "$APP_GROUP" "$CONFIG_DIR" "$(dirname "$ENV_FILE")"
     chmod 750 "$CONFIG_DIR" "$(dirname "$ENV_FILE")"
     export APP_GROUP
@@ -407,6 +467,7 @@ check_service_ports() {
         check_port "$port"
     done
     [[ ! -f "$SYSTEMD_DIR/$SERVICE_WORKER.service" ]] || owned_service "$SERVICE_WORKER" || die 'La unidad worker pertenece a otra instalación.'
+    [[ ! -f "$SYSTEMD_DIR/$SERVICE_MIGRATE.service" ]] || owned_service "$SERVICE_MIGRATE" || die 'La unidad migrate pertenece a otra instalación.'
 }
 
 fetch() { curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 "$1" -o "$2"; }
@@ -553,6 +614,22 @@ prepare_repair() {
     export NODE_BINARY TDL_BINARY RESOLVED_VERSION RESOLVED_METHOD
 }
 
+verify_release_code() {
+    python3 - "$RELEASE" <<'PY'
+import os, sys
+from pathlib import Path
+release=Path(sys.argv[1])
+for base in (release/'backend', release/'scripts', release/'venv'):
+    if not base.is_dir(): raise SystemExit('Release root incompleta')
+    for path in (base, *base.rglob('*')):
+        if path.is_symlink() and path.is_dir() and not path.resolve().is_relative_to(release):
+            raise SystemExit('Código root enlazado a directorio fuera de la release; reconstruye con update')
+        st=path.stat()
+        if st.st_uid != 0 or st.st_mode & 0o022:
+            raise SystemExit('Código ejecutado por root modificable por otro usuario; reconstruye con update')
+PY
+}
+
 ensure_oidc() {
     AUTHENTIK_ENABLED="$(pick_value AUTHENTIK_ENABLED false)"
     export AUTHENTIK_ENABLED
@@ -560,11 +637,11 @@ ensure_oidc() {
 }
 
 bootstrap_admin() {
-    local username password_file
-    username="$(env_read "$ENV_FILE" ADMIN_USERNAME)"
-    password_file="$(env_read "$ENV_FILE" ADMIN_PASSWORD_FILE)"
+    local username password_file configuration=${CANDIDATE:-$ENV_FILE}
+    username="$(env_read "$configuration" ADMIN_USERNAME)"
+    password_file="$(env_read "$configuration" ADMIN_PASSWORD_FILE)"
     PYTHONPATH="$RELEASE/backend" "$RELEASE/venv/bin/python" -m app.admin create-admin \
-        --username "$username" --password-file "$password_file" --env-file "$ENV_FILE"
+        --username "$username" --password-file "$password_file" --env-file "$configuration"
     printf 'Contraseña inicial protegida: %s\nConsultar como root: sudo cat -- %q\nDebe cambiarse al entrar.\n' "$password_file" "$password_file"
 }
 
@@ -614,7 +691,26 @@ for key in keys:
 PY
 }
 
-data_admin() { python3 "$SOURCE_DIR/scripts/data-admin.py" "$1" --env "$ENV_FILE" "${@:2}"; }
+data_admin() { "$RELEASE/venv/bin/python" "$SOURCE_DIR/scripts/data-admin.py" "$1" --env "$ENV_FILE" "${@:2}"; }
+
+prepare_postgres() {
+    local -a fresh=()
+    [[ "${FRESH:-0}" != 1 && "${NEW_ENV:-0}" != 1 ]] || fresh=(--fresh)
+    "$RELEASE/venv/bin/python" "$SOURCE_DIR/scripts/native-postgres.py" prepare \
+        --env "$CANDIDATE" --output "$CONFIG_DIR/postgres-resources" "${fresh[@]}"
+}
+
+prepare_runtime() {
+    "$RELEASE/venv/bin/python" "$SOURCE_DIR/scripts/native-postgres.py" runtime \
+        --env "$CANDIDATE" --output "$WORK/runtime.env"
+}
+
+migrate_database() {
+    MIGRATION_ENV="$WORK/runtime.env" render_units "$WORK/migration-units"
+    install -m 644 "$WORK/migration-units/$SERVICE_MIGRATE.service" "$SYSTEMD_DIR/"
+    systemctl daemon-reload
+    systemctl restart "$SERVICE_MIGRATE"
+}
 health_check() {
     curl --fail --silent --retry 15 --retry-delay 2 --retry-connrefused "http://127.0.0.1:$API_PORT/health" >/dev/null
     curl --fail --silent --retry 15 --retry-delay 2 --retry-connrefused "http://127.0.0.1:$APP_PORT/login" >/dev/null
@@ -630,35 +726,37 @@ link_layout_aliases() {
 }
 
 activate_release() (
-    local previous backup='' unit replaced=0 redis_touched=0 redis_active=0 redis_enabled=0
+    local previous backup='' unit replaced=0 redis_touched=0 redis_active=0 redis_enabled=0 old_postgres=0
     local -a active_services=() enabled_services=()
     previous="$(readlink -f "$APP_ROOT/current" 2>/dev/null || true)"
     for unit in "${SERVICES[@]}"; do
         if systemctl is-active --quiet "$unit"; then active_services+=("$unit"); fi
         if systemctl is-enabled --quiet "$unit"; then enabled_services+=("$unit"); fi
     done
+    # Invoked indirectly by the EXIT trap, including failed migration/bootstrap.
+    # shellcheck disable=SC2317
     restore_previous() {
         local result=$1 file
         [[ "$result" == 0 ]] && return
         trap - EXIT
         if [[ "$replaced" == 1 ]]; then
             systemctl stop "${SERVICES[@]}" || true
-            for file in env defaults; do
+            systemctl stop "$SERVICE_MIGRATE" || true
+            for file in env defaults runtime; do
                 local destination="$ENV_FILE"; [[ "$file" != defaults ]] || destination="$INSTALL_CONF"
-                if [[ -f "$backup/$file" ]]; then cp -p -- "$backup/$file" "$destination"; else rm -f -- "$destination"; fi
+                [[ "$file" != runtime ]] || destination="$RUNTIME_ENV"
+                if [[ -f "$backup/$file" ]]; then cp -p -- "$backup/$file" "$destination.rollback"; mv -f -- "$destination.rollback" "$destination"; else rm -f -- "$destination"; fi
             done
             if [[ "$APP_HOST" == 0.0.0.0 ]]; then
                 if [[ -f "$backup/network.nft" ]]; then cp -p "$backup/network.nft" "$CONFIG_DIR/network.nft"
                 else rm -f -- "$CONFIG_DIR/network.nft"; fi
             fi
-            if [[ -f "$backup/database.sqlite3" ]]; then
-                python3 "$SOURCE_DIR/scripts/data-admin.py" restore-database --env "$ENV_FILE" --backup "$backup" || true
-            fi
-            for unit in "${SERVICES[@]}"; do
+            # Schema/data are never rolled back automatically after candidate migrations or writes.
+            for unit in "${SERVICES[@]}" "$SERVICE_MIGRATE"; do
                 if [[ -f "$backup/$unit.service" ]]; then cp -p -- "$backup/$unit.service" "$SYSTEMD_DIR/"
                 else rm -f -- "$SYSTEMD_DIR/$unit.service"; fi
             done
-            if [[ -n "$previous" && -d "$previous" ]]; then ln -sfn "$previous" "$APP_ROOT/current"
+            if [[ -n "$previous" && -d "$previous" ]]; then ln -s "$previous" "$APP_ROOT/.current-rollback-$$"; mv -Tf "$APP_ROOT/.current-rollback-$$" "$APP_ROOT/current"
             elif [[ -L "$APP_ROOT/current" ]]; then rm -f -- "$APP_ROOT/current"; fi
             if [[ "$redis_touched" == 1 ]]; then
                 cp -p -- "$backup/redis.conf" "${REDIS_CONFIG:-/etc/redis/redis.conf}"
@@ -670,38 +768,47 @@ activate_release() (
             ((${#enabled_services[@]} == 0)) || systemctl enable "${enabled_services[@]}" || true
         fi
         ((${#active_services[@]} == 0)) || systemctl start "${active_services[@]}" || true
-        printf 'Activación fallida. Se intentó recuperar la versión anterior. Respaldo: %s\n' "${backup:-no creado}" >&2
+        printf 'Activación fallida. Se intentó recuperar release/config anterior; esquema PostgreSQL sin rollback automático. Respaldo: %s\n' "${backup:-no creado}" >&2
         journalctl --no-pager -n 30 -u "$SERVICE_API" -u "$SERVICE_WORKER" -u "$SERVICE_WEB" >&2 || true
         exit "$result"
     }
     trap 'restore_previous $?' EXIT
-    [[ ! -f "$ENV_FILE" ]] || data_admin check-idle
+    if [[ "${NEW_ENV:-0}" != 1 && "$(env_read "$ENV_FILE" DATABASE_URL)" == postgres* ]]; then old_postgres=1; fi
+    [[ "$old_postgres" != 1 ]] || data_admin check-idle
     if [[ -f "$SYSTEMD_DIR/$SERVICE_WEB.service" ]]; then systemctl stop "$SERVICE_WEB"; fi
-    [[ ! -f "$ENV_FILE" ]] || data_admin check-idle
     for unit in "$SERVICE_API" "$SERVICE_WORKER"; do
         if [[ -f "$SYSTEMD_DIR/$unit.service" ]]; then systemctl stop "$unit"; fi
     done
-    if [[ -f "$ENV_FILE" ]]; then backup="$(data_admin backup --destination-root "$BACKUPS_DIR")"
+    [[ "$old_postgres" != 1 ]] || data_admin check-idle
+    if [[ "$old_postgres" == 1 ]]; then backup="$(data_admin backup --destination-root "$BACKUPS_DIR")"
     else backup="$BACKUPS_DIR/$(date -u +%Y%m%dT%H%M%S)-$$"; mkdir -p "$backup"; fi
     chmod 700 "$backup"
     [[ ! -f "$ENV_FILE" ]] || cp -p -- "$ENV_FILE" "$backup/env"
     [[ ! -f "$INSTALL_CONF" ]] || cp -p -- "$INSTALL_CONF" "$backup/defaults"
+    [[ ! -f "$RUNTIME_ENV" ]] || cp -p -- "$RUNTIME_ENV" "$backup/runtime"
     if [[ "$APP_HOST" == 0.0.0.0 && -f "$CONFIG_DIR/network.nft" ]]; then cp -p "$CONFIG_DIR/network.nft" "$backup/network.nft"; fi
-    for unit in "${SERVICES[@]}"; do [[ ! -f "$SYSTEMD_DIR/$unit.service" ]] || cp -p -- "$SYSTEMD_DIR/$unit.service" "$backup/"; done
+    for unit in "${SERVICES[@]}" "$SERVICE_MIGRATE"; do [[ ! -f "$SYSTEMD_DIR/$unit.service" ]] || cp -p -- "$SYSTEMD_DIR/$unit.service" "$backup/"; done
     if [[ "$INSTALL_REDIS" == 1 ]]; then
         cp -p -- "${REDIS_CONFIG:-/etc/redis/redis.conf}" "$backup/redis.conf"
         if systemctl is-active --quiet redis-server; then redis_active=1; fi
         if systemctl is-enabled --quiet redis-server; then redis_enabled=1; fi
     fi
-    render_units "$WORK/units"
+    prepare_postgres
+    prepare_runtime
     replaced=1
-    install -m 600 -o root -g root "$CANDIDATE" "$ENV_FILE"
+    migrate_database
+    bootstrap_admin
+    render_units "$WORK/units"
+    install -m 600 -o root -g root "$CANDIDATE" "$ENV_FILE.next"
+    mv -f -- "$ENV_FILE.next" "$ENV_FILE"
+    install -m 600 -o root -g root "$WORK/runtime.env" "$RUNTIME_ENV.next"
+    mv -f -- "$RUNTIME_ENV.next" "$RUNTIME_ENV"
     if [[ "$APP_HOST" == 0.0.0.0 ]]; then install -m 600 "$WORK/network.nft" "$CONFIG_DIR/network.nft"; fi
     if [[ "$SAVE_DEFAULTS" == 1 ]]; then write_defaults "$INSTALL_CONF"; fi
-    for unit in "${SERVICES[@]}"; do install -m 644 "$WORK/units/$unit.service" "$SYSTEMD_DIR/"; done
-    ln -sfn "$RELEASE" "$APP_ROOT/current"
+    for unit in "${SERVICES[@]}" "$SERVICE_MIGRATE"; do install -m 644 "$WORK/units/$unit.service" "$SYSTEMD_DIR/"; done
+    ln -s "$RELEASE" "$APP_ROOT/.current-next-$$"
+    mv -Tf "$APP_ROOT/.current-next-$$" "$APP_ROOT/current"
     if [[ "$INSTALL_REDIS" == 1 ]]; then redis_touched=1; configure_redis; fi
-    bootstrap_admin
     systemctl daemon-reload
     systemctl enable "${SERVICES[@]}"
     systemctl restart "${SERVICES[@]}"
@@ -710,6 +817,7 @@ activate_release() (
     trap - EXIT
     printf 'Versión activa: %s\nRespaldo: %s\nAcceso local: http://localhost:%s\n' "$RELEASE" "$backup" "$APP_PORT"
     printf 'Servicios: systemctl status %s %s %s\n' "$SERVICE_API" "$SERVICE_WORKER" "$SERVICE_WEB"
+    if [[ "${FRESH:-0}" == 1 ]]; then printf 'Instalación nueva: base y cola independientes. Recursos anteriores conservados.\n'; fi
 )
 
 run_installation() {
@@ -727,11 +835,12 @@ run_installation() {
     prepare_layout
     check_service_ports
     check_network_access
-    if [[ "$ACTION" == repair || "$ACTION" == configure ]]; then prepare_repair
+    if [[ "$ACTION" == repair || "$ACTION" == configure ]]; then prepare_repair; verify_release_code
     else resolve_source; fi
     prepare_environment
     ensure_oidc
     if [[ "$ACTION" != repair && "$ACTION" != configure ]]; then install_binaries; build_release; fi
+    if [[ "$ACTION" != repair && "$ACTION" != configure ]]; then verify_release_code; fi
     prepare_candidate
     activate_release
 }

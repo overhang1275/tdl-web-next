@@ -1,13 +1,14 @@
 [Unit]
 Description=TDL Console FastAPI API
-After=network-online.target redis-server.service
+After=network-online.target redis-server.service tld-web-migrate.service
 Wants=network-online.target redis-server.service
+Requires=tld-web-migrate.service
 
 [Service]
 User=telegramdl
 Group=telegramdl
 WorkingDirectory=/opt/tld-web/current/backend
-EnvironmentFile=/etc/telegram-downloader/telegram-downloader.env
+EnvironmentFile=/etc/tld-web/runtime.env
 ExecStart=/opt/tld-web/current/venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000 --workers 1 --proxy-headers
 ExecStartPost=/usr/bin/curl --fail --silent --retry 15 --retry-delay 1 --retry-connrefused http://127.0.0.1:8000/health
 Restart=on-failure

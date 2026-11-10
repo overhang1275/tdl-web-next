@@ -1,13 +1,14 @@
 [Unit]
 Description=Telegram Downloader RQ worker
-After=network-online.target redis-server.service telegram-downloader-api.service
+After=network-online.target redis-server.service telegram-downloader-api.service tld-web-migrate.service
 Wants=network-online.target redis-server.service telegram-downloader-api.service
+Requires=tld-web-migrate.service telegram-downloader-api.service
 
 [Service]
 User=telegramdl
 Group=telegramdl
 WorkingDirectory=/opt/tld-web/current/backend
-EnvironmentFile=/etc/telegram-downloader/telegram-downloader.env
+EnvironmentFile=/etc/tld-web/runtime.env
 ExecStart=/opt/tld-web/current/venv/bin/python -m app.rq_worker
 Restart=on-failure
 RestartSec=5

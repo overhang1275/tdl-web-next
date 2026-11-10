@@ -76,8 +76,10 @@ def pg_environment(values):
 
 
 def pg_run(tool, args, values):
+    matching = Path(f"/usr/lib/postgresql/{values.get('_PG_CLIENT_MAJOR', '')}/bin/{tool}")
+    executable = str(matching) if matching.is_file() else tool
     try:
-        return subprocess.run([tool, *args], env=pg_environment(values),
+        return subprocess.run([executable, *args], env=pg_environment(values),
                               capture_output=True, text=True, check=True).stdout
     except (OSError, subprocess.CalledProcessError):
         # Client stderr can contain credentials supplied by the remote endpoint.
@@ -91,6 +93,7 @@ def pg_versions(values, tool):
             server = int(db.execute(text("SHOW server_version_num")).scalar_one()) // 10000
     finally:
         engine.dispose()
+    values['_PG_CLIENT_MAJOR'] = str(server)
     version = pg_run(tool, ["--version"], values).strip()
     match = re.search(r"PostgreSQL\) (\d+)", version)
     if not match or int(match[1]) != server:
@@ -98,14 +101,26 @@ def pg_versions(values, tool):
     return server, version
 
 
+def require_empty(db):
+    if db.execute(text("""SELECT EXISTS (
+        SELECT 1 FROM pg_namespace WHERE left(nspname, 3) <> 'pg_' AND nspname NOT IN ('public','information_schema')
+        UNION ALL SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public'
+        UNION ALL SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='public'
+        UNION ALL SELECT 1 FROM pg_type t JOIN pg_namespace n ON n.oid=t.typnamespace WHERE n.nspname='public'
+        UNION ALL SELECT 1 FROM pg_extension WHERE extname <> 'plpgsql'
+        UNION ALL SELECT 1 FROM pg_largeobject_metadata
+    )""")).scalar_one():
+        raise RuntimeError("El destino debe ser una base vacía; no se borrará ningún objeto")
+
+
 def protected_copy(source, destination):
-    with Path(source).open("rb") as src, destination.open("xb") as dst:
+    with config.regular_file(Path(source)) as src, destination.open("xb") as dst:
         destination.chmod(0o600)
         shutil.copyfileobj(src, dst)
 
 
 def sha256(path):
-    with path.open("rb") as stream:
+    with config.regular_file(path) as stream:
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
@@ -116,7 +131,7 @@ def write_manifest(destination, manifest):
 
 
 def backup(env_file: Path, destination_root: Path | None = None) -> Path:
-    values = config.read_env(env_file)
+    values = config.read_env(env_file, privileged=True)
     require_idle(values)
     base = destination_root or Path(values.get("BACKUPS_DIR", str(Path(values["DATA_DIR"]) / "backups")))
     destination = base / datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
@@ -129,6 +144,8 @@ def backup(env_file: Path, destination_root: Path | None = None) -> Path:
         dump = destination / "database.dump"
         dump.touch(mode=0o600)
         pg_run("pg_dump", ["--format=custom", "--no-owner", "--no-privileges", "--file", str(dump)], values)
+        pg_versions(values, "pg_restore")
+        pg_run("pg_restore", ["--list", str(dump)], values)
         protected_copy(env_file, destination / ".env")
         state = destination / "state.tar.gz"
         state.touch(mode=0o600)
@@ -176,13 +193,24 @@ def validate_backup(directory):
 def restore_database(env_file: Path, directory: Path, *, services_stopped: bool = False) -> None:
     if not services_stopped:
         raise RuntimeError("Confirme servicios detenidos con --services-stopped antes de restaurar")
-    values = config.read_env(env_file)
+    values = config.read_env(env_file, privileged=True)
+    for key in ('SERVICE_API', 'SERVICE_WORKER', 'SERVICE_WEB'):
+        if values.get(key):
+            if not re.fullmatch(r'[A-Za-z0-9_.@-]+', values[key]):
+                raise RuntimeError('Nombre de servicio inválido')
+            result = subprocess.run(['systemctl', 'show', '--property=ActiveState', '--value', values[key]],
+                                    capture_output=True, text=True, check=False)
+            if result.returncode or result.stdout.strip() not in {'inactive', 'failed'}:
+                raise RuntimeError('Los servicios deben estar detenidos antes de restaurar')
     manifest = validate_backup(directory)
     server, _ = pg_versions(values, "pg_restore")
     if manifest.get("server_major") != server:
         raise RuntimeError("Versión PostgreSQL del respaldo incompatible con el destino")
     # Only canonical local destinations are allowed; paths in the backup are never trusted.
     key_dir = Path(values["DATA_DIR"]) / "keys"
+    uid, gid = int(values.get('APP_UID', '10001')), int(values.get('APP_GID', '10001'))
+    if uid <= 0 or gid <= 0:
+        raise RuntimeError('Las claves requieren UID/GID de aplicación sin privilegios')
     has_keys = any(f"keys/{name}" in manifest["sha256"] for name in KEY_FILES)
     if has_keys and (key_dir.is_symlink() or key_dir.parent.is_symlink()
                      or (key_dir.exists() and not key_dir.is_dir()) or not key_dir.parent.is_dir()):
@@ -192,21 +220,21 @@ def restore_database(env_file: Path, directory: Path, *, services_stopped: bool 
         if f"keys/{name}" not in manifest["sha256"]:
             continue
         source, target = directory / "keys" / name, key_dir / filename
+        try:
+            config.checked_path(target)
+            config.trusted_parent(target, uid)
+        except ValueError:
+            raise RuntimeError('Directorio de claves inseguro') from None
         if target.is_symlink() or (target.exists() and (not target.is_file() or sha256(target) != sha256(source))):
             raise RuntimeError("Conflicto con claves existentes; no se sobrescriben")
-        keys.append((source, target))
+        with config.regular_file(source) as stream:
+            keys.append((config.bounded_bytes(stream), target))
     engine = create_engine(database_url(values))
     try:
         with engine.connect() as db:
             if db.execute(text("SELECT count(*) FROM pg_stat_activity WHERE datname=current_database() AND pid<>pg_backend_pid()")).scalar_one():
                 raise RuntimeError("Hay conexiones activas al destino; detenga todos los servicios")
-            if db.execute(text("""SELECT EXISTS (
-                SELECT 1 FROM pg_namespace WHERE left(nspname, 3) <> 'pg_' AND nspname NOT IN ('public','information_schema')
-                UNION ALL SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public'
-                UNION ALL SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='public'
-                UNION ALL SELECT 1 FROM pg_type t JOIN pg_namespace n ON n.oid=t.typnamespace WHERE n.nspname='public'
-            )""")).scalar_one():
-                raise RuntimeError("El destino debe ser una base vacía; no se borrará ningún objeto")
+            require_empty(db)
     finally:
         engine.dispose()
     # An empty dbname uses PGDATABASE literally, never reparses names as conninfo.
@@ -214,11 +242,14 @@ def restore_database(env_file: Path, directory: Path, *, services_stopped: bool 
                           "--dbname", "", str(directory / "database.dump")], values)
     if keys:
         key_dir.mkdir(mode=0o700, exist_ok=True)
-        key_dir.chmod(0o700)
-        for source, target in keys:
-            if not target.exists():
-                protected_copy(source, target)
-            target.chmod(0o600)
+        directory_fd = config.parent_fd(key_dir / 'jwt-private.pem')
+        try:
+            os.fchmod(directory_fd, 0o700)
+            os.fchown(directory_fd, uid, gid)
+        finally:
+            os.close(directory_fd)
+        for content, target in keys:
+            config.write_private(target, content, uid, gid)
 
 
 def main():
@@ -233,7 +264,7 @@ def main():
         parser.error("--backup is required for restore-database")
     try:
         if args.command == "check-idle":
-            require_idle(config.read_env(args.env))
+            require_idle(config.read_env(args.env, privileged=True))
         elif args.command == "backup":
             destination = backup(args.env, args.destination_root)
             print("Respaldo completo; medios no incluidos.", file=sys.stderr)

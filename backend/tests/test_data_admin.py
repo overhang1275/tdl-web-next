@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 import stat
 import subprocess
 import sys
@@ -30,6 +29,7 @@ def admin_env(tmp_path, admin_databases):
         (path / "marker").write_text(name)
         entries[name] = str(path)
     env.write_text("".join(f"{key}={value}\n" for key, value in entries.items()))
+    env.chmod(0o600)
     return env
 
 
@@ -45,6 +45,7 @@ def migrate(url):
 def target_env(admin_env, admin_databases):
     target = admin_env.with_name("target.env")
     target.write_text(admin_env.read_text().replace(admin_databases[0], admin_databases[1]))
+    target.chmod(0o600)
     return target
 
 
@@ -121,18 +122,22 @@ def test_restore_requires_stopped_services(admin_env, admin_databases, tmp_path)
     target_engine.dispose()
 
 
-def test_dump_failure_does_not_report_success(admin_env, admin_databases, tmp_path):
+def test_dump_failure_does_not_report_success(admin_env, admin_databases, tmp_path, monkeypatch, capsys):
     engine = migrate(admin_databases[0])
     engine.dispose()
-    tools = tmp_path / "tools"
-    tools.mkdir()
-    fake = tools / "pg_dump"
-    fake.write_text('#!/bin/sh\ncase "$1" in --version) echo "pg_dump (PostgreSQL) 16.15"; exit 0;; esac\necho "$PGPASSWORD" >&2\nexit 1\n')
-    fake.chmod(0o700)
-    result = subprocess.run([sys.executable, str(Path(__file__).resolve().parents[2] / "scripts/data-admin.py"), "backup", "--env", str(admin_env), "--destination-root", str(tmp_path / "backups")], env={**os.environ, "PATH": f"{tools}:{os.environ['PATH']}"}, capture_output=True, text=True)
-    assert result.returncode != 0
-    assert not result.stdout.strip()
-    assert "tdl_test" not in result.stderr
+    admin = load('data-admin')
+    run = subprocess.run
+    def failing_dump(args, **kwargs):
+        if Path(args[0]).name == 'pg_dump' and '--version' not in args:
+            raise subprocess.CalledProcessError(1, args, stderr=kwargs['env']['PGPASSWORD'])
+        return run(args, **kwargs)
+    monkeypatch.setattr(subprocess, 'run', failing_dump)
+    monkeypatch.setattr(sys, 'argv', ['data-admin.py', 'backup', '--env', str(admin_env),
+                                    '--destination-root', str(tmp_path / 'backups')])
+    assert admin.main() != 0
+    captured = capsys.readouterr()
+    assert not captured.out.strip()
+    assert 'tdl_test' not in captured.err
     snapshots = list((tmp_path / "backups").iterdir())
     assert len(snapshots) == 1
     assert json.loads((snapshots[0] / "manifest.json").read_text())["complete"] is False
@@ -196,6 +201,17 @@ def test_optional_keys_have_controlled_restore_paths(admin_env, admin_databases,
     assert private.read_text() == "private-secret"
     assert (tmp_path / "data/keys/jwt-private.pem").read_text() == "private-secret"
     assert stat.S_IMODE((tmp_path / "data/keys/jwt-private.pem").stat().st_mode) == 0o600
+    assert (tmp_path / "data/keys/jwt-private.pem").stat().st_uid == 10001
+    assert (tmp_path / "data/keys").stat().st_uid == 10001
+
+
+def test_restore_refuses_active_native_service_even_without_database_connection(admin_env, monkeypatch):
+    admin = load('data-admin')
+    with admin_env.open('a') as stream:
+        stream.write('SERVICE_API=tld-web-api\nSERVICE_WORKER=tld-web-worker\n')
+    monkeypatch.setattr(subprocess, 'run', lambda args, **kwargs: subprocess.CompletedProcess(args, 0, 'active\n', ''))
+    with pytest.raises(RuntimeError, match='deten'):
+        admin.restore_database(admin_env, admin_env.parent / 'absent', services_stopped=True)
 
 
 @pytest.mark.parametrize("conflict", ["different_key", "symlink", "file_directory"])

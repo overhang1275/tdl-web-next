@@ -494,6 +494,7 @@ def test_native_backup_uses_protected_destination_and_can_restore_database(tmp_p
     engine.dispose()
     target = tmp_path / 'target.env'
     target.write_text(env.read_text().replace(admin_databases[0], admin_databases[1]))
+    target.chmod(0o600)
     admin.restore_database(target, snapshot, services_stopped=True)
     engine = create_engine(admin_databases[1])
     with engine.connect() as db:
