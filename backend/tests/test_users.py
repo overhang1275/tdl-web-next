@@ -48,7 +48,7 @@ def test_temporary_password_allows_only_me_change_and_logout(client):
     logout_pair = client.post("/api/v1/auth/token", json={"username": "second", "password": TEMP}).json()
     assert client.post("/api/v1/auth/logout", headers=headers(logout_pair)).status_code == 204
     assert client.post("/api/v1/auth/refresh", json={"refresh_token": temporary["refresh_token"]}).status_code == 403
-    assert client.post("/api/v1/auth/change-password", headers=headers(temporary), json={"current_password": "wrong password", "new_password": PASSWORD}).status_code == 401
+    assert client.post("/api/v1/auth/change-password", headers=headers(temporary), json={"current_password": "wrong password", "new_password": PASSWORD}).status_code == 400
     assert client.post("/api/v1/auth/change-password", headers=headers(temporary), json={"current_password": TEMP, "new_password": PASSWORD}).status_code == 204
     assert client.get("/api/v1/auth/me", headers=headers(temporary)).status_code == 401
     fresh = client.post("/api/v1/auth/token", json={"username": "second", "password": PASSWORD}).json()
@@ -201,7 +201,7 @@ def test_failed_account_mutations_and_logout_are_audited(client, test_engine):
     pair = login(client)
     create(client, pair)
     assert create(client, pair).status_code == 409
-    assert client.post("/api/v1/auth/change-password", headers=headers(pair), json={"current_password": "wrong password", "new_password": TEMP}).status_code == 401
+    assert client.post("/api/v1/auth/change-password", headers=headers(pair), json={"current_password": "wrong password", "new_password": TEMP}).status_code == 400
     assert client.post("/api/v1/auth/logout", json={"refresh_token": pair["refresh_token"]}).status_code == 204
     with Session(test_engine) as db:
         events = {(e.action, e.outcome) for e in db.scalars(select(AuditEvent))}

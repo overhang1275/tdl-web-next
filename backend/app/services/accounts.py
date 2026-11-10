@@ -112,7 +112,13 @@ def reset_password(db: Session, user_id: UUID, password: str, *, temporary: bool
 def change_password(db: Session, user_id: UUID, current_password: str, new_password: str) -> None:
     user = lock_user(db, user_id)
     # Reuse the bounded verifier and limiter, without an intervening commit.
-    verify_credentials(db, user.username, current_password, origin="internal-web")
+    try:
+        verify_credentials(db, user.username, current_password, origin="internal-web")
+    except AuthError as error:
+        # The caller is already authenticated: a wrong current password is bad input, not a lost session.
+        if error.code == "invalid_credentials":
+            raise AuthError("invalid_credentials", "La contraseña actual es incorrecta.", 400) from None
+        raise
     reset_password(db, user.id, new_password, temporary=False)
 
 
