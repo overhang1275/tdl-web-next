@@ -134,6 +134,8 @@ def test_provision_only_journaled_uuid_role_and_database(tmp_path, monkeypatch):
             return 'localhost'
         if 'pg_hba_file_rules' in query:
             return '0'
+        if 'pg_encoding_to_char' in query:
+            return 'UTF8'
         if 'FROM pg_roles' in query:
             return ('tdl:' + identifier) if state['role'] else ''
         if 'FROM pg_database' in query:
@@ -151,11 +153,45 @@ def test_provision_only_journaled_uuid_role_and_database(tmp_path, monkeypatch):
     native.provision(values, ('16', 'main', '5432'), journal)
     assert not any('CREATE ' in query for query in calls[first:])
     assert any('NOSUPERUSER NOCREATEDB NOCREATEROLE' in query for query in calls)
+    assert any("ENCODING 'UTF8'" in query for query in calls)
     assert not any(word in '\n'.join(calls) for word in ('ALTER ROLE', 'DROP ', 'postgres PASSWORD'))
     assert json.loads(journal.read_text())['database_created'] is True
     assert journal.stat().st_mode & 0o777 == 0o600
     journal.unlink()
     with pytest.raises(RuntimeError, match='colisi'):
+        native.provision(values, ('16', 'main', '5432'), journal)
+
+
+def test_provision_rejects_existing_non_utf8_database(tmp_path, monkeypatch):
+    native = load('native-postgres')
+    identifier = str(uuid4())
+    name = 'tdl_' + identifier.replace('-', '')
+    values = {'INSTALLATION_ID': identifier, 'DATABASE_URL': f'postgresql://{name}:secret@127.0.0.1/{name}'}
+    state = {'role': False, 'database': False, 'encoding': 'UTF8'}
+
+    def psql(cluster, statement):
+        query = statement.as_string() if hasattr(statement, 'as_string') else statement
+        if 'listen_addresses' in query:
+            return 'localhost'
+        if 'pg_hba_file_rules' in query:
+            return '0'
+        if 'pg_encoding_to_char' in query:
+            return state['encoding']
+        if 'FROM pg_roles' in query:
+            return ('tdl:' + identifier) if state['role'] else ''
+        if 'FROM pg_database' in query:
+            return name if state['database'] else ''
+        if 'CREATE ROLE' in query:
+            state['role'] = True
+        if 'CREATE DATABASE' in query:
+            state['database'] = True
+        return ''
+
+    monkeypatch.setattr(native, 'psql', psql)
+    journal = tmp_path / 'resources.json'
+    native.provision(values, ('16', 'main', '5432'), journal)
+    state.update(role=True, database=True, encoding='SQL_ASCII')
+    with pytest.raises(RuntimeError, match='UTF8'):
         native.provision(values, ('16', 'main', '5432'), journal)
 
 

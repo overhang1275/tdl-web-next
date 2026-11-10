@@ -124,6 +124,10 @@ def provision(values, cluster, journal):
         raise RuntimeError('colisión de rol/base existente sin journal; use DATABASE_URL propia')
     if present and role != 'tdl:' + identifier or database and database != expected:
         raise RuntimeError('colisión de recursos ajenos; no se cambia su contraseña ni se borran')
+    if database:
+        encoding = psql(cluster, sql.SQL('SELECT pg_encoding_to_char(encoding) FROM pg_database WHERE datname={}').format(sql.Literal(expected)))
+        if encoding != 'UTF8':
+            raise RuntimeError('La base existente no usa UTF8; recréala vacía o usa otra instalación')
     state = saved or identity
     def save():
         config.write_private(journal, json.dumps(state, indent=2) + '\n')
@@ -138,7 +142,7 @@ def provision(values, cluster, journal):
     if not database:
         state['database_pending'] = True
         save()
-        psql(cluster, sql.SQL('CREATE DATABASE {} OWNER {} TEMPLATE template0;').format(sql.Identifier(expected), sql.Identifier(expected)))
+        psql(cluster, sql.SQL("CREATE DATABASE {} OWNER {} TEMPLATE template0 ENCODING 'UTF8' LC_COLLATE 'C' LC_CTYPE 'C';").format(sql.Identifier(expected), sql.Identifier(expected)))
     psql(cluster, sql.SQL('REVOKE ALL ON DATABASE {} FROM PUBLIC;').format(sql.Identifier(expected)))
     state['database_created'] = True
     save()
@@ -196,6 +200,8 @@ def main():
     except Exception as error:
         if isinstance(error, (ValueError, RuntimeError)):
             print(str(error), file=sys.stderr)
+        else:
+            print(f'{type(error).__name__}: {error}', file=sys.stderr)
         return 1
     return 0
 
