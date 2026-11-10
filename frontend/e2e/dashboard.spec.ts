@@ -255,6 +255,8 @@ test("file gallery reaches later pages", async ({ page }) => {
     return route.fulfill({ json: { items: [{ ...file, name: current === 1 ? "first.mp4" : "last.mp4" }], page: current, per_page: 24, total: 25, page_count: 2 } });
   });
   await page.goto("/downloads/1");
+  await expect(page.getByText("first.mp4")).toBeHidden();
+  await page.getByRole("heading", { name: "Archivos", exact: true }).click();
   await expect(page.getByText("first.mp4")).toBeVisible();
   await page.getByRole("button", { name: "Página siguiente" }).click();
   await expect(page.getByText("last.mp4")).toBeVisible();

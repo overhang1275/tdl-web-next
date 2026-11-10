@@ -20,7 +20,7 @@ export function PageHeader({
       <div>
         <h1 className="text-2xl font-semibold tracking-tight sm:text-3xl">{title}</h1>
         {description ? (
-          <p className="mt-1 max-w-2xl text-sm text-muted-foreground">{description}</p>
+          <p className="mt-1 max-w-2xl break-words text-sm text-muted-foreground">{description}</p>
         ) : null}
       </div>
       {actions ? <div className="flex flex-wrap items-center gap-2">{actions}</div> : null}
@@ -135,7 +135,7 @@ export function Pagination({
 }) {
   if (pageCount <= 1) return null;
   return (
-    <nav className="mt-4 flex items-center justify-between gap-3" aria-label="Paginación">
+    <nav className="mt-4 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between sm:gap-3" aria-label="Paginación">
       <span className="text-xs text-muted-foreground">
         Página {page} de {pageCount}
         {typeof total === "number" ? ` · ${total} en total` : ""}
@@ -147,6 +147,7 @@ export function Pagination({
           onClick={() => onPage(page - 1)}
           disabled={page <= 1}
           aria-label="Página anterior"
+          className="flex-1 sm:flex-none"
         >
           <ChevronLeft className="h-4 w-4" />
           Anterior
@@ -157,6 +158,7 @@ export function Pagination({
           onClick={() => onPage(page + 1)}
           disabled={page >= pageCount}
           aria-label="Página siguiente"
+          className="flex-1 sm:flex-none"
         >
           Siguiente
           <ChevronRight className="h-4 w-4" />

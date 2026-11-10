@@ -95,7 +95,7 @@ export function EventTimeline({ events }: { events: EventItem[] }) {
       {events.map((event, index) => (
         <li key={`${event.timestamp}-${index}`} className="flex gap-3">
           <span className="mt-1.5 h-2 w-2 shrink-0 rounded-full bg-primary" aria-hidden="true" />
-          <div>
+          <div className="min-w-0 break-words">
             <p className="text-sm font-medium">{event.title}</p>
             <p className="text-xs text-muted-foreground">{event.message}</p>
             {event.timestamp ? (

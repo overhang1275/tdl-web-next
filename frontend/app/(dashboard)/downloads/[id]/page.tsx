@@ -1,7 +1,7 @@
 "use client";
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { ArrowLeft, Ban, RotateCcw, Trash2 } from "lucide-react";
+import { ArrowLeft, Ban, ChevronDown, RotateCcw, Trash2 } from "lucide-react";
 import Link from "next/link";
 import { useParams } from "next/navigation";
 import { useEffect, useState } from "react";
@@ -116,7 +116,7 @@ export default function JobDetailPage() {
         title={`Job #${data.id}`}
         description={`${data.chat_title ?? data.chat_id} · ${data.output_subfolder}`}
         actions={
-          <>
+          <div className="flex w-full flex-col gap-2 sm:w-auto sm:flex-row sm:flex-wrap">
             <Link
               href="/downloads"
               className={cn(buttonVariants({ variant: "outline" }), "gap-2")}
@@ -153,13 +153,13 @@ export default function JobDetailPage() {
               <Trash2 className="h-4 w-4" />
               Eliminar
             </Button>
-          </>
+          </div>
         }
       />
 
       <JobProgress job={data} />
 
-      <div className="mt-4 grid gap-4 xl:grid-cols-2">
+      <div className="mt-4 grid gap-4 lg:grid-cols-2">
         <Card className="p-5">
           <h2 className="font-semibold">Eventos</h2>
           <div className="mt-3">
@@ -178,21 +178,31 @@ export default function JobDetailPage() {
         </Card>
       </div>
 
-      <Card className="mt-4 p-5">
-        <div className="mb-3 flex items-center justify-between">
-          <h2 className="font-semibold">Archivos</h2>
-          <span className="text-xs text-muted-foreground">
-            {files.data?.total ?? 0} archivos
-          </span>
-        </div>
-        {files.isError ? (
-          <ErrorState description={files.error.message} onRetry={() => files.refetch()} />
-        ) : files.isLoading ? (
-          <LoadingRows rows={2} />
-        ) : (
-          <FileGrid files={files.data?.items ?? []} />
-        )}
-        {files.data ? <Pagination page={files.data.page} pageCount={files.data.page_count} total={files.data.total} onPage={setFilesPage} /> : null}
+      <Card className="mt-4">
+        <details className="group">
+          <summary className="flex cursor-pointer select-none list-none items-center justify-between gap-3 p-5 [&::-webkit-details-marker]:hidden">
+            <div className="flex items-center gap-2">
+              <ChevronDown
+                className="h-4 w-4 text-muted-foreground transition-transform group-open:rotate-180"
+                aria-hidden="true"
+              />
+              <h2 className="font-semibold">Archivos</h2>
+            </div>
+            <span className="text-xs text-muted-foreground">
+              {files.data?.total ?? 0} archivos
+            </span>
+          </summary>
+          <div className="px-5 pb-5">
+            {files.isError ? (
+              <ErrorState description={files.error.message} onRetry={() => files.refetch()} />
+            ) : files.isLoading ? (
+              <LoadingRows rows={2} />
+            ) : (
+              <FileGrid files={files.data?.items ?? []} />
+            )}
+            {files.data ? <Pagination page={files.data.page} pageCount={files.data.page_count} total={files.data.total} onPage={setFilesPage} /> : null}
+          </div>
+        </details>
       </Card>
 
       <ConfirmDialog
