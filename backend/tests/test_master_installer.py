@@ -122,6 +122,46 @@ def test_repair_rejects_replaceable_root_code_before_helper(tmp_path, untrusted)
     assert not marker.exists()
 
 
+def test_repair_rejects_replaceable_intermediate_symlink_hop(tmp_path):
+    release = tmp_path / 'releases' / 'candidate'
+    for name in ('backend', 'scripts', 'venv'):
+        (release / name).mkdir(parents=True)
+    marker = tmp_path / 'executed-helper'
+    trusted = tmp_path / 'trusted-root'
+    trusted.mkdir()
+    final = trusted / 'configure-env.py'
+    final.write_text(f'from pathlib import Path\nPath({str(marker)!r}).touch()\n')
+    final.chmod(0o600)
+    outside = tmp_path / 'service-owned'
+    outside.mkdir()
+    hop = outside / 'hop.py'
+    hop.symlink_to(final)
+    os.chown(outside, 10001, 10001)
+    target = release / 'scripts' / 'configure-env.py'
+    target.symlink_to(hop)
+    assert final.stat().st_uid == 0
+    result = shell('RELEASE="$TEST_RELEASE"\nverify_release_code\npython3 "$RELEASE/scripts/configure-env.py"',
+                   tmp_path, TEST_RELEASE=release)
+    assert result.returncode != 0
+    assert not marker.exists()
+
+
+def test_repair_rejects_service_owned_ancestor_link_in_sticky_directory(tmp_path):
+    release = tmp_path / 'trusted' / 'candidate'
+    for name in ('backend', 'scripts', 'venv'):
+        (release / name).mkdir(parents=True)
+    sticky = tmp_path / 'sticky'
+    sticky.mkdir()
+    sticky.chmod(0o1777)
+    alias = sticky / 'release'
+    alias.symlink_to(release.parent)
+    os.lchown(alias, 10001, 10001)
+    result = shell('RELEASE="$TEST_RELEASE/candidate"\nverify_release_code',
+                   tmp_path, TEST_RELEASE=alias)
+    assert result.returncode != 0
+    assert 'modificable' in result.stderr
+
+
 def test_repair_accepts_trusted_root_release_with_venv_interpreter_link(tmp_path):
     import sys
     release = tmp_path / 'releases' / 'candidate'

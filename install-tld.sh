@@ -616,24 +616,47 @@ prepare_repair() {
 
 verify_release_code() {
     python3 - "$RELEASE" <<'PY'
-import sys
+import os, stat, sys
 from pathlib import Path
-release=Path(sys.argv[1])
-def trusted_chain(path):
-    for item in (path, *path.parents):
-        metadata=item.stat()
-        sticky_ancestor=item != path and item.is_dir() and metadata.st_mode & 0o1000
-        if metadata.st_uid != 0 or (metadata.st_mode & 0o022 and not sticky_ancestor):
-            raise SystemExit('Código root o sus directorios modificables por otro usuario; reconstruye con update')
-trusted_chain(release)
-trusted_chain(release.resolve(strict=True))
+
+release = Path(sys.argv[1])
+max_hops = 40
+
+def reject(message):
+    raise SystemExit(message)
+
+def trusted(path, hops=0):
+    if hops > max_hops:
+        reject('Cadena de enlaces no soportada en el código de la release; reconstruye con update')
+    if not path.is_absolute():
+        reject('Ruta de código no absoluta en la release; reconstruye con update')
+    parts = path.parts
+    current = Path(path.anchor)
+    for index, part in enumerate(parts[1:]):
+        current = current / part
+        try:
+            metadata = current.lstat()
+        except OSError as error:
+            reject(f'Código de la release inaccesible: {error}')
+        if stat.S_ISLNK(metadata.st_mode):
+            # A sticky parent only protects links owned by root; the service can replace its own link.
+            if metadata.st_uid != 0:
+                reject('Enlace de código modificable por otro usuario; reconstruye con update')
+            target = Path(os.path.normpath(current.parent / os.readlink(current)))
+            trusted(target, hops + 1)
+            current = target
+            continue
+        sticky = index < len(parts) - 2 and stat.S_ISDIR(metadata.st_mode) and metadata.st_mode & 0o1000
+        if metadata.st_uid != 0 or (metadata.st_mode & 0o022 and not sticky):
+            reject('Código root o sus directorios modificables por otro usuario; reconstruye con update')
+
+trusted(release)
 for base in (release/'backend', release/'scripts', release/'venv'):
-    if not base.is_dir(): raise SystemExit('Release root incompleta')
+    if not base.is_dir(): reject('Release root incompleta')
     for path in (base, *base.rglob('*')):
-        trusted_chain(path)
-        trusted_chain(path.resolve(strict=True))
+        trusted(path)
         if path.is_symlink() and path.is_dir() and not path.resolve().is_relative_to(release):
-            raise SystemExit('Código root enlazado a directorio fuera de la release; reconstruye con update')
+            reject('Código root enlazado a directorio fuera de la release; reconstruye con update')
 PY
 }
 
