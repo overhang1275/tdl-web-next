@@ -607,7 +607,7 @@ prepare_repair() {
     [[ -f "$RELEASE/frontend/.next/standalone/server.js" && -x "$RELEASE/venv/bin/python" ]] || die 'No existe una versión completa que reparar.'
     SOURCE_DIR="$RELEASE"
     NODE_BINARY="$(env_read "$ENV_FILE" NODE_BINARY)"
-    [[ -n "$NODE_BINARY" ]] || NODE_BINARY="$APP_ROOT/node/bin/node"
+    [[ -n "$NODE_BINARY" ]] || NODE_BINARY="$(find "$APP_ROOT/tools" -maxdepth 3 -type f -path '*/bin/node' -perm -u+x 2>/dev/null | sort -V | tail -1)"
     [[ -x "$NODE_BINARY" ]] || die 'No existe Node; usa update para reconstruir las dependencias.'
     TDL_BINARY="$(env_read "$ENV_FILE" TDL_BINARY)"
     RESOLVED_VERSION="$(env_read "$ENV_FILE" APP_VERSION)"
@@ -816,7 +816,9 @@ activate_release() (
         exit "$result"
     }
     trap 'restore_previous $?' EXIT
-    if [[ "${NEW_ENV:-0}" != 1 && "$(env_read "$ENV_FILE" DATABASE_URL)" == postgres* ]]; then old_postgres=1; fi
+    # A partial first install leaves an env but no units; treat it as fresh so the
+    # idle guard cannot block on a database that was never provisioned.
+    if [[ "${NEW_ENV:-0}" != 1 && -f "$SYSTEMD_DIR/$SERVICE_API.service" && "$(env_read "$ENV_FILE" DATABASE_URL)" == postgres* ]]; then old_postgres=1; fi
     [[ "$old_postgres" != 1 ]] || data_admin check-idle
     if [[ -f "$SYSTEMD_DIR/$SERVICE_WEB.service" ]]; then systemctl stop "$SERVICE_WEB"; fi
     for unit in "$SERVICE_API" "$SERVICE_WORKER"; do

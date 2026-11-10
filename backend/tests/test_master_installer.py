@@ -488,6 +488,44 @@ def test_candidate_native_values_are_explicit(tmp_path):
     assert values['PUBLIC_URL'] == 'https://reference.test'
 
 
+def test_activation_without_installed_units_skips_idle_check(tmp_path):
+    root = tmp_path / 'app-root'
+    (root / 'new').mkdir(parents=True)
+    config = tmp_path / 'etc'
+    config.mkdir()
+    env = config / 'tld-web.env'
+    env.write_text('DATABASE_URL=postgresql://app:pw@127.0.0.1/app\n')
+    env.chmod(0o600)
+    candidate = tmp_path / 'candidate'
+    candidate.write_text('AUTH_SECRET=new\n')
+    candidate.chmod(0o600)
+    log = tmp_path / 'commands'
+    result = shell('''
+collect_options
+APP_GROUP="$(id -gn)"
+NODE_BINARY=/usr/bin/node
+WORK="$APP_ROOT/work"; mkdir -p "$WORK" "$SYSTEMD_DIR"
+RELEASE="$APP_ROOT/new"
+CANDIDATE="$TEST_CANDIDATE"
+systemctl() { echo "$*" >> "$COMMAND_LOG"; }
+data_admin() { echo "admin-$1" >> "$COMMAND_LOG"; return 1; }
+configure_redis() { :; }
+prepare_postgres() { :; }
+prepare_runtime() { cp "$CANDIDATE" "$WORK/runtime.env"; cp "$CANDIDATE" "$WORK/web.env"; }
+migrate_database() { :; }
+bootstrap_admin() { :; }
+render_units() {
+    mkdir -p "$1"
+    for unit in "${SERVICES[@]}" "$SERVICE_MIGRATE"; do : > "$1/$unit.service"; done
+}
+health_check() { :; }
+activate_release
+''', tmp_path, TEST_CANDIDATE=candidate, COMMAND_LOG=log, INSTALL_REDIS=0)
+    assert result.returncode == 0, result.stderr
+    events = log.read_text()
+    assert 'admin-check-idle' not in events and 'admin-backup' not in events
+
+
 @pytest.mark.parametrize('failure', ['backup', 'migration', 'bootstrap', 'health'])
 @pytest.mark.parametrize('lan', [False, True])
 def test_activation_failure_recovers_environment_units_and_services(tmp_path, failure, lan):
@@ -503,6 +541,8 @@ def test_activation_failure_recovers_environment_units_and_services(tmp_path, fa
     units = tmp_path / 'units'
     units.mkdir()
     (units / 'tld-web.service').write_text('old web unit')
+    (units / 'tld-web-api.service').write_text('old api unit')
+    (units / 'tld-web-worker.service').write_text('old worker unit')
     if lan:
         (units / 'tld-web-network.service').write_text('old firewall unit')
         (config / 'network.nft').write_text('old firewall configuration')
@@ -558,6 +598,31 @@ activate_release
     if lan:
         assert (config / 'network.nft').read_text() == 'old firewall configuration'
         assert (units / 'tld-web-network.service').read_text() == 'old firewall unit'
+
+
+def test_repair_finds_versioned_node_when_env_lacks_it(tmp_path):
+    root = tmp_path / 'app-root'
+    release = root / 'releases' / '20260101T000000-1'
+    standalone = release / 'frontend' / '.next' / 'standalone'
+    standalone.mkdir(parents=True)
+    (standalone / 'server.js').write_text('')
+    (release / 'venv' / 'bin').mkdir(parents=True)
+    python = release / 'venv' / 'bin' / 'python'
+    python.write_text('#!/bin/sh\n')
+    python.chmod(0o755)
+    node = root / 'tools' / 'node-24.19.0-x64' / 'bin' / 'node'
+    node.parent.mkdir(parents=True)
+    node.write_text('#!/bin/sh\n')
+    node.chmod(0o755)
+    (root / 'current').symlink_to(release)
+    config = tmp_path / 'etc'
+    config.mkdir()
+    env = config / 'tld-web.env'
+    env.write_text('AUTH_SECRET=x\n')
+    env.chmod(0o600)
+    result = shell('collect_options\nprepare_repair\necho "NODE=$NODE_BINARY"', tmp_path)
+    assert result.returncode == 0, result.stderr
+    assert f'NODE={node}' in result.stdout
 
 
 def test_repair_does_not_fetch_or_build(tmp_path):
