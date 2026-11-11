@@ -33,6 +33,42 @@ graphify-out/
 # Frontend
 node_modules/
 .next/
+frontend/out/
+frontend/coverage/
 frontend/playwright-report/
 frontend/test-results/
 *.tsbuildinfo
+
+# OS, editor and Python tooling
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+.mypy_cache/
+.pyright/
+*.egg-info/
+.coverage
+htmlcov/
+
+# Build output
+dist/
+build/
+
+# Private keys and local archives
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+*.dump
+*.bak
+*.tmp
+
+# Local runtime directories at the repository root
+/backups/
+/logs/
+/tmp/
+/uploads/
+/downloads/
+/sessions/
+/exports/
